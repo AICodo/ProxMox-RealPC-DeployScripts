@@ -189,11 +189,16 @@ random_hex() {
 }
 
 random_serial_20() {
-    # Generate a realistic 20-char alphanumeric serial (full A-Z 0-9)
-    # Uses bounded dd read to avoid SIGPIPE with set -eo pipefail
+    # Generate a reliable 20-char alphanumeric serial (A-Z 0-9).
+    # Read extra bytes to guarantee enough alphanumeric chars survive tr -dc.
     local pool
-    pool=$(dd if=/dev/urandom bs=128 count=1 2>/dev/null | LC_ALL=C tr -dc 'A-Z0-9')
-    echo "${pool:0:20}"
+    pool=$(dd if=/dev/urandom bs=256 count=1 2>/dev/null | LC_ALL=C tr -dc 'A-Z0-9' | head -c 20)
+    # Fallback: if pool is still short, pad with hex from /dev/urandom
+    while [[ ${#pool} -lt 20 ]]; do
+        pool+=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n' | tr '[:lower:]' '[:upper:]' | LC_ALL=C tr -dc 'A-Z0-9')
+        pool="${pool:0:20}"
+    done
+    echo "$pool"
 }
 
 qemu_escape_commas() {
