@@ -48,6 +48,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 # ── Signature strings to hunt for ──────────────────────────────────────
 # PCI vendor / device / subsystem IDs tied to QEMU, Red Hat, and VirtIO
+# Extended to cover ALL VMAware detection signatures
 $Signatures = @(
     "VEN_1AF4"          # Red Hat / VirtIO vendor
     "DEV_1AF4"
@@ -57,13 +58,31 @@ $Signatures = @(
     "DEV_1111"          # QEMU VGA
     "VEN_8086&DEV_2934" # QEMU i82801 USB (common default)
     "VEN_8086&DEV_2918" # QEMU PIIX4 ISA bridge
+    "VEN_8086&DEV_5845" # QEMU edu device (0x80865845)
+    "DEV_0627"          # QEMU display adapter
+    "DEV_1D1F"          # QEMU undocumented device
+    "VEN_1D6B"          # Linux Foundation USB (0x1d6b)
     "QEMU"
     "BOCHS"
     "Red Hat"
     "VirtIO"
     "VBOX"              # catch any VirtualBox leftovers too
     "SUBSYS_0627"       # QEMU display adapter subsystem (scoped to SUBSYS)
+    "KVMKVMKVM"         # KVM CPUID string
+    "ACPI\\QEMU"        # QEMU ACPI device
+    "PNP0A08"           # PCI Express root (benign but check context)
 )
+
+# Additional VMAware-specific registry paths to clean
+$VMAwareRegistryKills = @(
+    # Boot logo — VMAware checks CRC32 of BCD boot graphics (TianoCore hash)
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation"
+    # Firmware info that may contain OVMF/TianoCore strings
+    "HKLM:\HARDWARE\DESCRIPTION\System\BIOS"
+)
+
+# ACPI-related paths VMAware scans for "#ACPI(Sxx)" display signatures
+$AcpiDisplayRoot = "HKLM:\SYSTEM\CurrentControlSet\Enum\DISPLAY"
 
 # Registry roots to scan
 $EnumRoots = @(
@@ -198,6 +217,86 @@ function Invoke-Cleanup {
                     }
                 }
             }
+    }
+
+    # ── VMAware-specific: Clean firmware BIOS info ──────────────────────
+    # VMAware FIRMWARE/NVRAM checks: scans BIOS registry for "QEMU", "BOCHS",
+    # "SeaBIOS", "EDK II", "TianoCore", "Red Hat" in vendor/version strings
+    Write-Host "`n[*] Cleaning BIOS firmware registry strings ..." -ForegroundColor White
+    $biosKey = "HKLM:\HARDWARE\DESCRIPTION\System\BIOS"
+    if (Test-Path $biosKey) {
+        $biosProps = Get-ItemProperty -Path $biosKey -ErrorAction SilentlyContinue
+        $vmBiosPatterns = 'QEMU|BOCHS|SeaBIOS|EDK II|TianoCore|Red Hat|OVMF|American Megatrends Inc\.|EFI Development Kit'
+        foreach ($prop in $biosProps.PSObject.Properties) {
+            if ($prop.Name -notmatch '^PS' -and $prop.Value -is [string] -and $prop.Value -match $vmBiosPatterns) {
+                $Stats.Scanned++
+                Write-Host "  [FOUND] $($prop.Name) = $($prop.Value)" -ForegroundColor Yellow
+                # Note: Some BIOS values are populated by SMBIOS args and refreshed
+                # on boot. Deleting won't persist. The fix must be in the SMBIOS args
+                # or patched firmware. We log the finding for diagnostic purposes.
+            }
+        }
+    }
+
+    # ── VMAware-specific: ACPI_SIGNATURE display path cleanup ──────────
+    # VMAware checks display device ACPI location paths for "#ACPI(Sxx)"
+    Write-Host "`n[*] Checking display ACPI location paths ..." -ForegroundColor White
+    if (Test-Path $AcpiDisplayRoot) {
+        Get-ChildItem -Path $AcpiDisplayRoot -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSPath -match 'QEMU|BOCHS|1234|1111' } |
+            ForEach-Object {
+                $Stats.Scanned++
+                if ($PSCmdlet.ShouldProcess($_.PSPath, "Delete display ACPI key")) {
+                    Backup-Key $_.PSPath
+                    try {
+                        Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction Stop
+                        Write-Host "  [DEL] $($_.PSPath)" -ForegroundColor Green
+                        $Stats.Deleted++
+                    } catch {
+                        Write-Host "  [ERR] $($_.PSPath) - $_" -ForegroundColor Yellow
+                        $Stats.Failed++
+                    }
+                }
+            }
+    }
+
+    # ── VMAware-specific: UEFI NVRAM variable cleanup ──────────────────
+    # VMAware checks for "red hat" certs in PKDefault, and checks presence
+    # of KEKDefault, dbxDefault, MemoryOverwriteRequestControlLock, etc.
+    # These are stored in firmware, not registry — patched OVMF handles this.
+    # But Windows caches UEFI variable names in the registry:
+    $uefiFwRoot = "HKLM:\SYSTEM\CurrentControlSet\Control\FirmwareResources"
+    if (Test-Path $uefiFwRoot) {
+        Write-Host "`n[*] Scanning UEFI firmware resource cache ..." -ForegroundColor White
+        Get-ChildItem -Path $uefiFwRoot -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.PSPath -match 'Red Hat|Redhat|QEMU|OVMF' } |
+            ForEach-Object {
+                $Stats.Scanned++
+                if ($PSCmdlet.ShouldProcess($_.PSPath, "Delete UEFI firmware cache key")) {
+                    Backup-Key $_.PSPath
+                    try {
+                        Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction Stop
+                        Write-Host "  [DEL] $($_.PSPath)" -ForegroundColor Green
+                        $Stats.Deleted++
+                    } catch {
+                        Write-Host "  [ERR] $($_.PSPath) - $_" -ForegroundColor Yellow
+                        $Stats.Failed++
+                    }
+                }
+            }
+    }
+
+    # ── VMAware-specific: Boot logo CRC cleanup ────────────────────────
+    # VMAware's BOOT_LOGO checks the BCD boot graphics bitmap — TianoCore
+    # EDK2 has a known CRC32 (0x110350C5). The bootmgr stores the logo
+    # path in the BCD store. We can't change the firmware logo from the
+    # guest, but we can remove the cached graphics resource if present.
+    $bgfxKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\BootAnimation"
+    if (Test-Path $bgfxKey) {
+        Write-Host "`n[*] Checking boot logo animation cache ..." -ForegroundColor White
+        $Stats.Scanned++
+        # Log presence — actual fix requires patched OVMF with custom logo
+        Write-Host "  [INFO] Boot animation key exists — logo CRC depends on OVMF firmware" -ForegroundColor DarkCyan
     }
 
     # Summary

@@ -524,9 +524,51 @@ if [[ "$IGPU_PASSTHROUGH" == true ]]; then
 fi
 
 # Assemble full args line (matches upstream README for QEMU 9/10)
-# Priority 5: Disable excess PCI root ports — Q35 creates 30+ by default,
-# real systems have 4-8. Excess root ports with no devices trigger VM::EXCESS_PCI.
-PCI_ARGS=" -global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1"
+#
+# Note: S3/S4 sleep states are NOT disabled here — the patched binary handles
+# power management internally. Adding -global ICH9-LPC.disable_s3/s4 conflicts
+# with the binary and triggers VMAware's POWER_CAPABILITIES check (real desktops
+# support at least S3 standby).
+#
+# ACPI PCI hotplug is disabled — real hardware doesn't expose hotplug bridges,
+# and the hotplug controller creates extra ACPI objects that fingerprint as VM.
+PCI_ARGS=" -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"
+
+# Priority 6: Suppress VMAware's FIRMWARE / BOOT_LOGO / NVRAM / DEVICES checks.
+#
+# FIRMWARE (100pts): VMAware scans ALL ACPI/SMBIOS firmware tables for strings
+#   "QEMU", "pc-q35", "BOCHS", "FWCF", "WAET", "S3 Corp.", "VS2005R2", "ovmf",
+#   "edk ii unknown". The patched binary rewrites DSDT/FADT/MADT strings at build
+#   time, but the Q35 machine name propagated through ACPI OEM fields needs the
+#   custom tables to fully override. The ssdt/hpet AMLs handle this.
+#
+# BOOT_LOGO (100pts): CRC32 of the BCD boot logo bitmap — hash 0x110350C5 means
+#   TianoCore EDK2 / OVMF. The patched Strong OVMF ROM should have a different
+#   logo, but if not, the guest-side qemu-cleanup handles the registry remnant.
+#
+# NVRAM (100pts): OVMF ships Red Hat signing certs in PKDefault. VMAware scans
+#   UEFI NVRAM variables for "red hat". The patched Strong OVMF omits these certs
+#   and we do NOT use pre-enrolled-keys (which loads from stock templates).
+#
+# DEVICES (95pts): PCI vendor/device IDs 0x1af4 (VirtIO), 0x1b36 (QEMU bridge),
+#   0x1234 (bochs-display), 0x0627 (QEMU display subsystem). The patched binary
+#   remaps these. We don't use VirtIO NIC/disk (e1000 + SATA instead) reducing
+#   exposure. The guest-side qemu-cleanup.ps1 removes any remaining PCI registry
+#   artefacts.
+#
+# is_hardened() META-CHECK: VMAware detects "hardened" VMs when FIRMWARE triggers
+# but HYPERVISOR_BIT is clean (hypervisor=off). The patched binary MUST prevent
+# firmware strings from leaking, otherwise this meta-check catches the hiding.
+# There is no args-level fix — the binary MUST handle firmware table sanitization.
+
+# Priority 7: DISPLAY / GPU_CAPABILITIES — VMAware checks gamma ramp support,
+# bits-per-pixel (≤8 = suspicious), and DPI. stdvga appears as QEMU STD VGA with
+# limited capabilities. With GPU passthrough (--igpu) this is not an issue.
+# For stdvga users: guest-side resolution and color depth must be ≥32bpp.
+if [[ "$VGA" == "std" ]]; then
+    warn "Using stdvga — VMAware GPU_CAPABILITIES (45pts) and DISPLAY (25pts) may trigger."
+    warn "For best results, pass a real GPU (--igpu) or set resolution to ≥1920x1080 @32bpp in-guest."
+fi
 
 # Priority 2: Override QEMU -smp with auto-detected host topology
 SMP_ARGS=" -smp ${SMP_TOTAL},sockets=1,cores=${SMP_CORES},threads=${SMP_THREADS}"
@@ -660,6 +702,8 @@ echo -e "${GREEN}║    ✓ CPU: host, hypervisor=off (binary hides KVM internal
 echo -e "${GREEN}║    ✓ Cores: ${SMP_TOTAL} vCPUs (${SMP_CORES}c × ${SMP_THREADS}t, matches host topology)  ║${NC}"
 echo -e "${GREEN}║    ✓ Timers handled by binary (TSC/HPET/PIT/RTC/NVRAM)       ║${NC}"
 echo -e "${GREEN}║    ✓ EFI NVRAM sanitized (patched OVMF, no pre-enrolled-keys)║${NC}"
+echo -e "${GREEN}║    ✓ ACPI PCI hotplug disabled (no hotplug fingerprint)       ║${NC}"
+echo -e "${GREEN}║    ✓ S3/S4 left to binary (avoids POWER_CAPABILITIES detect) ║${NC}"
 echo -e "${GREEN}║    ✓ e1000 NIC with realistic MAC prefix                     ║${NC}"
 echo -e "${GREEN}║    ✓ SATA disk with custom serial (no virtio)                ║${NC}"
 echo -e "${GREEN}║    ✓ Balloon disabled                                        ║${NC}"
