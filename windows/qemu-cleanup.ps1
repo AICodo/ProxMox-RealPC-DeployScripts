@@ -340,7 +340,11 @@ if ($SkipPsExec) {
     # child runs inline instead of trying to download PsExec again.
     Write-Host "[*] Launching cleanup as SYSTEM via PsExec ..." -ForegroundColor Cyan
     $selfPath = $MyInvocation.MyCommand.Path
-    Start-Process -FilePath $psexecPath `
-        -ArgumentList "-accepteula -nobanner -s powershell.exe -ExecutionPolicy Bypass -File `"$selfPath`" -SkipPsExec" `
-        -Wait -NoNewWindow
+    $startArgs = @{
+        FilePath     = $psexecPath
+        ArgumentList = "-accepteula -nobanner -s powershell.exe -ExecutionPolicy Bypass -File ""$selfPath"" -SkipPsExec"
+        Wait         = $true
+        NoNewWindow  = $true
+    }
+    Start-Process @startArgs
 }
