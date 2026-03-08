@@ -10,10 +10,11 @@
 #   5. Extraction & installation of Strong build debs
 #   6. Installation of patched KVM kernel module (Intel or AMD)
 #   7. Placement of ACPI table files (/root/)
-#   8. Package pinning (prevent apt from overwriting patched QEMU/OVMF)
-#   9. Verification of installation
+#   8. Intel Ultra iGPU passthrough setup (optional, --igpu)
+#   9. Package pinning (prevent apt from overwriting patched QEMU/OVMF)
+#  10. Verification of installation
 #
-# Usage:   bash pve-realpc-setup.sh [--skip-download] [--skip-pin] [--skip-kernel-downgrade]
+# Usage:   bash pve-realpc-setup.sh [--skip-download] [--skip-pin] [--skip-kernel-downgrade] [--igpu]
 # Requires: root on a Proxmox VE 9 host, internet access (for downloads)
 ###############################################################################
 set -euo pipefail
@@ -37,6 +38,12 @@ STRONG_OVMF_DEB="pve-edk2-firmware-ovmf_4.2025.05-2_all_Strong.deb"
 PATCH_FILE="qemu-autoGenPatch.patch"
 ACPI_FILES=("ssdt.aml" "ssdt-ec.aml" "ssdt-battery.aml" "hpet.aml")
 
+# Intel Ultra iGPU passthrough ROM (AICodo/intel-ultra-rom)
+IGPU_ROM_TAG="v2.0-20260307-095826"
+IGPU_ROM_URL="https://github.com/AICodo/intel-ultra-rom/releases/download/${IGPU_ROM_TAG}"
+IGPU_ROM_FILE="ultra-1-2-qemu10.rom"
+IGPU_ROM_DIR="/usr/share/kvm"
+
 # SHA-256 digests (from GitHub release API) for integrity verification
 declare -A CHECKSUMS=(
     ["hpet.aml"]="cb0cf3c29fdf5b734422ec3f64589f1b88a11bb0a0f30bb41c6ce63c3e61367b"
@@ -47,23 +54,27 @@ declare -A CHECKSUMS=(
     ["ssdt-battery.aml"]="ea9c737cde6384c7e86028fe891ed3d8662721b8e254aea54f5d227d1e8009f1"
     ["ssdt-ec.aml"]="6694edf9c3cc5914063dcb3e25f374531f65801374dbae90fb8604fa9851d48a"
     ["ssdt.aml"]="09e3aa35a9a7a63801ea4231846bf7835b6ca398f2024ceb79673df6d409a341"
+    ["${IGPU_ROM_FILE}"]="b392ce4be9f1ff3e98dc45549248ba82d17d228a94c19a946b90d35ede97f0cc"
 )
 
 # ─── Flags ───────────────────────────────────────────────────────────────────
 SKIP_DOWNLOAD=false
 SKIP_PIN=false
 SKIP_KERNEL_DOWNGRADE=false
+ENABLE_IGPU=false
 NEEDS_REBOOT=false
 for arg in "$@"; do
     case "$arg" in
         --skip-download)          SKIP_DOWNLOAD=true ;;
         --skip-pin)               SKIP_PIN=true ;;
         --skip-kernel-downgrade)  SKIP_KERNEL_DOWNGRADE=true ;;
+        --igpu)                   ENABLE_IGPU=true ;;
         --help|-h)
-            echo "Usage: $0 [--skip-download] [--skip-pin] [--skip-kernel-downgrade]"
+            echo "Usage: $0 [--skip-download] [--skip-pin] [--skip-kernel-downgrade] [--igpu]"
             echo "  --skip-download           Skip downloading assets (use existing files in ${WORK_DIR})"
             echo "  --skip-pin                Skip APT package pinning"
             echo "  --skip-kernel-downgrade   Skip automatic kernel downgrade if version mismatch"
+            echo "  --igpu                    Download Intel Ultra iGPU ROM & configure host for passthrough"
             exit 0
             ;;
         *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -302,7 +313,7 @@ mkdir -p "${WORK_DIR}" "${BACKUP_DIR}"
 # STEP 1: Set MAC Address Prefix at Datacenter level
 ###############################################################################
 echo ""
-info "═══ Step 1/8: MAC Address Prefix ═══"
+info "═══ Step 1/10: MAC Address Prefix ═══"
 
 if [[ -f "$DATACENTER_CFG" ]]; then
     if grep -q "^mac_prefix:" "$DATACENTER_CFG" 2>/dev/null; then
@@ -328,7 +339,7 @@ fi
 # STEP 2: Download ALL release assets
 ###############################################################################
 echo ""
-info "═══ Step 2/8: Download Release Assets ═══"
+info "═══ Step 2/10: Download Release Assets ═══"
 
 if [[ "$SKIP_DOWNLOAD" == true ]]; then
     warn "Skipping downloads (--skip-download). Expecting assets in ${WORK_DIR}"
@@ -353,7 +364,7 @@ fi
 # STEP 3: Backup stock packages
 ###############################################################################
 echo ""
-info "═══ Step 3/8: Backup Stock Packages ═══"
+info "═══ Step 3/10: Backup Stock Packages ═══"
 
 # Back up the current qemu-system-x86_64 binary
 QEMU_BIN="/usr/bin/qemu-system-x86_64"
@@ -392,7 +403,7 @@ fi
 # STEP 4: Install base anti-detection deb packages
 ###############################################################################
 echo ""
-info "═══ Step 4/8: Install Base Anti-Detection Packages ═══"
+info "═══ Step 4/10: Install Base Anti-Detection Packages ═══"
 
 info "Installing ${QEMU_BASE_DEB} ..."
 dpkg -i "${WORK_DIR}/${QEMU_BASE_DEB}" 2>&1 | tail -5
@@ -406,7 +417,7 @@ ok "Base OVMF anti-detection package installed"
 # STEP 5: Extract & install Strong build
 ###############################################################################
 echo ""
-info "═══ Step 5/8: Extract & Install Strong Build ═══"
+info "═══ Step 5/10: Extract & Install Strong Build ═══"
 
 STRONG_DIR="${WORK_DIR}/strong"
 mkdir -p "$STRONG_DIR"
@@ -446,7 +457,7 @@ fi
 # STEP 6: Install patched KVM kernel module
 ###############################################################################
 echo ""
-info "═══ Step 6/8: Install Patched KVM Kernel Module ═══"
+info "═══ Step 6/10: Install Patched KVM Kernel Module ═══"
 
 CPU_VENDOR=$(detect_cpu_vendor)
 KERNEL_VER=$(uname -r)
@@ -540,7 +551,7 @@ fi
 # STEP 7: Place ACPI table files
 ###############################################################################
 echo ""
-info "═══ Step 7/8: Place ACPI Table Files ═══"
+info "═══ Step 7/10: Place ACPI Table Files ═══"
 
 for aml in "${ACPI_FILES[@]}"; do
     src="${WORK_DIR}/${aml}"
@@ -555,10 +566,90 @@ for aml in "${ACPI_FILES[@]}"; do
 done
 
 ###############################################################################
-# STEP 8: Pin packages (prevent apt upgrade from overwriting)
+# STEP 8: Intel Ultra iGPU Passthrough Setup (optional)
 ###############################################################################
 echo ""
-info "═══ Step 8/8: APT Package Pinning ═══"
+if [[ "$ENABLE_IGPU" == true ]]; then
+    info "═══ Step 8/10: Intel Ultra iGPU Passthrough Setup ═══"
+
+    # Download the iGPU ROM
+    if [[ "$SKIP_DOWNLOAD" != true ]]; then
+        mkdir -p "$IGPU_ROM_DIR"
+        ROM_DEST="${IGPU_ROM_DIR}/${IGPU_ROM_FILE}"
+        NEED_DL=true
+
+        if [[ -f "$ROM_DEST" ]] && [[ -n "${CHECKSUMS[$IGPU_ROM_FILE]:-}" ]]; then
+            ROM_ACTUAL=$(sha256sum "$ROM_DEST" | awk '{print $1}')
+            if [[ "$ROM_ACTUAL" == "${CHECKSUMS[$IGPU_ROM_FILE]}" ]]; then
+                ok "iGPU ROM already installed and verified: ${ROM_DEST}"
+                NEED_DL=false
+            else
+                warn "Existing ROM has wrong checksum — re-downloading."
+            fi
+        fi
+
+        if [[ "$NEED_DL" == true ]]; then
+            info "Downloading Intel Ultra iGPU ROM: ${IGPU_ROM_FILE} ..."
+            wget -q --show-progress -O "$ROM_DEST" "${IGPU_ROM_URL}/${IGPU_ROM_FILE}" \
+                || fail "Failed to download iGPU ROM"
+            verify_checksum "$ROM_DEST" "${CHECKSUMS[$IGPU_ROM_FILE]}"
+            ok "iGPU ROM installed: ${ROM_DEST} ($(stat -c%s "$ROM_DEST") bytes)"
+        fi
+    else
+        if [[ -f "${IGPU_ROM_DIR}/${IGPU_ROM_FILE}" ]]; then
+            ok "iGPU ROM present: ${IGPU_ROM_DIR}/${IGPU_ROM_FILE}"
+        else
+            warn "iGPU ROM not found and --skip-download is set"
+        fi
+    fi
+
+    # Configure Intel IOMMU in GRUB
+    GRUB_FILE="/etc/default/grub"
+    if [[ -f "$GRUB_FILE" ]]; then
+        if ! grep -q "intel_iommu=on" "$GRUB_FILE"; then
+            info "Enabling Intel IOMMU in GRUB ..."
+            cp "$GRUB_FILE" "${BACKUP_DIR}/grub.default.igpu.bak" 2>/dev/null || true
+            sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\([^"]*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 intel_iommu=on"/' "$GRUB_FILE"
+            if command -v update-grub &>/dev/null; then
+                update-grub 2>&1 | tail -3
+            fi
+            NEEDS_REBOOT=true
+            ok "Intel IOMMU enabled (reboot required)"
+        else
+            ok "Intel IOMMU already enabled in GRUB"
+        fi
+    fi
+
+    # Blacklist i915 and snd_hda_intel for VFIO passthrough
+    IGPU_BLACKLIST_FILE="/etc/modprobe.d/pve-realpc-igpu.conf"
+    if [[ ! -f "$IGPU_BLACKLIST_FILE" ]]; then
+        cat > "$IGPU_BLACKLIST_FILE" <<'IGPUEOF'
+# Blacklist Intel GPU and audio drivers to allow VFIO passthrough
+# Created by pve-realpc-setup.sh --igpu
+blacklist i915
+blacklist snd_hda_intel
+options vfio_iommu_type1 allow_unsafe_interrupts=1
+IGPUEOF
+        ok "Created ${IGPU_BLACKLIST_FILE} (blacklist i915 + snd_hda_intel)"
+
+        # Rebuild initramfs so VFIO claims the devices at boot
+        info "Rebuilding initramfs for VFIO changes ..."
+        update-initramfs -u -k all 2>&1 | tail -3
+        ok "Initramfs updated"
+        NEEDS_REBOOT=true
+    else
+        ok "iGPU blacklist already configured: ${IGPU_BLACKLIST_FILE}"
+    fi
+else
+    info "═══ Step 8/10: Intel Ultra iGPU Passthrough Setup ═══"
+    info "Skipped (use --igpu to enable Intel Ultra iGPU passthrough)"
+fi
+
+###############################################################################
+# STEP 9: Pin packages (prevent apt upgrade from overwriting)
+###############################################################################
+echo ""
+info "═══ Step 9/10: APT Package Pinning ═══"
 
 PIN_FILE="/etc/apt/preferences.d/pve-realpc-hold"
 if [[ "$SKIP_PIN" == true ]]; then
@@ -627,6 +718,18 @@ if grep -q "mac_prefix: ${MAC_PREFIX}" "$DATACENTER_CFG" 2>/dev/null; then
     ok "Datacenter MAC prefix: ${MAC_PREFIX}"
 fi
 
+# Check iGPU ROM
+if [[ "$ENABLE_IGPU" == true ]]; then
+    if [[ -f "${IGPU_ROM_DIR}/${IGPU_ROM_FILE}" ]]; then
+        ok "iGPU ROM: ${IGPU_ROM_FILE} present ($(stat -c%s "${IGPU_ROM_DIR}/${IGPU_ROM_FILE}") bytes)"
+    else
+        warn "iGPU ROM: ${IGPU_ROM_FILE} missing from ${IGPU_ROM_DIR}/"
+    fi
+    if [[ -f "/etc/modprobe.d/pve-realpc-igpu.conf" ]]; then
+        ok "iGPU blacklist (i915 + snd_hda_intel) configured"
+    fi
+fi
+
 # Summary
 echo ""
 echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
@@ -638,6 +741,10 @@ echo -e "${GREEN}║  Patched KVM module installed (${CPU_VENDOR})              
 echo -e "${GREEN}║  ACPI tables placed in /root/                                 ║${NC}"
 echo -e "${GREEN}║  MAC prefix set to ${MAC_PREFIX}                               ║${NC}"
 echo -e "${GREEN}║  Packages pinned against apt upgrades                         ║${NC}"
+if [[ "$ENABLE_IGPU" == true ]]; then
+echo -e "${GREEN}║  Intel Ultra iGPU ROM installed (/usr/share/kvm/)             ║${NC}"
+echo -e "${GREEN}║  IOMMU enabled + i915/snd_hda_intel blacklisted               ║${NC}"
+fi
 echo -e "${GREEN}║                                                               ║${NC}"
 if [[ "$NEEDS_REBOOT" == true ]]; then
 echo -e "${YELLOW}║  ⚠  REBOOT REQUIRED — kernel was changed to match module     ║${NC}"

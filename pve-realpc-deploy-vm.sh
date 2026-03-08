@@ -11,13 +11,14 @@
 #   - OVMF + Q35 machine type (patched Strong OVMF firmware)
 #   - SATA disk with custom serial
 #   - e1000 NIC with realistic MAC prefix
-#   - Full SMBIOS spoofing (types 0,1,2,3,4,8,9,17)
+#   - Full SMBIOS spoofing (types 0,1,2,3,4,7,8,9,17,26,27,28)
 #   - Custom ACPI tables (ssdt.aml, ssdt-ec.aml, hpet.aml)
 #   - CPU: host with hypervisor=off (NO kvm=off — binary handles it)
-#   - NO -smp override (PVE's cores: handles topology)
+#   - Auto-detect host -smp topology (P/E core–aware thread mapping)
 #   - NO timing args (patched binary handles timers/TSC/NVRAM internally)
 #   - NO extra CPU feature flags (binary handles CPUID internally)
 #   - Optional: ssdt-battery.aml for laptop CPUs / NVIDIA error 43 fix
+#   - Optional: Intel Ultra iGPU passthrough (--igpu) with real GPU ROM
 #
 # Usage:
 #   bash pve-realpc-deploy-vm.sh                    # Interactive / defaults
@@ -33,6 +34,7 @@ IFS=$'\n\t'
 VMID=""                          # Auto-detect next available if empty
 VM_NAME="win10"
 CORES=8                          # CPU cores (goes directly to PVE cores:)
+THREADS_PER_CORE=0               # 0 = auto-detect from host (P/E core aware)
 MEMORY=16384                     # Only 4096, 8192, or 16384 look realistic
 DISK_SIZE="256G"                 # ≥128G to appear realistic
 DISK_STORAGE="local-lvm"        # Where to create the VM disk
@@ -44,6 +46,11 @@ CPU_TYPE="desktop"               # "desktop" = ssdt.aml (no battery), "laptop" =
 VGA="std"                        # "std" initially, "none" for GPU passthrough
 ADD_TPM=false                    # --tpm adds TPM 2.0 (upstream doesn't include it)
 AFFINITY=""                      # Empty = don't set; only written if --affinity passed
+IGPU_PASSTHROUGH=false           # --igpu enables Intel Ultra iGPU passthrough
+IGPU_PCI=""                      # Auto-detect if empty; usually 0000:00:02.0
+IGPU_AUDIO_PCI=""                # Auto-detect if empty; usually 0000:00:1f.3
+IGPU_GMS="0x2"                   # Pre-allocated DVMT: 0x2=64MB (must be ≥ BIOS setting)
+IGPU_ROM="ultra-1-2-qemu10.rom"  # Intel Ultra 1st/2nd gen ROM (Arrow Lake / Lunar Lake)
 SMBIOS_BOARD_MFG="Maxsun"
 SMBIOS_BOARD_PRODUCT="MS-Terminator B760M"
 SMBIOS_BOARD_VERSION="VER:H3.7G(2022/11/29)"
@@ -65,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --vmid)         VMID="$2";              shift 2 ;;
         --name)         VM_NAME="$2";           shift 2 ;;
         --cores)        CORES="$2";             shift 2 ;;
+        --threads)      THREADS_PER_CORE="$2";  shift 2 ;;
         --memory)       MEMORY="$2";            shift 2 ;;
         --disk-size)    DISK_SIZE="$2";         shift 2 ;;
         --disk-storage) DISK_STORAGE="$2";      shift 2 ;;
@@ -76,6 +84,11 @@ while [[ $# -gt 0 ]]; do
         --vga)          VGA="$2";               shift 2 ;;
         --affinity)     AFFINITY="$2";          shift 2 ;;
         --tpm)          ADD_TPM=true;           shift   ;;
+        --igpu)         IGPU_PASSTHROUGH=true;  shift   ;;
+        --igpu-pci)     IGPU_PCI="$2";          shift 2 ;;
+        --igpu-audio)   IGPU_AUDIO_PCI="$2";    shift 2 ;;
+        --igpu-gms)     IGPU_GMS="$2";          shift 2 ;;
+        --igpu-rom)     IGPU_ROM="$2";          shift 2 ;;
         --ostype)       OSTYPE="$2";            shift 2 ;;
         --board-mfg)    SMBIOS_BOARD_MFG="$2";     shift 2 ;;
         --board-product) SMBIOS_BOARD_PRODUCT="$2"; shift 2 ;;
@@ -94,6 +107,7 @@ VM Configuration:
   --vmid NUM           VM ID (default: next available)
   --name NAME          VM name (default: win10)
   --cores NUM          CPU cores (default: 8, goes directly to PVE cores:)
+  --threads NUM        Threads per core: 1|2 (default: auto-detect from host)
   --memory MB          Memory in MB: 4096|8192|16384 (default: 16384)
   --disk-size SIZE     Disk size, e.g. 256G (default: 256G)
   --disk-storage NAME  Storage pool for disks (default: local-lvm)
@@ -106,6 +120,13 @@ VM Configuration:
   --tpm                Add TPM 2.0 device (upstream doesn't include this)
   --affinity RANGE     CPU affinity, e.g. 0-7 (default: none)
   --firewall 0|1       Enable firewall (default: 1)
+
+Intel Ultra iGPU Passthrough:
+  --igpu               Enable Intel Ultra iGPU passthrough (auto-detects PCI)
+  --igpu-pci ADDR      iGPU PCI address, e.g. 0000:00:02.0 (default: auto)
+  --igpu-audio ADDR    Audio PCI address, e.g. 0000:00:1f.3 (default: auto)
+  --igpu-gms HEX       DVMT pre-alloc: 0x2=64M 0x4=128M 0x8=256M (default: 0x2)
+  --igpu-rom FILE      ROM filename in /usr/share/kvm/ (default: ultra-1-2-qemu10.rom)
 
 Identity Spoofing:
   --type desktop|laptop  Desktop (no battery) or laptop (virtual battery)
@@ -131,6 +152,8 @@ Examples:
   ./pve-realpc-deploy-vm.sh
   ./pve-realpc-deploy-vm.sh --vmid 200 --cores 8 --memory 16384
   ./pve-realpc-deploy-vm.sh --type laptop --vga none
+  ./pve-realpc-deploy-vm.sh --igpu                    # iGPU passthrough (auto-detect)
+  ./pve-realpc-deploy-vm.sh --igpu --igpu-gms 0x4     # iGPU with 128MB DVMT
   ./pve-realpc-deploy-vm.sh --cores 24 --affinity 0-23
   ./pve-realpc-deploy-vm.sh --iso-type slim          # Auto-pick slim ISO
   ./pve-realpc-deploy-vm.sh --iso-type stock          # Auto-pick stock ISO
@@ -374,14 +397,39 @@ fi
 info "CPU cores: ${CORES} (PVE handles topology via cores: + sockets:1)"
 
 ###############################################################################
+# Auto-detect host CPU topology for -smp (Priority 2)
+# Ensures VM::THREAD_MISMATCH is not triggered — the VM's thread-per-core
+# count must match what `host` CPU model reports via CPUID.
+###############################################################################
+if [[ "$THREADS_PER_CORE" -eq 0 ]] 2>/dev/null || [[ -z "$THREADS_PER_CORE" ]]; then
+    HOST_THREADS=$(lscpu 2>/dev/null | grep -i 'Thread(s) per core' | awk '{print $NF}')
+    if [[ -n "$HOST_THREADS" && "$HOST_THREADS" -ge 1 ]]; then
+        THREADS_PER_CORE="$HOST_THREADS"
+        info "Auto-detected host threads-per-core: ${THREADS_PER_CORE}"
+    else
+        THREADS_PER_CORE=1
+        warn "Could not detect host threads-per-core, defaulting to 1"
+    fi
+fi
+
+# Calculate topology: sockets × cores × threads must equal total vCPUs
+# PVE's cores: is the total vCPU count when sockets=1 and threads is explicit
+SMP_TOTAL=$((CORES * THREADS_PER_CORE))
+SMP_CORES="$CORES"
+SMP_THREADS="$THREADS_PER_CORE"
+info "SMP topology: ${SMP_TOTAL} vCPUs (1 socket × ${SMP_CORES} cores × ${SMP_THREADS} threads)"
+
+###############################################################################
 # Build QEMU args string
 # ─── IMPORTANT ───────────────────────────────────────────────────────────────
 # The patched QEMU 10 binary (Strong build) handles most anti-detection
 # INTERNALLY, including: timing (TSC/HPET/PIT/RTC), NVRAM/EFI variables,
 # CPUID leaf hiding, system timer obfuscation, and CPU topology masking.
 #
-# Adding extra flags like -smp, -rtc, -overcommit, kvm=off, +invtsc, etc.
+# Adding timer/CPU override flags like -rtc, -overcommit, kvm=off, +invtsc
 # CONFLICTS with the binary's built-in behavior and CAUSES detection.
+# -smp is safe (QEMU fundamental, not anti-detection) and we add it to match
+# the host topology so the binary's masking has accurate data to work with.
 #
 # The args below match the upstream README exactly:
 #   https://github.com/AICodo/pve-emu-realpc
@@ -402,8 +450,10 @@ fi
 #             +pdpe1gb, +umip, +md-clear, +arch-capabilities, tsc-frequency=
 CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true"
 
-# NO -smp args — PVE handles topology from cores: and sockets: in the .conf.
-# Adding -smp in args can conflict with the .conf and cause threadcount mismatch.
+# NO -smp args — topology is set by PVE via cores: and sockets: in the .conf.
+# We explicitly set threads via qm (cores × threads = total vCPUs).
+# The patched QEMU binary needs topology to match host CPUID to avoid
+# VM::THREAD_MISMATCH detection.
 
 # NO timing args — the patched binary handles ALL of these internally:
 #   - TSC frequency / pinning / invtsc
@@ -433,9 +483,59 @@ SMBIOS_ARGS+=" -smbios type=4,manufacturer=\"${SMBIOS_CPU_MFG}\",version=\"${SMB
 SMBIOS_ARGS+=" -smbios type=9"
 # Type 8 — Port Connectors (×2 per author's config)
 SMBIOS_ARGS+=" -smbios type=8 -smbios type=8"
+# Type 7 — CPU Cache (provides L1/L2/L3 cache info to defeat deep SMBIOS fingerprinting)
+SMBIOS_ARGS+=" -smbios type=7"
+# Types 26,27,28 — Voltage/Cooling/Temperature Probes (real systems always have these)
+SMBIOS_ARGS+=" -smbios type=26 -smbios type=27 -smbios type=28"
+
+# Intel Ultra iGPU passthrough args (when --igpu is enabled)
+IGPU_ARGS=""
+if [[ "$IGPU_PASSTHROUGH" == true ]]; then
+    # Force VGA off — real GPU replaces virtual VGA
+    VGA="none"
+    info "iGPU passthrough enabled — VGA set to none"
+
+    # Auto-detect iGPU PCI address
+    if [[ -z "$IGPU_PCI" ]]; then
+        IGPU_PCI=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA|Display' | grep -i Intel | head -1 | awk '{print $1}')
+        if [[ -z "$IGPU_PCI" ]]; then
+            fail "Could not auto-detect Intel iGPU PCI address. Use --igpu-pci to specify."
+        fi
+        info "Auto-detected iGPU: ${IGPU_PCI}"
+    fi
+
+    # Auto-detect audio PCI (Intel HDA, usually 00:1f.3)
+    if [[ -z "$IGPU_AUDIO_PCI" ]]; then
+        IGPU_AUDIO_PCI=$(lspci -Dnn 2>/dev/null | grep -i audio | grep -i Intel | head -1 | awk '{print $1}')
+        if [[ -n "$IGPU_AUDIO_PCI" ]]; then
+            info "Auto-detected audio: ${IGPU_AUDIO_PCI}"
+        else
+            info "No Intel audio device detected — skipping audio passthrough"
+        fi
+    fi
+
+    # Verify ROM file exists on host
+    if [[ ! -f "/usr/share/kvm/${IGPU_ROM}" ]]; then
+        fail "iGPU ROM not found: /usr/share/kvm/${IGPU_ROM}. Run pve-realpc-setup.sh --igpu first."
+    fi
+
+    # IGD passthrough args (QEMU 10+ Intel Ultra)
+    IGPU_ARGS=" -set device.hostpci0.addr=02.0"
+    IGPU_ARGS+=" -set device.hostpci0.x-igd-gms=${IGPU_GMS}"
+    IGPU_ARGS+=" -set device.hostpci0.x-igd-opregion=on"
+    IGPU_ARGS+=" -set device.hostpci0.x-igd-legacy-mode=on"
+    info "iGPU args: IGD opregion=on, GMS=${IGPU_GMS}, legacy-mode=on"
+fi
 
 # Assemble full args line (matches upstream README for QEMU 9/10)
-FULL_ARGS="${ACPI_ARGS} -cpu ${CPU_FLAGS}${SMBIOS_ARGS}"
+# Priority 5: Disable excess PCI root ports — Q35 creates 30+ by default,
+# real systems have 4-8. Excess root ports with no devices trigger VM::EXCESS_PCI.
+PCI_ARGS=" -global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1"
+
+# Priority 2: Override QEMU -smp with auto-detected host topology
+SMP_ARGS=" -smp ${SMP_TOTAL},sockets=1,cores=${SMP_CORES},threads=${SMP_THREADS}"
+
+FULL_ARGS="${ACPI_ARGS} -cpu ${CPU_FLAGS}${SMBIOS_ARGS}${IGPU_ARGS}${PCI_ARGS}${SMP_ARGS}"
 
 ###############################################################################
 # Create the VM via qm
@@ -453,7 +553,7 @@ qm create "$VMID" \
     --ostype "$OSTYPE" \
     --cpu host \
     --sockets 1 \
-    --cores "$CORES" \
+    --cores "$SMP_TOTAL" \
     --memory "$MEMORY" \
     --balloon 0 \
     --numa 0 \
@@ -477,6 +577,18 @@ if [[ "$ADD_TPM" == "true" ]]; then
     info "Adding TPM 2.0 device ..."
     qm set "$VMID" --tpmstate0 "${DISK_STORAGE}:1,version=v2.0"
     ok "TPM 2.0 added"
+fi
+
+# Step 2c: Intel Ultra iGPU passthrough (optional)
+if [[ "$IGPU_PASSTHROUGH" == true ]]; then
+    info "Adding Intel Ultra iGPU passthrough ..."
+    qm set "$VMID" --hostpci0 "${IGPU_PCI},romfile=${IGPU_ROM}"
+    ok "iGPU passthrough: ${IGPU_PCI} with ${IGPU_ROM}"
+
+    if [[ -n "$IGPU_AUDIO_PCI" ]]; then
+        qm set "$VMID" --hostpci1 "${IGPU_AUDIO_PCI}"
+        ok "Audio passthrough: ${IGPU_AUDIO_PCI}"
+    fi
 fi
 
 # Step 3: Add SATA system disk
@@ -546,10 +658,10 @@ echo -e "${GREEN}╠════════════════════
 echo -e "${GREEN}║                                                               ║${NC}"
 echo -e "${GREEN}║  Anti-Detection Features (upstream-compatible):               ║${NC}"
 echo -e "${GREEN}║    ✓ OVMF + Q35 (patched Strong OVMF firmware)               ║${NC}"
-echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 0,1,2,3,4,8,9,17)               ║${NC}"
+echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 0,1,2,3,4,7,8,9,17,26,27,28)   ║${NC}"
 echo -e "${GREEN}║    ✓ ACPI custom tables (ssdt, ssdt-ec, hpet)                ║${NC}"
 echo -e "${GREEN}║    ✓ CPU: host, hypervisor=off (binary hides KVM internally) ║${NC}"
-echo -e "${GREEN}║    ✓ Cores: ${CORES} via PVE (binary handles topology internally)  ║${NC}"
+echo -e "${GREEN}║    ✓ Cores: ${SMP_TOTAL} vCPUs (${SMP_CORES}c × ${SMP_THREADS}t, matches host topology)  ║${NC}"
 echo -e "${GREEN}║    ✓ Timers handled by binary (TSC/HPET/PIT/RTC/NVRAM)       ║${NC}"
 echo -e "${GREEN}║    ✓ EFI NVRAM sanitized (patched OVMF, no pre-enrolled-keys)║${NC}"
 echo -e "${GREEN}║    ✓ e1000 NIC with realistic MAC prefix                     ║${NC}"
@@ -561,6 +673,13 @@ fi
 if [[ "$ADD_TPM" == "true" ]]; then
 echo -e "${GREEN}║    ✓ TPM 2.0 emulation                                       ║${NC}"
 fi
+if [[ "$IGPU_PASSTHROUGH" == true ]]; then
+echo -e "${GREEN}║    ✓ Intel Ultra iGPU passthrough (${IGPU_ROM})   ║${NC}"
+echo -e "${GREEN}║    ✓ IGD: opregion=on, GMS=${IGPU_GMS}, legacy-mode=on          ║${NC}"
+if [[ -n "$IGPU_AUDIO_PCI" ]]; then
+echo -e "${GREEN}║    ✓ Intel HDA audio passthrough (${IGPU_AUDIO_PCI})          ║${NC}"
+fi
+fi
 echo -e "${GREEN}║                                                               ║${NC}"
 echo -e "${GREEN}║  Start VM:  qm start ${VMID}                                       ║${NC}"
 echo -e "${GREEN}║                                                               ║${NC}"
@@ -568,7 +687,7 @@ echo -e "${GREEN}║  Post-Install Tips:                                        
 echo -e "${GREEN}║    • Install Windows normally                                 ║${NC}"
 echo -e "${GREEN}║    • Do NOT install VirtIO/QEMU guest tools                  ║${NC}"
 echo -e "${GREEN}║    • Run windows\\run-tools.bat to clean VM fingerprints      ║${NC}"
-echo -e "${GREEN}║    • For GPU passthrough: change --vga none, add PCI device  ║${NC}"
+echo -e "${GREEN}║    • For GPU passthrough: use --igpu or --vga none + hostpci ║${NC}"
 echo -e "${GREEN}║    • Do NOT enable Hyper-V in the guest                      ║${NC}"
 echo -e "${GREEN}║    • Test with: pafish64.exe, al-khaser, VMAware             ║${NC}"
 echo -e "${GREEN}║                                                               ║${NC}"
