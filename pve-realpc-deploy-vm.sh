@@ -67,7 +67,7 @@ DISK_SERIAL=""                   # Random 20-char if empty
 MEM_SERIAL=""                    # Random 8-char hex if empty
 MEM_ASSET="9876543210"
 FIREWALL=1
-OSTYPE="l26"                     # l26 hides "win" from PCI config; use win10 if you prefer
+OSTYPE="other"                   # 'other' avoids PVE injecting -global ICH9-LPC.disable_s3/s4=1 (l26 does)
 
 # ─── Parse Arguments ────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -119,7 +119,7 @@ VM Configuration:
   --iso-type TYPE      ISO type: slim|stock (auto-filter ISOs by type)
   --bridge NAME        Network bridge (default: vmbr0)
   --vga TYPE           VGA type: std|none|virtio (default: std)
-  --ostype TYPE        OS type: l26|win10|win11 (default: l26)
+  --ostype TYPE        OS type: other|l26|win10|win11 (default: other)
   --tpm                Add TPM 2.0 device (upstream doesn't include this)
   --affinity RANGE     CPU affinity, e.g. 0-7 (default: none)
   --firewall 0|1       Enable firewall (default: 1)
@@ -518,19 +518,23 @@ CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforc
 # These are fixed below via ICH9-LPC globals and a custom PIT SSDT.
 
 # SMBIOS
+# PVE's conf file args: line is parsed by Perl Text::ParseWords::shellwords().
+# Each -smbios value containing spaces MUST be wrapped in single quotes so
+# shellwords delivers it as a single argv token to QEMU. Without this, QEMU
+# interprets the split tokens as file paths and crashes with "Could not open".
 SMBIOS_ARGS=""
 # Type 0 — BIOS
-SMBIOS_ARGS+=" -smbios type=0,vendor=\"${SMBIOS_BIOS_VENDOR}\",version=${SMBIOS_BIOS_VERSION},date='${SMBIOS_BIOS_DATE}',release=${SMBIOS_BIOS_RELEASE}"
-# Type 1 — System
-SMBIOS_ARGS+=" -smbios type=1,manufacturer=\"${SMBIOS_BOARD_MFG}\",product=\"${SMBIOS_BOARD_PRODUCT}\",version=\"${SMBIOS_BOARD_VERSION}\",serial=\"Default string\",sku=\"Default string\",family=\"Default string\""
+SMBIOS_ARGS+=" -smbios 'type=0,vendor=${SMBIOS_BIOS_VENDOR},version=${SMBIOS_BIOS_VERSION},date=${SMBIOS_BIOS_DATE},release=${SMBIOS_BIOS_RELEASE}'"
+# Type 1 — System: set via qm --smbios1 (PVE native) to merge with auto-generated UUID
+# See Step 1b below.
 # Type 2 — Baseboard
-SMBIOS_ARGS+=" -smbios type=2,manufacturer=\"${SMBIOS_BOARD_MFG}\",product=\"${SMBIOS_BOARD_PRODUCT}\",version=\"${SMBIOS_BOARD_VERSION}\",serial=\"Default string\",asset=\"Default string\",location=\"Default string\""
+SMBIOS_ARGS+=" -smbios 'type=2,manufacturer=${SMBIOS_BOARD_MFG},product=${SMBIOS_BOARD_PRODUCT},version=${SMBIOS_BOARD_VERSION},serial=Default string,asset=Default string,location=Default string'"
 # Type 3 — Chassis
-SMBIOS_ARGS+=" -smbios type=3,manufacturer=\"Default string\",version=\"Default string\",serial=\"Default string\",asset=\"Default string\",sku=\"Default string\""
+SMBIOS_ARGS+=" -smbios 'type=3,manufacturer=Default string,version=Default string,serial=Default string,asset=Default string,sku=Default string'"
 # Type 17 — Memory
-SMBIOS_ARGS+=" -smbios type=17,serial=${MEM_SERIAL},asset=\"${MEM_ASSET}\""
+SMBIOS_ARGS+=" -smbios 'type=17,serial=${MEM_SERIAL},asset=${MEM_ASSET}'"
 # Type 4 — Processor
-SMBIOS_ARGS+=" -smbios type=4,manufacturer=\"${SMBIOS_CPU_MFG}\",version=\"${SMBIOS_CPU_VERSION}\""
+SMBIOS_ARGS+=" -smbios 'type=4,manufacturer=${SMBIOS_CPU_MFG},version=${SMBIOS_CPU_VERSION}'"
 # Type 9 — System Slots (bare, triggers slot info generation in Strong build)
 SMBIOS_ARGS+=" -smbios type=9"
 # Type 8 — Port Connectors (×2 per author's config)
@@ -661,6 +665,14 @@ qm create "$VMID" \
     --localtime 1
 
 ok "Base VM created"
+
+# Step 1b: Set SMBIOS type=1 via PVE native smbios1: key
+# PVE auto-generates smbios1: with a UUID. Using qm --smbios1 merges our
+# manufacturer/product/serial fields with the UUID instead of creating a
+# duplicate -smbios type=1 in the args line.
+info "Setting SMBIOS type=1 (system identity) ..."
+qm set "$VMID" --smbios1 "manufacturer=${SMBIOS_BOARD_MFG},product=${SMBIOS_BOARD_PRODUCT},version=${SMBIOS_BOARD_VERSION},serial=Default string,sku=Default string,family=Default string"
+ok "SMBIOS type=1 set via PVE native key"
 
 # Step 2: Add EFI disk
 # Do NOT use pre-enrolled-keys — the patched Strong OVMF firmware handles
