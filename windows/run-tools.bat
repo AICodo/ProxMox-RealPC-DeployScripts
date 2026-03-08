@@ -1,5 +1,4 @@
 @echo off
-chcp 65001 >nul 2>&1
 title ProxMox-RealPC Windows Guest Tools
 color 0B
 
