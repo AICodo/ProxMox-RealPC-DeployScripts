@@ -42,6 +42,7 @@ if %errorlevel% neq 0 (
 echo.
 
 echo ============================================
-echo  All scripts finished.
+echo  All scripts finished. Restarting...
 echo ============================================
+shutdown /r /t 5
 pause

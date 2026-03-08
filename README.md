@@ -288,7 +288,7 @@ bash pve-realpc-deploy-vm.sh --help
 | `--bridge NAME` | `vmbr0` | Network bridge |
 | `--type desktop\|laptop` | `desktop` | Desktop = `ssdt.aml`; Laptop = `ssdt-battery.aml` |
 | `--vga TYPE` | `std` | VGA: `std`, `none` (GPU passthrough), `virtio` |
-| `--ostype TYPE` | `l26` | `l26` hides "win" from PCI config |
+| `--ostype TYPE` | `other` | `other` prevents PVE from injecting S3/S4-disable globals |
 | `--tpm` | off | Add TPM 2.0 device (upstream doesn't include it) |
 | `--affinity RANGE` | none | CPU pinning range (only set if explicitly passed) |
 | `--board-mfg NAME` | `Maxsun` | Motherboard manufacturer |

@@ -46,17 +46,17 @@ Rename-Computer -NewName "DESKTOP-$RandomString" -Force *>$null
 
 # ========== MAC Address ==========
 
-$newMac = ('{0:X}' -f (Get-Random -Maximum 0xFFFFFFFFFFFF)).PadLeft(12, "0") -replace '^(.)(.)', ('$1' + (Get-Random -InputObject 'A','E','2','6')) -replace '\$', ''
+# Use a realistic Intel OUI prefix (matches deploy script's e1000e NIC)
+# Common Intel NIC OUI prefixes that won't trigger VM detection
+$ouiPrefixes = @('D8FC93', '3C2AF4', 'A4BB6D', '8CDFB0', '48B02D', 'B4969B')
+$oui = $ouiPrefixes | Get-Random
+$suffix = ('{0:X}' -f (Get-Random -Maximum 0xFFFFFF)).PadLeft(6, '0')
+$newMac = $oui + $suffix
 $adapter = (Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1).Name
 Set-NetAdapter -Name "$adapter" -MacAddress "$newMac" -Confirm:$false
 
 # ==================================
 
 
-
-# ========== Restart ==========
-
-shutdown /r /t 0
-
-# ==================================
+# NOTE: Reboot is handled by run-tools.bat after all scripts complete.
 

@@ -13,6 +13,17 @@ if (-not (Test-Path $psexecPath)) {
         New-Item -ItemType Directory -Path $tempDir | Out-Null
     }
     Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
+
+    # Verify download integrity before extracting
+    $expectedHash = "A9D54E3BFF117FBF47098EF6CBBE0610CC1A97B4B0D0A94B2D3F27D9B08D3F1E"
+    $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
+    if ($actualHash -ne $expectedHash) {
+        Remove-Item -Path $zipPath -Force
+        Write-Host "[!] PSTools.zip hash mismatch — download may be compromised. Expected: $expectedHash Got: $actualHash" -ForegroundColor Red
+        Write-Host "[!] Update the expected hash in qemu-cleanup.ps1 if Sysinternals released a new version." -ForegroundColor Yellow
+        exit 1
+    }
+
     Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
     Remove-Item -Path $zipPath -Force
 }

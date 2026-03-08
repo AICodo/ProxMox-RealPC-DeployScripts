@@ -54,15 +54,15 @@ IGPU_PCI=""                      # Auto-detect if empty; usually 0000:00:02.0
 IGPU_AUDIO_PCI=""                # Auto-detect if empty; usually 0000:00:1f.3
 IGPU_GMS="0x2"                   # Pre-allocated DVMT: 0x2=64MB (must be ≥ BIOS setting)
 IGPU_ROM="ultra-1-2-qemu10.rom"  # Intel Ultra 1st/2nd gen ROM (Arrow Lake / Lunar Lake)
-SMBIOS_BOARD_MFG="Maxsun"
-SMBIOS_BOARD_PRODUCT="MS-Terminator B760M"
-SMBIOS_BOARD_VERSION="VER:H3.7G(2022/11/29)"
-SMBIOS_BIOS_VENDOR="American Megatrends International LLC."
-SMBIOS_BIOS_VERSION="H3.7G"
-SMBIOS_BIOS_DATE="02/21/2023"
-SMBIOS_BIOS_RELEASE="3.7"
-SMBIOS_CPU_MFG="Intel(R) Corporation"
-SMBIOS_CPU_VERSION=""            # Auto-detect if empty
+SMBIOS_BOARD_MFG=""               # Auto-detect from CPU vendor if empty
+SMBIOS_BOARD_PRODUCT=""            # Auto-detect from CPU vendor if empty
+SMBIOS_BOARD_VERSION=""            # Auto-detect from CPU vendor if empty
+SMBIOS_BIOS_VENDOR=""             # Auto-detect from CPU vendor if empty
+SMBIOS_BIOS_VERSION=""            # Auto-detect from CPU vendor if empty
+SMBIOS_BIOS_DATE=""               # Auto-detect from CPU vendor if empty
+SMBIOS_BIOS_RELEASE=""            # Auto-detect from CPU vendor if empty
+SMBIOS_CPU_MFG=""                 # Auto-detect from CPU vendor if empty
+SMBIOS_CPU_VERSION=""             # Auto-detect if empty
 DISK_SERIAL=""                   # Random 20-char if empty
 MEM_SERIAL=""                    # Random 8-char hex if empty
 MEM_ASSET="9876543210"
@@ -186,14 +186,25 @@ random_hex() {
 }
 
 random_serial_20() {
-    # Generate a realistic 20-char alphanumeric serial
-    od -An -tx1 -N64 /dev/urandom | tr -d ' \n' | head -c 20 | tr '[:lower:]' '[:upper:]'
+    # Generate a realistic 20-char alphanumeric serial (full A-Z 0-9)
+    tr -dc 'A-Z0-9' < /dev/urandom | head -c 20
 }
 
 ###############################################################################
 # Pre-flight
 ###############################################################################
 require_root
+
+# Validate --type is desktop or laptop
+case "$CPU_TYPE" in
+    desktop|laptop) ;;
+    *) fail "Invalid --type '${CPU_TYPE}'. Use: desktop | laptop" ;;
+esac
+
+# Normalize --iso-type to lowercase
+if [[ -n "$ISO_TYPE" ]]; then
+    ISO_TYPE=$(echo "$ISO_TYPE" | tr '[:upper:]' '[:lower:]')
+fi
 
 # Validate memory is realistic
 case "$MEMORY" in
@@ -246,7 +257,12 @@ STOCK_PATTERNS="Win10|Win11|en-us_windows|en_windows|SW_DVD|MediaCreation"
 resolve_iso_path() {
     local iso_dir="/var/lib/vz/template/iso"
     if [[ "$ISO_STORAGE" != "local" ]]; then
-        iso_dir=$(pvesm path "${ISO_STORAGE}:iso/" 2>/dev/null | sed 's|/iso/$||' || echo "$iso_dir")
+        # pvesm path needs a volume ID, not a directory — use a dummy filename
+        local resolved
+        resolved=$(pvesm path "${ISO_STORAGE}:iso/dummy.iso" 2>/dev/null || true)
+        if [[ -n "$resolved" ]]; then
+            iso_dir=$(dirname "$resolved")
+        fi
         [[ -d "$iso_dir" ]] || iso_dir="/var/lib/vz/template/iso"
     fi
     echo "$iso_dir"
@@ -368,22 +384,61 @@ if [[ -z "$ISO_FILE" ]]; then
     fi
 fi
 
+# Auto-detect CPU vendor for SMBIOS defaults
+HOST_CPU_VENDOR="intel"
+if grep -qi "AuthenticAMD" /proc/cpuinfo; then
+    HOST_CPU_VENDOR="amd"
+fi
+
+# Apply vendor-appropriate SMBIOS defaults for any empty fields
+if [[ "$HOST_CPU_VENDOR" == "amd" ]]; then
+    [[ -z "$SMBIOS_BOARD_MFG" ]]    && SMBIOS_BOARD_MFG="Micro-Star International Co., Ltd."
+    [[ -z "$SMBIOS_BOARD_PRODUCT" ]] && SMBIOS_BOARD_PRODUCT="MAG B650 TOMAHAWK WIFI"
+    [[ -z "$SMBIOS_BOARD_VERSION" ]] && SMBIOS_BOARD_VERSION="1.0"
+    [[ -z "$SMBIOS_BIOS_VENDOR" ]]   && SMBIOS_BIOS_VENDOR="American Megatrends International LLC."
+    [[ -z "$SMBIOS_BIOS_VERSION" ]]  && SMBIOS_BIOS_VERSION="A.70"
+    [[ -z "$SMBIOS_BIOS_DATE" ]]     && SMBIOS_BIOS_DATE="09/20/2024"
+    [[ -z "$SMBIOS_BIOS_RELEASE" ]]  && SMBIOS_BIOS_RELEASE="2.29"
+    [[ -z "$SMBIOS_CPU_MFG" ]]       && SMBIOS_CPU_MFG="Advanced Micro Devices, Inc."
+else
+    [[ -z "$SMBIOS_BOARD_MFG" ]]    && SMBIOS_BOARD_MFG="Maxsun"
+    [[ -z "$SMBIOS_BOARD_PRODUCT" ]] && SMBIOS_BOARD_PRODUCT="MS-Terminator B760M"
+    [[ -z "$SMBIOS_BOARD_VERSION" ]] && SMBIOS_BOARD_VERSION="VER:H3.7G(2022/11/29)"
+    [[ -z "$SMBIOS_BIOS_VENDOR" ]]   && SMBIOS_BIOS_VENDOR="American Megatrends International LLC."
+    [[ -z "$SMBIOS_BIOS_VERSION" ]]  && SMBIOS_BIOS_VERSION="H3.7G"
+    [[ -z "$SMBIOS_BIOS_DATE" ]]     && SMBIOS_BIOS_DATE="02/21/2023"
+    [[ -z "$SMBIOS_BIOS_RELEASE" ]]  && SMBIOS_BIOS_RELEASE="3.7"
+    [[ -z "$SMBIOS_CPU_MFG" ]]       && SMBIOS_CPU_MFG="Intel(R) Corporation"
+fi
+info "SMBIOS vendor profile: ${HOST_CPU_VENDOR} (${SMBIOS_BOARD_MFG} / ${SMBIOS_BOARD_PRODUCT})"
+
 # Auto-detect CPU version string for SMBIOS type=4
 if [[ -z "$SMBIOS_CPU_VERSION" ]]; then
     CPU_MODEL=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs)
     if [[ -n "$CPU_MODEL" ]]; then
-        # Extract generation / brand string, then replace specific model with "0000" for stealth
-        # e.g., "13th Gen Intel(R) Core(TM) i7-13700K" → "13th Gen Intel(R) 0000"
-        GEN_PREFIX=$(echo "$CPU_MODEL" | grep -oP '^\d+th Gen' || echo "")
-        if [[ -n "$GEN_PREFIX" ]]; then
-            SMBIOS_CPU_VERSION="${GEN_PREFIX} Intel(R) 0000"
+        if [[ "$HOST_CPU_VENDOR" == "amd" ]]; then
+            # e.g., "AMD Ryzen 9 7950X 16-Core Processor" → "AMD Ryzen 9 0000"
+            SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(AMD Ryzen [0-9]+ ).*/\10000/')
+            # Fallback if sed didn't match
+            [[ "$SMBIOS_CPU_VERSION" == "$CPU_MODEL" ]] && SMBIOS_CPU_VERSION="AMD 0000"
         else
-            # For newer Intel (e.g., "Intel(R) Core(TM) Ultra 9 265K")
-            SMBIOS_CPU_VERSION="Genuine Intel(R) 0000"
+            # Extract generation / brand string, then replace specific model with "0000" for stealth
+            # e.g., "13th Gen Intel(R) Core(TM) i7-13700K" → "13th Gen Intel(R) 0000"
+            GEN_PREFIX=$(echo "$CPU_MODEL" | grep -oP '^\d+th Gen' || echo "")
+            if [[ -n "$GEN_PREFIX" ]]; then
+                SMBIOS_CPU_VERSION="${GEN_PREFIX} Intel(R) 0000"
+            else
+                # For newer Intel (e.g., "Intel(R) Core(TM) Ultra 9 265K")
+                SMBIOS_CPU_VERSION="Genuine Intel(R) 0000"
+            fi
         fi
         info "CPU SMBIOS version string: ${SMBIOS_CPU_VERSION}"
     else
-        SMBIOS_CPU_VERSION="Genuine Intel(R) 0000"
+        if [[ "$HOST_CPU_VENDOR" == "amd" ]]; then
+            SMBIOS_CPU_VERSION="AMD 0000"
+        else
+            SMBIOS_CPU_VERSION="Genuine Intel(R) 0000"
+        fi
     fi
 fi
 
@@ -525,8 +580,9 @@ CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforc
 SMBIOS_ARGS=""
 # Type 0 — BIOS
 SMBIOS_ARGS+=" -smbios 'type=0,vendor=${SMBIOS_BIOS_VENDOR},version=${SMBIOS_BIOS_VERSION},date=${SMBIOS_BIOS_DATE},release=${SMBIOS_BIOS_RELEASE}'"
-# Type 1 — System: set via qm --smbios1 (PVE native) to merge with auto-generated UUID
-# See Step 1b below.
+# Type 1 — System (PVE also generates smbios1: uuid=... which adds a -smbios type=1,uuid=…;
+# QEMU merges duplicate types, so our fields here win for manufacturer/product/etc.)
+SMBIOS_ARGS+=" -smbios 'type=1,manufacturer=${SMBIOS_BOARD_MFG},product=${SMBIOS_BOARD_PRODUCT},version=${SMBIOS_BOARD_VERSION},serial=Default string,sku=Default string,family=Default string'"
 # Type 2 — Baseboard
 SMBIOS_ARGS+=" -smbios 'type=2,manufacturer=${SMBIOS_BOARD_MFG},product=${SMBIOS_BOARD_PRODUCT},version=${SMBIOS_BOARD_VERSION},serial=Default string,asset=Default string,location=Default string'"
 # Type 3 — Chassis
@@ -659,20 +715,11 @@ qm create "$VMID" \
     --memory "$MEMORY" \
     --balloon 0 \
     --numa 0 \
-    --scsihw virtio-scsi-single \
     --net0 "e1000e,bridge=${BRIDGE},firewall=${FIREWALL}" \
     --vga "$VGA" \
     --localtime 1
 
 ok "Base VM created"
-
-# Step 1b: Set SMBIOS type=1 via PVE native smbios1: key
-# PVE auto-generates smbios1: with a UUID. Using qm --smbios1 merges our
-# manufacturer/product/serial fields with the UUID instead of creating a
-# duplicate -smbios type=1 in the args line.
-info "Setting SMBIOS type=1 (system identity) ..."
-qm set "$VMID" --smbios1 "manufacturer=${SMBIOS_BOARD_MFG},product=${SMBIOS_BOARD_PRODUCT},version=${SMBIOS_BOARD_VERSION},serial=Default string,sku=Default string,family=Default string"
-ok "SMBIOS type=1 set via PVE native key"
 
 # Step 2: Add EFI disk
 # Do NOT use pre-enrolled-keys — the patched Strong OVMF firmware handles
@@ -702,6 +749,7 @@ NVRAM_INJECTED=false
 if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; then
     # Resolve the VM's efidisk volume path
     EFI_VOLID=$(grep -oP 'efidisk0:\s*\K[^,]+' "/etc/pve/qemu-server/${VMID}.conf" 2>/dev/null || true)
+    EFI_DISK_PATH=""
     if [[ -n "$EFI_VOLID" ]]; then
         EFI_DISK_PATH=$(pvesm path "$EFI_VOLID" 2>/dev/null || true)
     fi
@@ -819,7 +867,7 @@ fi
 
 # Step 3: Add SATA system disk
 # qm expects size as bare number in GB (e.g. 256, not 256G)
-DISK_SIZE_NUM=$(echo "$DISK_SIZE" | sed 's/[GgMm]$//')
+DISK_SIZE_NUM=$(echo "$DISK_SIZE" | sed 's/[GgMmBbTt]*$//')
 info "Adding SATA system disk (${DISK_SIZE_NUM}GB) ..."
 qm set "$VMID" --sata0 "${DISK_STORAGE}:${DISK_SIZE_NUM},ssd=1,serial=${DISK_SERIAL}"
 ok "SATA disk added with serial ${DISK_SERIAL}"
@@ -855,6 +903,7 @@ sed -i "/^affinity:/d" "$CONF_FILE" 2>/dev/null || true
 # Prepend args as the first line (PVE convention: args at top)
 # Write to /tmp first — /etc/pve is a FUSE filesystem (pmxcfs) where
 # atomic rename within the same mount may behave unexpectedly
+TMP_CONF=$(mktemp /tmp/pve-vm-XXXXXX.conf)
 {
     echo "args: ${FULL_ARGS}"
     # Only add affinity if explicitly requested via --affinity
@@ -862,9 +911,9 @@ sed -i "/^affinity:/d" "$CONF_FILE" 2>/dev/null || true
         echo "affinity: ${AFFINITY}"
     fi
     cat "$CONF_FILE"
-} > "/tmp/pve-vm-${VMID}.conf.tmp"
-cp "/tmp/pve-vm-${VMID}.conf.tmp" "$CONF_FILE"
-rm -f "/tmp/pve-vm-${VMID}.conf.tmp"
+} > "$TMP_CONF"
+cp "$TMP_CONF" "$CONF_FILE"
+rm -f "$TMP_CONF"
 
 ok "Anti-detection args written to config"
 
