@@ -11,7 +11,7 @@
 #   - OVMF + Q35 machine type (patched Strong OVMF firmware)
 #   - SATA disk with custom serial
 #   - e1000e NIC with realistic MAC prefix (Intel 82574L)
-#   - Full SMBIOS spoofing (types 1,2,3,4,8,9,17) — type 0 left to firmware
+#   - Full SMBIOS spoofing (types 0,1,2,3,4,8,9,17)
 #   - Custom ACPI tables (ssdt.aml, ssdt-ec.aml, hpet.aml)
 #   - CPU: host with hypervisor=off, pmu=off (binary handles CPUID/KVM hiding)
 #   - Auto-detect host -smp topology (P/E core–aware thread mapping)
@@ -206,13 +206,6 @@ qemu_escape_commas() {
     # doubled (,,) to pass through. Without this, values like
     # "Micro-Star International Co., Ltd." break QEMU's -smbios parser.
     echo "${1//,/,,}"
-}
-
-pve_smbios_b64() {
-    # PVE's smbios1: string fields (manufacturer, product, serial, etc.) are
-    # validated against regex [A-Za-z0-9+/]+={0,2} — i.e. BASE64.
-    # PVE decodes them before generating the QEMU -smbios type=1 command line.
-    echo -n "$1" | base64 -w0
 }
 
 ###############################################################################
@@ -559,24 +552,23 @@ fi
 # generated DSDT omits it. If PIT is absent → VM detected.
 # Fix: Load a custom SSDT that defines a PNP0100 device at the standard PIT
 # I/O ports (0x40–0x43, IRQ 0). Created by pve-realpc-setup.sh using iasl.
+#
+# NOTE: pit.aml is NOT part of the upstream AICodo project. It's our addition.
+# OVMF is stricter than SeaBIOS about ACPI table validation — if pit.aml causes
+# issues, remove /root/pit.aml and the VM will boot without it (losing 45pts).
 if [[ -f "/root/pit.aml" ]]; then
     ACPI_ARGS+=" -acpitable file=/root/pit.aml"
     info "PIT SSDT loaded (defeats SYSTEM_TIMERS / CLOCK detection)"
 else
-    warn "Missing /root/pit.aml — VMAware CLOCK/SYSTEM_TIMERS (45pts) may trigger."
-    warn "  Re-run pve-realpc-setup.sh to generate it."
+    info "pit.aml not present — skipping (upstream doesn't include it; VMAware CLOCK 45pts may trigger)"
 fi
 
-# CPU flags — MINIMAL, matching upstream with safe AutoVirt-inspired additions.
+# CPU flags — matches upstream exactly:
+#   host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true
 # The patched QEMU 10 binary handles kvm hiding, TSC, invtsc, timing, CPUID internally.
 # Do NOT add: kvm=off, +invtsc, +tsc-deadline, +tsc_adjust, +rdpid, +xsaves,
 #             +pdpe1gb, +umip, +md-clear, +arch-capabilities, tsc-frequency=
-#
-# pmu=off: Disable Performance Monitoring Unit — prevents CPUID PMU-related leaf
-# exposure and performance counters that can leak KVM presence. Real desktops
-# have PMU, but guest software rarely needs it and it's a detection vector.
-# Adapted from AutoVirt: --features "pmu.state=off"
-CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true,pmu=off"
+CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true"
 
 # NO -smp args — topology is set by PVE via cores: and sockets: in the .conf.
 # We explicitly set threads via qm (cores × threads = total vCPUs).
@@ -597,34 +589,27 @@ CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforc
 #   - PIT device ACPI enumeration (PNP0100 not in QEMU's DSDT)
 # These are fixed below via ICH9-LPC globals and a custom PIT SSDT.
 
-# SMBIOS
-# PVE's conf file args: line is parsed by Perl Text::ParseWords::shellwords().
-# Each -smbios value containing spaces MUST be wrapped in single quotes so
-# shellwords delivers it as a single argv token to QEMU. Without this, QEMU
-# interprets the split tokens as file paths and crashes with "Could not open".
+# SMBIOS — matches upstream AICodo/pve-emu-realpc config EXACTLY.
+# PVE's args: line is parsed by Perl Text::ParseWords::shellwords().
+# Upstream uses double-quotes around individual values with spaces; shellwords
+# handles this correctly, passing each -smbios option as a single QEMU argument.
 #
-# Type 0 (BIOS) is INTENTIONALLY OMITTED from args:
-#   OVMF reads type=0 overrides from fw_cfg during its DXE phase. Replacing the
-#   firmware's own BIOS identity table externally causes OVMF's SmbiosPlatformDxe
-#   driver to produce an inconsistent SMBIOS entry point, which can crash the
-#   firmware before display initialization ("Guest has not initialized the display
-#   (yet)" / VNC proxy failure). The patched Strong OVMF firmware already sanitizes
-#   its own type=0 strings for the FIRMWARE check — let it handle its own identity.
-#
-# Type 1 (System) is handled via PVE's native smbios1: config option (see Step 1b
-# after qm create). PVE ALWAYS generates a -smbios type=1,uuid=... entry; adding
-# a second type=1 here in args creates duplicate entries that can conflict.
-# Using smbios1: is the canonical PVE approach and guarantees a single, properly-
-# formatted type=1 with the correct UUID.
+# IMPORTANT: Commas in SMBIOS values must be escaped (doubled) because QEMU's
+# -smbios parser uses commas as field separators. The qemu_escape_commas helper
+# handles this (e.g. "Co., Ltd." → "Co.,, Ltd.").
 SMBIOS_ARGS=""
+# Type 0 — BIOS (upstream includes this — patched OVMF handles coexistence)
+SMBIOS_ARGS+=" -smbios type=0,vendor=\"$(qemu_escape_commas "${SMBIOS_BIOS_VENDOR}")\",version=${SMBIOS_BIOS_VERSION},date='${SMBIOS_BIOS_DATE}',release=${SMBIOS_BIOS_RELEASE}"
+# Type 1 — System (QEMU merges with PVE's smbios1:uuid= for a complete entry)
+SMBIOS_ARGS+=" -smbios type=1,manufacturer=\"$(qemu_escape_commas "${SMBIOS_BOARD_MFG}")\",product=\"$(qemu_escape_commas "${SMBIOS_BOARD_PRODUCT}")\",version=\"$(qemu_escape_commas "${SMBIOS_BOARD_VERSION}")\",serial=\"Default string\",sku=\"Default string\",family=\"Default string\""
 # Type 2 — Baseboard
-SMBIOS_ARGS+=" -smbios 'type=2,manufacturer=$(qemu_escape_commas "${SMBIOS_BOARD_MFG}"),product=$(qemu_escape_commas "${SMBIOS_BOARD_PRODUCT}"),version=$(qemu_escape_commas "${SMBIOS_BOARD_VERSION}"),serial=Default string,asset=Default string,location=Default string'"
+SMBIOS_ARGS+=" -smbios type=2,manufacturer=\"$(qemu_escape_commas "${SMBIOS_BOARD_MFG}")\",product=\"$(qemu_escape_commas "${SMBIOS_BOARD_PRODUCT}")\",version=\"$(qemu_escape_commas "${SMBIOS_BOARD_VERSION}")\",serial=\"Default string\",asset=\"Default string\",location=\"Default string\""
 # Type 3 — Chassis
-SMBIOS_ARGS+=" -smbios 'type=3,manufacturer=Default string,version=Default string,serial=Default string,asset=Default string,sku=Default string'"
+SMBIOS_ARGS+=" -smbios type=3,manufacturer=\"Default string\",version=\"Default string\",serial=\"Default string\",asset=\"Default string\",sku=\"Default string\""
 # Type 17 — Memory
-SMBIOS_ARGS+=" -smbios 'type=17,serial=${MEM_SERIAL},asset=${MEM_ASSET}'"
+SMBIOS_ARGS+=" -smbios type=17,serial=${MEM_SERIAL},asset=\"${MEM_ASSET}\""
 # Type 4 — Processor
-SMBIOS_ARGS+=" -smbios 'type=4,manufacturer=$(qemu_escape_commas "${SMBIOS_CPU_MFG}"),version=$(qemu_escape_commas "${SMBIOS_CPU_VERSION}")'"
+SMBIOS_ARGS+=" -smbios type=4,manufacturer=\"$(qemu_escape_commas "${SMBIOS_CPU_MFG}")\",version=\"$(qemu_escape_commas "${SMBIOS_CPU_VERSION}")\""
 # Type 9 — System Slots (bare, triggers slot info generation in Strong build)
 SMBIOS_ARGS+=" -smbios type=9"
 # Type 8 — Port Connectors (×2 per author's config)
@@ -724,10 +709,12 @@ if [[ "$VGA" == "std" ]]; then
     warn "For best results, pass a real GPU (--igpu) or set resolution to ≥1920x1080 @32bpp in-guest."
 fi
 
-# Priority 2: Override QEMU -smp with auto-detected host topology
-SMP_ARGS=" -smp ${SMP_TOTAL},sockets=1,cores=${SMP_CORES},threads=${SMP_THREADS}"
+# Priority 2: THREAD_MISMATCH — PVE sets topology via cores:/sockets: in the conf.
+# We do NOT add -smp to args; /proc/cpuinfo auto-detection already sets the correct
+# cores: value in the qm create call. Adding -smp to args can conflict with PVE's
+# own -smp generation from cores:/sockets:. (Upstream does NOT use -smp in args.)
 
-FULL_ARGS="${ACPI_ARGS} -cpu ${CPU_FLAGS}${SMBIOS_ARGS}${IGPU_ARGS}${PCI_ARGS}${SMP_ARGS}"
+FULL_ARGS="${ACPI_ARGS} -cpu ${CPU_FLAGS}${SMBIOS_ARGS}${IGPU_ARGS}${PCI_ARGS}"
 
 ###############################################################################
 # Create the VM via qm
@@ -755,19 +742,12 @@ qm create "$VMID" \
 
 ok "Base VM created"
 
-# Step 1b: Build SMBIOS type=1 line for direct conf file injection (done in Step 5).
-# PVE's smbios1: string fields require BASE64 encoding — qm set --smbios1 validates
-# against regex [A-Za-z0-9+/]+={0,2}. Using qm set is fragile, so we write the
-# smbios1: line directly to the conf file alongside args: in Step 5.
-SMBIOS1_MFG=$(pve_smbios_b64 "${SMBIOS_BOARD_MFG}")
-SMBIOS1_PRODUCT=$(pve_smbios_b64 "${SMBIOS_BOARD_PRODUCT}")
-SMBIOS1_VERSION=$(pve_smbios_b64 "${SMBIOS_BOARD_VERSION}")
-SMBIOS1_SERIAL=$(pve_smbios_b64 "Default string")
-SMBIOS1_SKU=$(pve_smbios_b64 "Default string")
-SMBIOS1_FAMILY=$(pve_smbios_b64 "Default string")
+# Step 1b: smbios1: uuid-only (matching upstream exactly).
+# PVE generates `-smbios type=1,uuid=UUID` from this line. The args: line provides
+# the additional type=1 fields (manufacturer, product, etc.) and QEMU merges them.
 SYS_UUID=$(cat /proc/sys/kernel/random/uuid)
-SMBIOS1_LINE="uuid=${SYS_UUID},manufacturer=${SMBIOS1_MFG},product=${SMBIOS1_PRODUCT},version=${SMBIOS1_VERSION},serial=${SMBIOS1_SERIAL},sku=${SMBIOS1_SKU},family=${SMBIOS1_FAMILY}"
-info "Prepared SMBIOS type=1 (uuid=${SYS_UUID}) — will write to conf directly"
+SMBIOS1_LINE="uuid=${SYS_UUID}"
+info "Prepared SMBIOS type=1 (uuid=${SYS_UUID})"
 
 # Step 2: Add EFI disk
 # Do NOT use pre-enrolled-keys — the patched Strong OVMF firmware handles
@@ -793,7 +773,11 @@ ok "EFI disk added"
 # Approach adapted from: https://github.com/Scrut1ny/AutoVirt
 info "Injecting host EFI variables into VM NVRAM (anti-NVRAM detection) ..."
 
+# SAFETY: Back up the pristine OVMF_VARS before modifying. If injection produces
+# a corrupt image, OVMF will hang at "Guest has not initialized the display".
+# We restore from backup if anything goes wrong.
 NVRAM_INJECTED=false
+EFI_BACKUP_PATH=""
 if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; then
     # Resolve the VM's efidisk volume path
     EFI_VOLID=$(grep -oP 'efidisk0:\s*\K[^,]+' "/etc/pve/qemu-server/${VMID}.conf" 2>/dev/null || true)
@@ -803,6 +787,10 @@ if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; th
     fi
 
     if [[ -n "$EFI_DISK_PATH" ]]; then
+        # Back up pristine OVMF_VARS before any modification
+        EFI_BACKUP_PATH="/tmp/pve-efidisk-${VMID}-pristine.qcow2"
+        cp "$EFI_DISK_PATH" "$EFI_BACKUP_PATH" 2>/dev/null || true
+
         # Extract the raw OVMF_VARS partition from the efidisk
         # PVE efidisk is a raw QCOW2 image containing only the VARS region
         NVRAM_WORK="/tmp/pve-nvram-${VMID}"
@@ -865,11 +853,18 @@ if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; th
                     --set-json "$NVRAM_JSON" 2>/dev/null || true
 
                 if [[ -f "$NVRAM_NEW" ]]; then
-                    # Write back to the efidisk
-                    qemu-img convert -f raw -O qcow2 "$NVRAM_NEW" "$EFI_DISK_PATH" 2>/dev/null \
-                        || cp "$NVRAM_NEW" "$EFI_DISK_PATH" 2>/dev/null || true
-                    NVRAM_INJECTED=true
-                    ok "Host EFI variables injected into VM NVRAM (${VAR_COUNT} variables: PK, KEK, db, dbx, defaults)"
+                    # Verify the injected image is a valid size (should be ~256K-4M)
+                    NVRAM_NEW_SIZE=$(stat -c%s "$NVRAM_NEW" 2>/dev/null || echo "0")
+                    if [[ "$NVRAM_NEW_SIZE" -ge 131072 ]]; then
+                        # Write back to the efidisk
+                        qemu-img convert -f raw -O qcow2 "$NVRAM_NEW" "$EFI_DISK_PATH" 2>/dev/null \
+                            || cp "$NVRAM_NEW" "$EFI_DISK_PATH" 2>/dev/null || true
+                        NVRAM_INJECTED=true
+                        ok "Host EFI variables injected into VM NVRAM (${VAR_COUNT} variables: PK, KEK, db, dbx, defaults)"
+                    else
+                        warn "NVRAM injection produced undersized image (${NVRAM_NEW_SIZE} bytes) — restoring pristine backup"
+                        [[ -n "$EFI_BACKUP_PATH" && -f "$EFI_BACKUP_PATH" ]] && cp "$EFI_BACKUP_PATH" "$EFI_DISK_PATH" 2>/dev/null || true
+                    fi
                 fi
             else
                 warn "Could not extract host EFI variables (found ${VAR_COUNT}). Host may not be UEFI or Secure Boot is off."
@@ -878,6 +873,7 @@ if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; th
 
         # Cleanup
         rm -rf "$NVRAM_WORK"
+        [[ -n "$EFI_BACKUP_PATH" && -f "$EFI_BACKUP_PATH" ]] && rm -f "$EFI_BACKUP_PATH"
     else
         warn "Could not resolve EFI disk path for VMID ${VMID}"
     fi
@@ -983,7 +979,7 @@ echo -e "${GREEN}╠════════════════════
 echo -e "${GREEN}║                                                               ║${NC}"
 echo -e "${GREEN}║  Anti-Detection Features (upstream-compatible):               ║${NC}"
 echo -e "${GREEN}║    ✓ OVMF + Q35 (patched Strong OVMF firmware)               ║${NC}"
-echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 1,2,3,4,8,9,17 — 0 by OVMF)  ║${NC}"
+echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 0,1,2,3,4,8,9,17)              ║${NC}"
 echo -e "${GREEN}║    ✓ ACPI custom tables (ssdt, ssdt-ec, hpet, pit)            ║${NC}"
 echo -e "${GREEN}║    ✓ CPU: host, hypervisor=off, pmu=off (binary hides KVM)  ║${NC}"
 echo -e "${GREEN}║    ✓ Cores: ${SMP_TOTAL} vCPUs (${SMP_CORES}c × ${SMP_THREADS}t, matches host topology)  ║${NC}"
