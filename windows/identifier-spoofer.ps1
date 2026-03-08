@@ -119,7 +119,7 @@ Set-Reg -Path "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name "MachineGuid" -Value
 # -- 2. InstallDate / InstallTime ----------------------------------------
 Write-Host "[2/8] InstallDate / InstallTime" -ForegroundColor White
 $dateParams = @{
-    Year   = Get-Random -Min 2018 -Max 2025
+    Year   = Get-Random -Min 2019 -Max 2026
     Month  = Get-Random -Min 1 -Max 13
     Day    = Get-Random -Min 1 -Max 29
     Hour   = Get-Random -Max 24

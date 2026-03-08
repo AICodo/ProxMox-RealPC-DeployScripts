@@ -70,15 +70,20 @@ $Signatures = @(
     "SUBSYS_0627"       # QEMU display adapter subsystem (scoped to SUBSYS)
     "KVMKVMKVM"         # KVM CPUID string
     "ACPI\\QEMU"        # QEMU ACPI device
-    "PNP0A08"           # PCI Express root (benign but check context)
-)
-
-# Additional VMAware-specific registry paths to clean
-$VMAwareRegistryKills = @(
-    # Boot logo - VMAware checks CRC32 of BCD boot graphics (TianoCore hash)
-    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation"
-    # Firmware info that may contain OVMF/TianoCore strings
-    "HKLM:\HARDWARE\DESCRIPTION\System\BIOS"
+    # VirtIO driver / service names (appear in Services tree PSPaths)
+    "viostor"           # VirtIO block storage driver
+    "vioscsi"           # VirtIO SCSI driver
+    "netkvm"            # VirtIO network driver
+    "vioser"            # VirtIO serial driver
+    "vioinput"          # VirtIO input driver
+    "viogpudo"          # VirtIO GPU driver
+    "viorng"            # VirtIO RNG driver
+    "viofs"             # VirtIO filesystem driver
+    "qxldod"            # QEMU QXL display driver
+    "qxl"               # QEMU QXL legacy
+    "FwCfg"             # QEMU firmware config device
+    "BalloonService"    # VirtIO balloon service
+    "blnsvr"            # VirtIO balloon helper
 )
 
 # ACPI-related paths VMAware scans for "#ACPI(Sxx)" display signatures
@@ -158,29 +163,7 @@ function Remove-MatchingKeys {
     }
 }
 
-function Remove-ScsiVmKeys {
-    [CmdletBinding(SupportsShouldProcess)]
-    param([string]$Root, [string[]]$Patterns)
-    if (-not (Test-Path $Root)) { return }
-    $keys = Get-ChildItem -Path $Root -Recurse -ErrorAction SilentlyContinue
-    foreach ($key in $keys) {
-        $Stats.Scanned++
-        $match = $Patterns | Where-Object { $key.PSPath -like "*$_*" }
-        if ($match) {
-            if ($PSCmdlet.ShouldProcess($key.PSPath, "Delete SCSI key")) {
-                Backup-Key $key.PSPath
-                try {
-                    Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction Stop
-                    Write-Host "  [DEL] $($key.PSPath)" -ForegroundColor Green
-                    $Stats.Deleted++
-                } catch {
-                    Write-Host "  [ERR] $($key.PSPath) - $_" -ForegroundColor Yellow
-                    $Stats.Failed++
-                }
-            }
-        }
-    }
-}
+
 
 # -- Main logic (can run inline or via PsExec) --------------------------
 function Invoke-Cleanup {
@@ -195,15 +178,33 @@ function Invoke-Cleanup {
         Remove-MatchingKeys -Root $root -Patterns $Signatures
     }
 
-    Write-Host "`n[*] Scanning SCSI sub-keys ($ScsiRoot) for VM artefacts ..." -ForegroundColor White
-    Remove-ScsiVmKeys -Root $ScsiRoot -Patterns $Signatures
+    # Remove ALL SCSI sub-keys - in a QEMU VM every SCSI device is virtual
+    Write-Host "`n[*] Removing all SCSI sub-keys ($ScsiRoot) ..." -ForegroundColor White
+    if (Test-Path $ScsiRoot) {
+        Get-ChildItem -Path $ScsiRoot -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            $Stats.Scanned++
+            if ($PSCmdlet.ShouldProcess($_.PSPath, "Delete SCSI key")) {
+                Backup-Key $_.PSPath
+                try {
+                    Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction Stop
+                    Write-Host "  [DEL] $($_.PSPath)" -ForegroundColor Green
+                    $Stats.Deleted++
+                } catch {
+                    Write-Host "  [ERR] $($_.PSPath) - $_" -ForegroundColor Yellow
+                    $Stats.Failed++
+                }
+            } else {
+                Write-Host "  [DRY] Would delete: $($_.PSPath)" -ForegroundColor DarkGray
+            }
+        }
+    }
 
     # Extra: remove cached VirtIO / QEMU driver packages from DriverStore
     $driverStore = "$env:SystemRoot\System32\DriverStore\FileRepository"
     if (Test-Path $driverStore) {
         Write-Host "`n[*] Scanning DriverStore for VirtIO leftovers ..." -ForegroundColor White
         Get-ChildItem -Path $driverStore -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match 'vio|virtio|qemu|red_hat|redhat|bochs' } |
+            Where-Object { $_.Name -match 'vio|virtio|qemu|red_hat|redhat|bochs|netkvm|balloon|blnsvr|fwcfg|qxl' } |
             ForEach-Object {
                 $Stats.Scanned++
                 if ($PSCmdlet.ShouldProcess($_.FullName, "Delete driver folder")) {
@@ -226,7 +227,7 @@ function Invoke-Cleanup {
     $biosKey = "HKLM:\HARDWARE\DESCRIPTION\System\BIOS"
     if (Test-Path $biosKey) {
         $biosProps = Get-ItemProperty -Path $biosKey -ErrorAction SilentlyContinue
-        $vmBiosPatterns = 'QEMU|BOCHS|SeaBIOS|EDK II|TianoCore|Red Hat|OVMF|American Megatrends Inc\.|EFI Development Kit'
+        $vmBiosPatterns = 'QEMU|BOCHS|SeaBIOS|EDK II|TianoCore|Red Hat|OVMF|EFI Development Kit'
         foreach ($prop in $biosProps.PSObject.Properties) {
             if ($prop.Name -notmatch '^PS' -and $prop.Value -is [string] -and $prop.Value -match $vmBiosPatterns) {
                 $Stats.Scanned++
@@ -340,10 +341,13 @@ if ($SkipPsExec) {
     # child runs inline instead of trying to download PsExec again.
     Write-Host "[*] Launching cleanup as SYSTEM via PsExec ..." -ForegroundColor Cyan
     $selfPath = $MyInvocation.MyCommand.Path
+    $childArgs = @('-accepteula', '-nobanner', '-s', 'powershell.exe',
+                   '-ExecutionPolicy', 'Bypass', '-File', $selfPath, '-SkipPsExec',
+                   '-BackupFirst', "$BackupFirst")
+    if ($WhatIfPreference) { $childArgs += '-WhatIf' }
     $startArgs = @{
         FilePath     = $psexecPath
-        ArgumentList = @('-accepteula', '-nobanner', '-s', 'powershell.exe',
-                         '-ExecutionPolicy', 'Bypass', '-File', $selfPath, '-SkipPsExec')
+        ArgumentList = $childArgs
         Wait         = $true
         NoNewWindow  = $true
     }
