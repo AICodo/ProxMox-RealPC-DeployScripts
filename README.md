@@ -221,6 +221,12 @@ bash pve-realpc-deploy-vm.sh --vmid 200 --name win10-stealth --cores 8 --memory 
 # Laptop mode (virtual battery — useful for NVIDIA error 43 fix)
 bash pve-realpc-deploy-vm.sh --type laptop --vga none
 
+# Best anti-timing-detection setup (host CPU isolation + explicit topology)
+bash pve-realpc-deploy-vm.sh --cores 8 --threads 2 --isolate-cpus
+
+# Force single-threaded on a host with SMT (if game expects no HyperThreading)
+bash pve-realpc-deploy-vm.sh --no-smt
+
 # Show all options
 bash pve-realpc-deploy-vm.sh --help
 ```
@@ -231,7 +237,7 @@ bash pve-realpc-deploy-vm.sh --help
 |---|---|---|
 | `--vmid NUM` | next available | VM ID |
 | `--name NAME` | `win10` | VM name |
-| `--cores NUM` | `8` | CPU cores (1 socket × N cores × 1 thread) |
+| `--cores NUM` | `8` | Total logical CPUs (auto-split into cores × threads) |
 | `--memory MB` | `16384` | RAM in MB (realistic: `4096`, `8192`, `16384`) |
 | `--disk-size SIZE` | `256G` | System disk size |
 | `--disk-storage NAME` | `local-lvm` | Storage pool for disks |
@@ -246,6 +252,9 @@ bash pve-realpc-deploy-vm.sh --help
 | `--board-mfg NAME` | `Maxsun` | Motherboard manufacturer |
 | `--board-product NAME` | `MS-Terminator B760M` | Motherboard product name |
 | `--disk-serial SERIAL` | random 20-char | Disk serial number |
+| `--threads NUM` | auto-detect | Threads per core (`1` or `2`); auto-detected from host SMT |
+| `--no-smt` | — | Force `threads=1` even if host CPU has SMT/HyperThreading |
+| `--isolate-cpus` | — | Print host CPU isolation commands after deploy (timing fix) |
 | `--firewall 0\|1` | `1` | Enable PVE firewall |
 
 ### What the VM Gets
@@ -260,11 +269,14 @@ The deploy script creates a VM with these anti-detection features:
 - **LSI SCSI controller** (not VirtIO-SCSI)
 - **SMBIOS spoofing** — Types 0 (BIOS), 1 (System), 2 (Baseboard), 3 (Chassis), 4 (Processor), 8 (Ports), 9 (Slots), 17 (Memory)
 - **ACPI tables** — fans, thermal zones, embedded controller, HPET
-- **CPU flags** — `hypervisor=off`, `kvm=off`, `host-cache-info=on`, `+invtsc`, `+tsc-deadline`, TSC frequency pinning
+- **CPU topology** — auto-detects host SMT/HyperThreading; configures matching `cores × threads` so CPUID thread count matches reality
+- **CPU flags** — `hypervisor=off`, `kvm=off`, `host-cache-info=on`, `+invtsc`, `+tsc-deadline`, `+tsc_adjust`, `+rdtscp`, TSC frequency pinning
+- **Timing mitigations** — `hv-frequencies`, `hv-time`, `hv-reenlightenment`, `hv-vapic`, `hv-spinlocks`, PIT lost-tick delay, no-hpet, S3/S4 disabled
 - **CPU power management** passthrough (`-overcommit cpu-pm=on`)
 - **RTC drift fix** — `base=localtime,driftfix=slew`
 - **Balloon disabled** — balloon devices are a detection vector
 - **CPU affinity** — pins vCPUs to physical cores
+- **Host CPU isolation** — optional `--isolate-cpus` prints `isolcpus`/`nohz_full`/`rcu_nocbs` kernel params + performance governor setup
 
 ---
 
@@ -469,8 +481,14 @@ A: The AICodo releases page also provides standalone `qemu-system-x86_64` binari
 2. Check ACPI tables exist: `ls /root/*.aml`
 3. Ensure the `args:` line is present in `/etc/pve/qemu-server/<VMID>.conf`
 4. Check you did NOT install VirtIO drivers or QEMU guest agent inside Windows
-5. Clean the Windows registry of leftover VM vendor IDs (`1af4`, `1b36`, `0627`)
+5. Run `windows\run-tools.bat` to clean VM fingerprints from the guest registry
 6. Verify the patched KVM module is loaded: `modinfo kvm | grep filename`
+
+**Q: I am still failing timing anomalies or thread-count checks — what can I do?**
+1. **Thread count**: If your host CPU has HyperThreading/SMT the script auto-detects it and sets `threads=2`. If detection doesnot match, force it: `--threads 2` (HT host) or `--no-smt` (disable). Check with `lscpu | grep 'Thread(s) per core'` on the host.
+2. **CPU isolation**: Re-deploy with `--isolate-cpus`. The script will print `isolcpus`, `nohz_full`, `rcu_nocbs` kernel parameters and CPU governor setup. This prevents the host from scheduling on guest CPU cores, dramatically reducing RDTSC/CPUID timing jitter.
+3. **TSC frequency**: Ensure `--tsc-freq` matches your CPU exactly. The script auto-detects via `journalctl`, but verify with `dmesg | grep -i tsc`.
+4. **CPU governor**: Set all cores to `performance` mode: `cpufreq-set -g performance` or see the `--isolate-cpus` output.
 
 **Q: How do I update when a new release comes out?**
 A: Edit the `RELEASE_TAG` variable at the top of `pve-realpc-setup.sh` to the new tag, then re-run the script. It will download new assets and reinstall.

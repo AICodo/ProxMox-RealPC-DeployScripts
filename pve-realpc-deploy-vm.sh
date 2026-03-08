@@ -26,7 +26,7 @@ IFS=$'\n\t'
 # ─── Defaults (override with flags) ─────────────────────────────────────────
 VMID=""                          # Auto-detect next available if empty
 VM_NAME="win10"
-CORES=8                          # Physical cores to assign (1 socket × N cores × 1 thread)
+CORES=8                          # Logical CPUs to assign (auto-split into cores×threads)
 MEMORY=16384                     # Only 4096, 8192, or 16384 look realistic
 DISK_SIZE="256G"                 # ≥128G to appear realistic
 DISK_STORAGE="local-lvm"        # Where to create the VM disk
@@ -37,6 +37,9 @@ CPU_TYPE="desktop"               # "desktop" = ssdt.aml (no battery), "laptop" =
 VGA="std"                        # "std" initially, "none" for GPU passthrough
 AFFINITY=""                      # e.g., "0-7" — auto-calculated if empty
 TSC_FREQ=""                      # Auto-detect from /proc/cpuinfo if empty
+THREADS_PER_CORE=""              # Auto-detect from host SMT topology (1 or 2)
+NO_SMT=false                     # Force threads=1 even if host has SMT
+ISOLATE_CPUS=false               # Offer to pin host CPUs for the VM (reduces timing jitter)
 SMBIOS_BOARD_MFG="Maxsun"
 SMBIOS_BOARD_PRODUCT="MS-Terminator B760M"
 SMBIOS_BOARD_VERSION="VER:H3.7G(2022/11/29)"
@@ -68,6 +71,9 @@ while [[ $# -gt 0 ]]; do
         --vga)          VGA="$2";               shift 2 ;;
         --affinity)     AFFINITY="$2";          shift 2 ;;
         --tsc-freq)     TSC_FREQ="$2";          shift 2 ;;
+        --threads)      THREADS_PER_CORE="$2";  shift 2 ;; # 1 or 2
+        --no-smt)       NO_SMT=true;            shift   ;;
+        --isolate-cpus) ISOLATE_CPUS=true;      shift   ;;
         --ostype)       OSTYPE="$2";            shift 2 ;;
         --board-mfg)    SMBIOS_BOARD_MFG="$2";     shift 2 ;;
         --board-product) SMBIOS_BOARD_PRODUCT="$2"; shift 2 ;;
@@ -91,6 +97,9 @@ VM Configuration:
   --ostype TYPE        OS type: l26|win10|win11 (default: l26)
   --affinity RANGE     CPU affinity, e.g. 0-7 (default: auto)
   --tsc-freq HZ        TSC frequency in Hz (default: auto-detect)
+  --threads NUM        Threads per core: 1 or 2 (default: auto from host SMT)
+  --no-smt             Force threads=1 even if host CPU has SMT/HT
+  --isolate-cpus       Print host CPU isolation commands for best timing
   --firewall 0|1       Enable firewall (default: 1)
 
 Identity Spoofing:
@@ -248,6 +257,54 @@ if [[ -z "$SMBIOS_CPU_VERSION" ]]; then
     fi
 fi
 
+###############################################################################
+# Auto-detect SMT / Hyper-Threading topology
+###############################################################################
+if [[ -z "$THREADS_PER_CORE" ]]; then
+    if [[ "$NO_SMT" == "true" ]]; then
+        THREADS_PER_CORE=1
+        info "SMT disabled by --no-smt flag → threads=1"
+    else
+        # Check if host has SMT active
+        HOST_THREADS_PER_CORE=1
+        if [[ -f /sys/devices/system/cpu/smt/active ]]; then
+            SMT_ACTIVE=$(cat /sys/devices/system/cpu/smt/active 2>/dev/null || echo "0")
+            if [[ "$SMT_ACTIVE" == "1" ]]; then
+                HOST_THREADS_PER_CORE=2
+            fi
+        else
+            # Fallback: compare siblings vs cores from /proc/cpuinfo
+            SIBLINGS=$(grep -m1 'siblings' /proc/cpuinfo | awk '{print $NF}')
+            CPU_CORES=$(grep -m1 'cpu cores' /proc/cpuinfo | awk '{print $NF}')
+            if [[ -n "$SIBLINGS" ]] && [[ -n "$CPU_CORES" ]] && (( CPU_CORES > 0 )); then
+                HOST_THREADS_PER_CORE=$(( SIBLINGS / CPU_CORES ))
+            fi
+        fi
+        THREADS_PER_CORE=$HOST_THREADS_PER_CORE
+        if (( THREADS_PER_CORE >= 2 )); then
+            info "Host SMT/HT detected → guest topology will use threads=2"
+        else
+            info "Host has no SMT/HT → guest topology will use threads=1"
+        fi
+    fi
+fi
+
+# Calculate actual cores and threads for SMP
+# CORES from CLI = total logical CPUs desired.  Split into physical × threads.
+if (( THREADS_PER_CORE >= 2 )); then
+    # Ensure CORES is even so it divides cleanly
+    if (( CORES % 2 != 0 )); then
+        CORES=$(( CORES + 1 ))
+        warn "--cores rounded up to ${CORES} for even SMT split"
+    fi
+    SMP_CORES=$(( CORES / THREADS_PER_CORE ))
+    SMP_THREADS=$THREADS_PER_CORE
+else
+    SMP_CORES=$CORES
+    SMP_THREADS=1
+fi
+info "CPU topology: ${CORES} logical = ${SMP_CORES} cores × ${SMP_THREADS} threads"
+
 # Auto-calculate CPU affinity
 if [[ -z "$AFFINITY" ]]; then
     # Pin to the first N physical cores
@@ -279,14 +336,29 @@ if [[ "$CPU_TYPE" == "laptop" ]]; then
     info "Laptop mode: using ssdt-battery.aml (virtual battery for NVIDIA error 43 fix)"
 fi
 
-# CPU flags
-CPU_FLAGS="host,host-cache-info=on,hypervisor=off,kvm=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true,+invtsc,+tsc-deadline"
+# CPU flags — anti-timing-detection additions:
+#   +tsc_adjust       : let guest see TSC_ADJUST MSR (consistent cross-vCPU TSC)
+#   +rdpid            : RDPID instruction (present on real CPUs, often missing in VMs)
+#   +xsaves           : Extended XSAVE states (real CPUs expose this)
+#   +arch-capabilities: suppress Spectre/Meltdown mitigations visible to guest
+#   +pdpe1gb          : 1GB huge pages (modern CPUs always have this)
+#   +umip             : User-Mode Instruction Prevention (present on modern CPUs)
+#   +md-clear         : helps with timing of MDS mitigations
+CPU_FLAGS="host,host-cache-info=on,hypervisor=off,kvm=off,vmware-cpuid-freq=false"
+CPU_FLAGS+=",enforce=false,host-phys-bits=true"
+CPU_FLAGS+=",+invtsc,+tsc-deadline,+tsc_adjust"
+CPU_FLAGS+=",+rdpid,+xsaves,+pdpe1gb,+umip,+md-clear,+arch-capabilities"
 if [[ -n "$TSC_FREQ" ]]; then
-    CPU_FLAGS="${CPU_FLAGS},tsc-frequency=${TSC_FREQ}"
+    CPU_FLAGS+=",tsc-frequency=${TSC_FREQ}"
+fi
+# AMD-specific: topoext passes real topology via CPUID (prevents thread count mismatch)
+if grep -q 'vendor_id.*AuthenticAMD' /proc/cpuinfo 2>/dev/null; then
+    CPU_FLAGS+=",+topoext"
+    info "AMD CPU detected — added +topoext for correct topology exposure"
 fi
 
-# SMP
-SMP_ARGS="-smp ${CORES},sockets=1,cores=${CORES},threads=1"
+# SMP — use the auto-detected topology (cores × threads)
+SMP_ARGS="-smp ${CORES},sockets=1,cores=${SMP_CORES},threads=${SMP_THREADS}"
 
 # SMBIOS
 SMBIOS_ARGS=""
@@ -307,8 +379,14 @@ SMBIOS_ARGS+=" -smbios type=9"
 # Type 8 — Port Connectors (×2 per author's config)
 SMBIOS_ARGS+=" -smbios type=8 -smbios type=8"
 
-# Timing / power
+# Timing / power — anti-timing-detection:
+#   cpu-pm=on          : pass through host CPU power management (C-states visible to guest)
+#   driftfix=slew      : smooth RTC corrections instead of jumping
+#   lost_tick_policy   : delay PIT ticks rather than discard (reduces timing holes)
+#   ICH9-LPC S3/S4 off : prevent sleep-state transitions that expose hypervisor wake latency
 TIMING_ARGS="-overcommit cpu-pm=on -rtc base=localtime,driftfix=slew"
+TIMING_ARGS+=" -global kvm-pit.lost_tick_policy=delay"
+TIMING_ARGS+=" -global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1"
 
 # Assemble full args line
 FULL_ARGS="${ACPI_ARGS} -cpu ${CPU_FLAGS} ${SMP_ARGS} ${TIMING_ARGS}${SMBIOS_ARGS}"
@@ -328,7 +406,7 @@ qm create "$VMID" \
     --ostype "$OSTYPE" \
     --cpu host \
     --sockets 1 \
-    --cores "$CORES" \
+    --cores "$SMP_CORES" \
     --memory "$MEMORY" \
     --balloon 0 \
     --numa 0 \
@@ -398,6 +476,34 @@ rm -f "/tmp/pve-vm-${VMID}.conf.tmp"
 ok "Anti-detection args written to config"
 
 ###############################################################################
+# Host CPU isolation guidance (timing anomaly mitigation)
+###############################################################################
+if [[ "$ISOLATE_CPUS" == "true" ]]; then
+    echo ""
+    echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${YELLOW}│  HOST CPU ISOLATION — for best timing results       │${NC}"
+    echo -e "${YELLOW}└─────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+    echo -e "  To prevent the host from scheduling on the guest's CPUs:"
+    echo ""
+    echo -e "  ${CYAN}1. Add to GRUB kernel command line:${NC}"
+    echo -e "     Edit /etc/default/grub, add to GRUB_CMDLINE_LINUX:"
+    echo -e "       ${GREEN}isolcpus=${AFFINITY} nohz_full=${AFFINITY} rcu_nocbs=${AFFINITY}${NC}"
+    echo ""
+    echo -e "  ${CYAN}2. Set CPU governor to performance:${NC}"
+    echo -e "       ${GREEN}apt install cpufrequtils${NC}"
+    echo -e "       ${GREEN}echo 'GOVERNOR=performance' > /etc/default/cpufrequtils${NC}"
+    echo -e "       ${GREEN}systemctl restart cpufrequtils${NC}"
+    echo ""
+    echo -e "  ${CYAN}3. Update GRUB and reboot:${NC}"
+    echo -e "       ${GREEN}update-grub && reboot${NC}"
+    echo ""
+    echo -e "  This gives the VM exclusive, jitter-free access to cores ${AFFINITY}."
+    echo -e "  Critical for passing RDTSC / CPUID timing checks."
+    echo ""
+fi
+
+###############################################################################
 # Final verification — display the config
 ###############################################################################
 echo ""
@@ -416,8 +522,10 @@ echo -e "${GREEN}║    ✓ OVMF + Q35 (Strong build firmware)                  
 echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 0,1,2,3,4,8,9,17)               ║${NC}"
 echo -e "${GREEN}║    ✓ ACPI custom tables (ssdt, ssdt-ec, hpet)                ║${NC}"
 echo -e "${GREEN}║    ✓ Hypervisor + KVM signature hidden                       ║${NC}"
-echo -e "${GREEN}║    ✓ TSC pinning + invtsc + tsc-deadline                     ║${NC}"
+echo -e "${GREEN}║    ✓ TSC pinning + invtsc + tsc-deadline + tsc_adjust        ║${NC}"
+echo -e "${GREEN}║    ✓ CPU topology: ${SMP_CORES}c/${SMP_THREADS}t (matches host SMT)                ║${NC}"
 echo -e "${GREEN}║    ✓ CPU power management passthrough                        ║${NC}"
+echo -e "${GREEN}║    ✓ PIT lost-tick delay + S3/S4 disabled                    ║${NC}"
 echo -e "${GREEN}║    ✓ RTC drift fix (localtime + slew)                        ║${NC}"
 echo -e "${GREEN}║    ✓ e1000 NIC with realistic MAC prefix                     ║${NC}"
 echo -e "${GREEN}║    ✓ SATA disk with custom serial (no virtio)                ║${NC}"
@@ -432,8 +540,13 @@ echo -e "${GREEN}║                                                            
 echo -e "${GREEN}║  Post-Install Tips:                                           ║${NC}"
 echo -e "${GREEN}║    • Install Windows normally                                 ║${NC}"
 echo -e "${GREEN}║    • Do NOT install VirtIO/QEMU guest tools                  ║${NC}"
-echo -e "${GREEN}║    • Clean registry: remove 1af4/1b36/0627 PCI entries       ║${NC}"
+echo -e "${GREEN}║    • Run windows\\run-tools.bat to clean VM fingerprints      ║${NC}"
 echo -e "${GREEN}║    • For GPU passthrough: change --vga none, add PCI device  ║${NC}"
 echo -e "${GREEN}║    • Do NOT enable Hyper-V in the guest                      ║${NC}"
 echo -e "${GREEN}║    • Test with: pafish64.exe, al-khaser, VMAware             ║${NC}"
+if [[ "$ISOLATE_CPUS" != "true" ]]; then
+echo -e "${GREEN}║                                                               ║${NC}"
+echo -e "${YELLOW}║  ⚠  Timing: re-run with --isolate-cpus for host CPU pinning  ║${NC}"
+fi
+echo -e "${GREEN}║                                                               ║${NC}"
 echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
