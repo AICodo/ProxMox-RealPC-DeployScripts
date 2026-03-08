@@ -108,7 +108,7 @@ The **Strong** build (`_Strong.deb` packages + patched `kvm.ko`) adds CPU sensor
 - **Proxmox VE 8 or 9** (scripts target PVE 9 by default; PVE 8 releases also available upstream)
 - **Root access** on the PVE host
 - **Internet access** (to download release assets from GitHub)
-- A **Windows ISO** uploaded to your PVE ISO storage (for VM deployment)
+- A **Windows ISO** uploaded to your PVE ISO storage (stock or slim/debloated — the deploy script lets you choose)
 - **Intel or AMD** x86_64 CPU
 
 ---
@@ -219,10 +219,20 @@ Creates a single Proxmox VM with every anti-detection measure pre-configured.
 
 ```bash
 # Interactive / all defaults (auto-detects VMID, ISO, CPU version)
+# If multiple ISOs exist, shows an interactive picker with [SLIM]/[STOCK] tags
 bash pve-realpc-deploy-vm.sh
 
 # Custom VM
 bash pve-realpc-deploy-vm.sh --vmid 200 --name win10-stealth --cores 8 --memory 16384
+
+# Use a slim/debloated Windows ISO (auto-filtered by filename patterns)
+bash pve-realpc-deploy-vm.sh --iso-type slim
+
+# Use stock Windows ISO
+bash pve-realpc-deploy-vm.sh --iso-type stock
+
+# Explicit ISO filename
+bash pve-realpc-deploy-vm.sh --iso tiny11_24H2.iso
 
 # Laptop mode (virtual battery — useful for NVIDIA error 43 fix)
 bash pve-realpc-deploy-vm.sh --type laptop --vga none
@@ -248,7 +258,8 @@ bash pve-realpc-deploy-vm.sh --help
 | `--disk-size SIZE` | `256G` | System disk size |
 | `--disk-storage NAME` | `local-lvm` | Storage pool for disks |
 | `--iso-storage NAME` | `local` | Storage pool containing ISOs |
-| `--iso FILENAME` | auto-detect | ISO filename |
+| `--iso FILENAME` | auto-detect | Explicit ISO filename |
+| `--iso-type slim\|stock` | interactive | Auto-filter ISOs by type (see patterns below) |
 | `--bridge NAME` | `vmbr0` | Network bridge |
 | `--type desktop\|laptop` | `desktop` | Desktop = `ssdt.aml`; Laptop = `ssdt-battery.aml` |
 | `--vga TYPE` | `std` | VGA: `std`, `none` (GPU passthrough), `virtio` |
@@ -259,6 +270,20 @@ bash pve-realpc-deploy-vm.sh --help
 | `--board-product NAME` | `MS-Terminator B760M` | Motherboard product name |
 | `--disk-serial SERIAL` | random 20-char | Disk serial number |
 | `--firewall 0\|1` | `1` | Enable PVE firewall |
+
+### ISO Selection
+
+When multiple ISOs exist in storage, the deploy script shows an interactive numbered picker with auto-detected tags:
+
+| Tag | Detected Patterns |
+| --- | --- |
+| **[SLIM]** | `tiny11`, `tiny10`, `atlas`, `revi`, `ghost`, `spectre`, `slim`, `lite`, `compact`, `debloat`, `stripped`, `mini`, `micro`, `optimized`, `ntlite`, `msmg` |
+| **[STOCK]** | `Win10`, `Win11`, `en-us_windows`, `en_windows`, `SW_DVD`, `MediaCreation` |
+
+- **`--iso-type slim`** — shows only slim ISOs (auto-selects if there's exactly one)
+- **`--iso-type stock`** — shows only stock ISOs (falls back to "not slim" if no stock pattern matches)
+- **`--iso FILENAME`** — skips the picker entirely and uses the specified file
+- **No flag** — shows all ISOs with tags and lets you choose
 
 ### What the VM Gets
 
