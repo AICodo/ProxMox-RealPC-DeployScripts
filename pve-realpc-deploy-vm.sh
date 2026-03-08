@@ -2,15 +2,21 @@
 ###############################################################################
 # pve-realpc-deploy-vm.sh — Deploy a Perfect Anti-Detection Windows VM
 #
-# Creates a fully configured Proxmox VM with all anti-detection measures:
-#   - OVMF + Q35 machine type
-#   - SATA disk with custom serial (no virtio/scsi)
+# Creates a fully configured Proxmox VM matching the upstream AICodo/pve-emu-realpc
+# recommended configuration. The patched QEMU 10 binary handles most anti-detection
+# internally (timing, NVRAM, system timers, CPUID, etc.) — the args line is kept
+# intentionally minimal to avoid conflicting with the binary's built-in hiding.
+#
+# Default config (matches upstream exactly):
+#   - OVMF + Q35 machine type (patched Strong OVMF firmware)
+#   - SATA disk with custom serial
 #   - e1000 NIC with realistic MAC prefix
 #   - Full SMBIOS spoofing (types 0,1,2,3,4,8,9,17)
 #   - Custom ACPI tables (ssdt.aml, ssdt-ec.aml, hpet.aml)
-#   - CPU: host with hypervisor=off, kvm=off, TSC pinning, invtsc
-#   - CPU power management passthrough (-overcommit cpu-pm=on)
-#   - RTC drift fix, CPU affinity, balloon disabled
+#   - CPU: host with hypervisor=off (NO kvm=off — binary handles it)
+#   - NO -smp override (PVE's cores: handles topology)
+#   - NO timing args (patched binary handles timers/TSC/NVRAM internally)
+#   - NO extra CPU feature flags (binary handles CPUID internally)
 #   - Optional: ssdt-battery.aml for laptop CPUs / NVIDIA error 43 fix
 #
 # Usage:
@@ -26,20 +32,18 @@ IFS=$'\n\t'
 # ─── Defaults (override with flags) ─────────────────────────────────────────
 VMID=""                          # Auto-detect next available if empty
 VM_NAME="win10"
-CORES=8                          # Logical CPUs to assign (auto-split into cores×threads)
+CORES=8                          # CPU cores (goes directly to PVE cores:)
 MEMORY=16384                     # Only 4096, 8192, or 16384 look realistic
 DISK_SIZE="256G"                 # ≥128G to appear realistic
 DISK_STORAGE="local-lvm"        # Where to create the VM disk
 ISO_STORAGE="local"             # Where ISO files are stored
 ISO_FILE=""                      # Auto-detect if empty
+ISO_TYPE=""                      # "slim"|"stock"|"" for interactive picker
 BRIDGE="vmbr0"                   # Network bridge
 CPU_TYPE="desktop"               # "desktop" = ssdt.aml (no battery), "laptop" = ssdt-battery.aml
 VGA="std"                        # "std" initially, "none" for GPU passthrough
-AFFINITY=""                      # e.g., "0-7" — auto-calculated if empty
-TSC_FREQ=""                      # Auto-detect from /proc/cpuinfo if empty
-THREADS_PER_CORE=""              # Auto-detect from host SMT topology (1 or 2)
-NO_SMT=false                     # Force threads=1 even if host has SMT
-ISOLATE_CPUS=false               # Offer to pin host CPUs for the VM (reduces timing jitter)
+ADD_TPM=false                    # --tpm adds TPM 2.0 (upstream doesn't include it)
+AFFINITY=""                      # Empty = don't set; only written if --affinity passed
 SMBIOS_BOARD_MFG="Maxsun"
 SMBIOS_BOARD_PRODUCT="MS-Terminator B760M"
 SMBIOS_BOARD_VERSION="VER:H3.7G(2022/11/29)"
@@ -66,14 +70,12 @@ while [[ $# -gt 0 ]]; do
         --disk-storage) DISK_STORAGE="$2";      shift 2 ;;
         --iso-storage)  ISO_STORAGE="$2";       shift 2 ;;
         --iso)          ISO_FILE="$2";          shift 2 ;;
+        --iso-type)     ISO_TYPE="$2";          shift 2 ;;  # slim | stock
         --bridge)       BRIDGE="$2";            shift 2 ;;
         --type)         CPU_TYPE="$2";          shift 2 ;;  # desktop | laptop
         --vga)          VGA="$2";               shift 2 ;;
         --affinity)     AFFINITY="$2";          shift 2 ;;
-        --tsc-freq)     TSC_FREQ="$2";          shift 2 ;;
-        --threads)      THREADS_PER_CORE="$2";  shift 2 ;; # 1 or 2
-        --no-smt)       NO_SMT=true;            shift   ;;
-        --isolate-cpus) ISOLATE_CPUS=true;      shift   ;;
+        --tpm)          ADD_TPM=true;           shift   ;;
         --ostype)       OSTYPE="$2";            shift 2 ;;
         --board-mfg)    SMBIOS_BOARD_MFG="$2";     shift 2 ;;
         --board-product) SMBIOS_BOARD_PRODUCT="$2"; shift 2 ;;
@@ -83,23 +85,26 @@ while [[ $# -gt 0 ]]; do
             cat <<'HELPEOF'
 Usage: pve-realpc-deploy-vm.sh [OPTIONS]
 
+This script creates VMs using the EXACT args recommended by the upstream
+AICodo/pve-emu-realpc project. The patched QEMU 10 binary handles timing,
+NVRAM, system timers, CPUID hiding, and topology INTERNALLY — extra args
+flags for those features are intentionally omitted to avoid conflicts.
+
 VM Configuration:
   --vmid NUM           VM ID (default: next available)
   --name NAME          VM name (default: win10)
-  --cores NUM          CPU cores (default: 8)
+  --cores NUM          CPU cores (default: 8, goes directly to PVE cores:)
   --memory MB          Memory in MB: 4096|8192|16384 (default: 16384)
   --disk-size SIZE     Disk size, e.g. 256G (default: 256G)
   --disk-storage NAME  Storage pool for disks (default: local-lvm)
   --iso-storage NAME   Storage pool for ISOs (default: local)
   --iso FILENAME       ISO filename (default: auto-detect Windows ISO)
+  --iso-type TYPE      ISO type: slim|stock (auto-filter ISOs by type)
   --bridge NAME        Network bridge (default: vmbr0)
   --vga TYPE           VGA type: std|none|virtio (default: std)
   --ostype TYPE        OS type: l26|win10|win11 (default: l26)
-  --affinity RANGE     CPU affinity, e.g. 0-7 (default: auto)
-  --tsc-freq HZ        TSC frequency in Hz (default: auto-detect)
-  --threads NUM        Threads per core: 1 or 2 (default: auto from host SMT)
-  --no-smt             Force threads=1 even if host CPU has SMT/HT
-  --isolate-cpus       Print host CPU isolation commands for best timing
+  --tpm                Add TPM 2.0 device (upstream doesn't include this)
+  --affinity RANGE     CPU affinity, e.g. 0-7 (default: none)
   --firewall 0|1       Enable firewall (default: 1)
 
 Identity Spoofing:
@@ -108,10 +113,28 @@ Identity Spoofing:
   --board-product NAME   Motherboard product (default: MS-Terminator B760M)
   --disk-serial SERIAL   20-char disk serial (default: random)
 
+Notes:
+  The patched QEMU 10 binary handles these INTERNALLY (do NOT add manually):
+    - TSC frequency / pinning / invtsc
+    - HPET, PIT, RTC system timers
+    - KVM/hypervisor CPUID leaf hiding
+    - CPU topology masking
+    - EFI NVRAM variable sanitization
+    - CPU power management passthrough
+
+ISO Selection:
+  If multiple ISOs exist, an interactive picker is shown unless --iso or
+  --iso-type is used. ISOs are auto-tagged as [SLIM] or [STOCK] based on
+  filename patterns (tiny11, atlas, revi, ghost, ntlite, msmg, etc.).
+
 Examples:
   ./pve-realpc-deploy-vm.sh
   ./pve-realpc-deploy-vm.sh --vmid 200 --cores 8 --memory 16384
   ./pve-realpc-deploy-vm.sh --type laptop --vga none
+  ./pve-realpc-deploy-vm.sh --cores 24 --affinity 0-23
+  ./pve-realpc-deploy-vm.sh --iso-type slim          # Auto-pick slim ISO
+  ./pve-realpc-deploy-vm.sh --iso-type stock          # Auto-pick stock ISO
+  ./pve-realpc-deploy-vm.sh --iso tiny11_24H2.iso     # Explicit ISO file
 HELPEOF
             exit 0
             ;;
@@ -181,59 +204,140 @@ if qm status "$VMID" &>/dev/null; then
     fail "VM ${VMID} already exists. Use --vmid to specify a different ID."
 fi
 
-# Auto-detect Windows ISO
-if [[ -z "$ISO_FILE" ]]; then
-    ISO_PATH="/var/lib/vz/template/iso"
+# ─── ISO Selection ───────────────────────────────────────────────────────────
+# Resolves the ISO storage path and either uses --iso, auto-filters by
+# --iso-type (slim / stock), or presents an interactive numbered menu.
+#
+# Slim ISO patterns (auto-detected): tiny11, atlas, revi, ghost, spectre,
+#   slim, lite, compact, debloat, stripped, mini, micro, optimized
+# Stock ISO patterns: Win10, Win11, Windows, en-us_, en_windows
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Common patterns for slim / debloated Windows ISOs
+SLIM_PATTERNS="tiny11|tiny10|atlas|revi|ghost|spectre|slim|lite|compact|debloat|stripped|mini[^a-z]|micro|optimized|ntlite|msmg"
+STOCK_PATTERNS="Win10|Win11|en-us_windows|en_windows|SW_DVD|MediaCreation"
+
+resolve_iso_path() {
+    local iso_dir="/var/lib/vz/template/iso"
     if [[ "$ISO_STORAGE" != "local" ]]; then
-        # Try to resolve the storage path
-        ISO_PATH=$(pvesm path "${ISO_STORAGE}:iso/" 2>/dev/null | sed 's|/iso/$||' || echo "/var/lib/vz/template/iso")
-        # Fallback
-        [[ -d "$ISO_PATH" ]] || ISO_PATH="/var/lib/vz/template/iso"
+        iso_dir=$(pvesm path "${ISO_STORAGE}:iso/" 2>/dev/null | sed 's|/iso/$||' || echo "$iso_dir")
+        [[ -d "$iso_dir" ]] || iso_dir="/var/lib/vz/template/iso"
     fi
+    echo "$iso_dir"
+}
 
-    # Search for Windows ISOs
-    if [[ -d "$ISO_PATH" ]]; then
-        ISO_FILE=$(find "$ISO_PATH" -maxdepth 1 -name "*.iso" -iname "*windows*" -printf '%f\n' 2>/dev/null | head -1)
-        if [[ -z "$ISO_FILE" ]]; then
-            # Broader search — any ISO
-            ISO_FILE=$(find "$ISO_PATH" -maxdepth 1 -name "*.iso" -printf '%f\n' 2>/dev/null | head -1)
-        fi
-    fi
+if [[ -z "$ISO_FILE" ]]; then
+    ISO_PATH=$(resolve_iso_path)
 
-    if [[ -z "$ISO_FILE" ]]; then
-        warn "No ISO found in ${ISO_PATH}. VM will be created without a CD-ROM ISO."
-        warn "You can attach one later via: qm set ${VMID} -ide2 ${ISO_STORAGE}:iso/YOUR_ISO.iso,media=cdrom"
+    if [[ ! -d "$ISO_PATH" ]]; then
+        warn "ISO directory ${ISO_PATH} does not exist."
+        ISO_FILE=""
     else
-        info "Auto-detected ISO: ${ISO_FILE}"
-    fi
-fi
+        # Gather all .iso files
+        mapfile -t ALL_ISOS < <(find "$ISO_PATH" -maxdepth 1 -name "*.iso" -printf '%f\n' 2>/dev/null | sort)
 
-# Auto-detect TSC frequency — must be BASE clock, NOT turbo/boost.
-# TSC ticks at the invariant base frequency on modern Intel CPUs.
-if [[ -z "$TSC_FREQ" ]]; then
-    # Best source: kernel's own TSC detection from dmesg
-    TSC_MHZ=$(dmesg 2>/dev/null | grep -oP 'tsc: Detected \K[0-9.]+' | head -1)
-    if [[ -n "$TSC_MHZ" ]]; then
-        TSC_FREQ=$(awk "BEGIN {printf \"%.0f\", ${TSC_MHZ} * 1000000}")
-        info "TSC frequency from kernel: ${TSC_FREQ} Hz (${TSC_MHZ} MHz)"
-    else
-        # Fallback: lscpu "CPU base MHz" or "Model name @ X.XGHz"
-        BASE_MHZ=$(lscpu 2>/dev/null | grep -i "CPU min MHz" | awk '{print $NF}' | cut -d. -f1)
-        # CPU min MHz is often the idle freq, not base — try model name instead
-        if [[ -z "$BASE_MHZ" ]] || [[ "$BASE_MHZ" == "0" ]]; then
-            BASE_MHZ=$(grep -m1 "model name" /proc/cpuinfo | grep -oP '@ \K[0-9.]+' | awk '{printf "%.0f", $1*1000}')
-        fi
-        # Last resort: "CPU MHz" (current frequency, close enough on idle)
-        if [[ -z "$BASE_MHZ" ]] || [[ "$BASE_MHZ" == "0" ]]; then
-            BASE_MHZ=$(lscpu 2>/dev/null | grep -i "^CPU MHz" | head -1 | awk '{print $NF}' | cut -d. -f1)
-        fi
-        if [[ -n "$BASE_MHZ" ]] && [[ "$BASE_MHZ" != "0" ]]; then
-            TSC_FREQ=$(( BASE_MHZ * 1000000 ))
-            info "Auto-detected TSC frequency: ${TSC_FREQ} Hz (${BASE_MHZ} MHz)"
+        if [[ ${#ALL_ISOS[@]} -eq 0 ]]; then
+            warn "No ISO files found in ${ISO_PATH}."
+            warn "You can attach one later: qm set ${VMID} -ide2 ${ISO_STORAGE}:iso/YOUR_ISO.iso,media=cdrom"
+            ISO_FILE=""
+
+        elif [[ -n "$ISO_TYPE" ]]; then
+            # ── Filter by --iso-type ──
+            case "$ISO_TYPE" in
+                slim)
+                    mapfile -t FILTERED < <(printf '%s\n' "${ALL_ISOS[@]}" | grep -iE "$SLIM_PATTERNS" || true)
+                    if [[ ${#FILTERED[@]} -eq 0 ]]; then
+                        warn "No slim ISOs matched. Available ISOs:"
+                        printf '    %s\n' "${ALL_ISOS[@]}"
+                        fail "Use --iso FILENAME to specify manually, or remove --iso-type."
+                    elif [[ ${#FILTERED[@]} -eq 1 ]]; then
+                        ISO_FILE="${FILTERED[0]}"
+                        ok "Auto-selected slim ISO: ${ISO_FILE}"
+                    else
+                        info "Multiple slim ISOs found:"
+                        for i in "${!FILTERED[@]}"; do
+                            echo -e "   ${CYAN}$((i+1))${NC}) ${FILTERED[$i]}"
+                        done
+                        echo -ne "${CYAN}Select [1-${#FILTERED[@]}]:${NC} "
+                        read -r choice
+                        choice=$((choice - 1))
+                        if [[ $choice -ge 0 && $choice -lt ${#FILTERED[@]} ]]; then
+                            ISO_FILE="${FILTERED[$choice]}"
+                        else
+                            fail "Invalid selection."
+                        fi
+                        ok "Selected slim ISO: ${ISO_FILE}"
+                    fi
+                    ;;
+                stock)
+                    mapfile -t FILTERED < <(printf '%s\n' "${ALL_ISOS[@]}" | grep -iE "$STOCK_PATTERNS" || true)
+                    # Also include ISOs that don't match slim patterns as stock candidates
+                    if [[ ${#FILTERED[@]} -eq 0 ]]; then
+                        mapfile -t FILTERED < <(printf '%s\n' "${ALL_ISOS[@]}" | grep -ivE "$SLIM_PATTERNS" || true)
+                    fi
+                    if [[ ${#FILTERED[@]} -eq 0 ]]; then
+                        warn "No stock ISOs matched. Available ISOs:"
+                        printf '    %s\n' "${ALL_ISOS[@]}"
+                        fail "Use --iso FILENAME to specify manually, or remove --iso-type."
+                    elif [[ ${#FILTERED[@]} -eq 1 ]]; then
+                        ISO_FILE="${FILTERED[0]}"
+                        ok "Auto-selected stock ISO: ${ISO_FILE}"
+                    else
+                        info "Multiple stock ISOs found:"
+                        for i in "${!FILTERED[@]}"; do
+                            echo -e "   ${CYAN}$((i+1))${NC}) ${FILTERED[$i]}"
+                        done
+                        echo -ne "${CYAN}Select [1-${#FILTERED[@]}]:${NC} "
+                        read -r choice
+                        choice=$((choice - 1))
+                        if [[ $choice -ge 0 && $choice -lt ${#FILTERED[@]} ]]; then
+                            ISO_FILE="${FILTERED[$choice]}"
+                        else
+                            fail "Invalid selection."
+                        fi
+                        ok "Selected stock ISO: ${ISO_FILE}"
+                    fi
+                    ;;
+                *) fail "Unknown --iso-type '${ISO_TYPE}'. Use: slim | stock" ;;
+            esac
+
+        elif [[ ${#ALL_ISOS[@]} -eq 1 ]]; then
+            # Only one ISO — use it directly
+            ISO_FILE="${ALL_ISOS[0]}"
+            info "Auto-selected ISO (only one available): ${ISO_FILE}"
+
         else
-            warn "Could not auto-detect TSC frequency. Omitting tsc-frequency flag."
-            warn "You can set it manually with --tsc-freq 3900000000 (your base clock in Hz)"
-            TSC_FREQ=""
+            # ── Interactive ISO picker ──
+            echo ""
+            info "═══ ISO Selection ═══"
+            info "Found ${#ALL_ISOS[@]} ISO files in ${ISO_PATH}:"
+            echo ""
+
+            # Classify and tag each ISO
+            for i in "${!ALL_ISOS[@]}"; do
+                local_iso="${ALL_ISOS[$i]}"
+                tag=""
+                if echo "$local_iso" | grep -iqE "$SLIM_PATTERNS"; then
+                    tag="${YELLOW}[SLIM]${NC} "
+                elif echo "$local_iso" | grep -iqE "$STOCK_PATTERNS"; then
+                    tag="${GREEN}[STOCK]${NC}"
+                fi
+                echo -e "   ${CYAN}$((i+1))${NC}) ${tag} ${local_iso}"
+            done
+            echo -e "   ${CYAN}0${NC})  Skip — no ISO (attach later)"
+            echo ""
+            echo -ne "${CYAN}Select ISO [0-${#ALL_ISOS[@]}]:${NC} "
+            read -r choice
+
+            if [[ "$choice" == "0" ]]; then
+                ISO_FILE=""
+                warn "No ISO selected. Attach later: qm set ${VMID} -ide2 ${ISO_STORAGE}:iso/YOUR_ISO.iso,media=cdrom"
+            elif [[ $choice -ge 1 && $choice -le ${#ALL_ISOS[@]} ]]; then
+                ISO_FILE="${ALL_ISOS[$((choice-1))]}"
+                ok "Selected ISO: ${ISO_FILE}"
+            else
+                fail "Invalid selection."
+            fi
         fi
     fi
 fi
@@ -257,62 +361,6 @@ if [[ -z "$SMBIOS_CPU_VERSION" ]]; then
     fi
 fi
 
-###############################################################################
-# Auto-detect SMT / Hyper-Threading topology
-###############################################################################
-if [[ -z "$THREADS_PER_CORE" ]]; then
-    if [[ "$NO_SMT" == "true" ]]; then
-        THREADS_PER_CORE=1
-        info "SMT disabled by --no-smt flag → threads=1"
-    else
-        # Check if host has SMT active
-        HOST_THREADS_PER_CORE=1
-        if [[ -f /sys/devices/system/cpu/smt/active ]]; then
-            SMT_ACTIVE=$(cat /sys/devices/system/cpu/smt/active 2>/dev/null || echo "0")
-            if [[ "$SMT_ACTIVE" == "1" ]]; then
-                HOST_THREADS_PER_CORE=2
-            fi
-        else
-            # Fallback: compare siblings vs cores from /proc/cpuinfo
-            SIBLINGS=$(grep -m1 'siblings' /proc/cpuinfo | awk '{print $NF}')
-            CPU_CORES=$(grep -m1 'cpu cores' /proc/cpuinfo | awk '{print $NF}')
-            if [[ -n "$SIBLINGS" ]] && [[ -n "$CPU_CORES" ]] && (( CPU_CORES > 0 )); then
-                HOST_THREADS_PER_CORE=$(( SIBLINGS / CPU_CORES ))
-            fi
-        fi
-        THREADS_PER_CORE=$HOST_THREADS_PER_CORE
-        if (( THREADS_PER_CORE >= 2 )); then
-            info "Host SMT/HT detected → guest topology will use threads=2"
-        else
-            info "Host has no SMT/HT → guest topology will use threads=1"
-        fi
-    fi
-fi
-
-# Calculate actual cores and threads for SMP
-# CORES from CLI = total logical CPUs desired.  Split into physical × threads.
-if (( THREADS_PER_CORE >= 2 )); then
-    # Ensure CORES is even so it divides cleanly
-    if (( CORES % 2 != 0 )); then
-        CORES=$(( CORES + 1 ))
-        warn "--cores rounded up to ${CORES} for even SMT split"
-    fi
-    SMP_CORES=$(( CORES / THREADS_PER_CORE ))
-    SMP_THREADS=$THREADS_PER_CORE
-else
-    SMP_CORES=$CORES
-    SMP_THREADS=1
-fi
-info "CPU topology: ${CORES} logical = ${SMP_CORES} cores × ${SMP_THREADS} threads"
-
-# Auto-calculate CPU affinity
-if [[ -z "$AFFINITY" ]]; then
-    # Pin to the first N physical cores
-    LAST_CORE=$(( CORES - 1 ))
-    AFFINITY="0-${LAST_CORE}"
-    info "CPU affinity: ${AFFINITY}"
-fi
-
 # Generate random serials if not provided
 if [[ -z "$DISK_SERIAL" ]]; then
     DISK_SERIAL=$(random_serial_20)
@@ -323,10 +371,22 @@ if [[ -z "$MEM_SERIAL" ]]; then
     info "Generated memory serial: ${MEM_SERIAL}"
 fi
 
+info "CPU cores: ${CORES} (PVE handles topology via cores: + sockets:1)"
+
 ###############################################################################
 # Build QEMU args string
+# ─── IMPORTANT ───────────────────────────────────────────────────────────────
+# The patched QEMU 10 binary (Strong build) handles most anti-detection
+# INTERNALLY, including: timing (TSC/HPET/PIT/RTC), NVRAM/EFI variables,
+# CPUID leaf hiding, system timer obfuscation, and CPU topology masking.
+#
+# Adding extra flags like -smp, -rtc, -overcommit, kvm=off, +invtsc, etc.
+# CONFLICTS with the binary's built-in behavior and CAUSES detection.
+#
+# The args below match the upstream README exactly:
+#   https://github.com/AICodo/pve-emu-realpc
 ###############################################################################
-info "Building QEMU args ..."
+info "Building QEMU args (upstream-compatible minimal set) ..."
 
 # ACPI tables
 ACPI_ARGS="-acpitable file=/root/ssdt.aml -acpitable file=/root/ssdt-ec.aml -acpitable file=/root/hpet.aml"
@@ -336,29 +396,24 @@ if [[ "$CPU_TYPE" == "laptop" ]]; then
     info "Laptop mode: using ssdt-battery.aml (virtual battery for NVIDIA error 43 fix)"
 fi
 
-# CPU flags — anti-timing-detection additions:
-#   +tsc_adjust       : let guest see TSC_ADJUST MSR (consistent cross-vCPU TSC)
-#   +rdpid            : RDPID instruction (present on real CPUs, often missing in VMs)
-#   +xsaves           : Extended XSAVE states (real CPUs expose this)
-#   +arch-capabilities: suppress Spectre/Meltdown mitigations visible to guest
-#   +pdpe1gb          : 1GB huge pages (modern CPUs always have this)
-#   +umip             : User-Mode Instruction Prevention (present on modern CPUs)
-#   +md-clear         : helps with timing of MDS mitigations
-CPU_FLAGS="host,host-cache-info=on,hypervisor=off,kvm=off,vmware-cpuid-freq=false"
-CPU_FLAGS+=",enforce=false,host-phys-bits=true"
-CPU_FLAGS+=",+invtsc,+tsc-deadline,+tsc_adjust"
-CPU_FLAGS+=",+rdpid,+xsaves,+pdpe1gb,+umip,+md-clear,+arch-capabilities"
-if [[ -n "$TSC_FREQ" ]]; then
-    CPU_FLAGS+=",tsc-frequency=${TSC_FREQ}"
-fi
-# AMD-specific: topoext passes real topology via CPUID (prevents thread count mismatch)
-if grep -q 'vendor_id.*AuthenticAMD' /proc/cpuinfo 2>/dev/null; then
-    CPU_FLAGS+=",+topoext"
-    info "AMD CPU detected — added +topoext for correct topology exposure"
-fi
+# CPU flags — MINIMAL, matching upstream exactly.
+# The patched QEMU 10 binary handles kvm hiding, TSC, invtsc, timing, CPUID internally.
+# Do NOT add: kvm=off, +invtsc, +tsc-deadline, +tsc_adjust, +rdpid, +xsaves,
+#             +pdpe1gb, +umip, +md-clear, +arch-capabilities, tsc-frequency=
+CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true"
 
-# SMP — use the auto-detected topology (cores × threads)
-SMP_ARGS="-smp ${CORES},sockets=1,cores=${SMP_CORES},threads=${SMP_THREADS}"
+# NO -smp args — PVE handles topology from cores: and sockets: in the .conf.
+# Adding -smp in args can conflict with the .conf and cause threadcount mismatch.
+
+# NO timing args — the patched binary handles ALL of these internally:
+#   - TSC frequency / pinning / invtsc
+#   - HPET timer hiding
+#   - PIT tick policy
+#   - RTC drift correction
+#   - ACPI PM timer obfuscation
+#   - S3/S4 state handling
+#   - CPU power management passthrough
+# Adding -rtc, -overcommit, -global flags overrides the binary and causes detection.
 
 # SMBIOS
 SMBIOS_ARGS=""
@@ -379,17 +434,8 @@ SMBIOS_ARGS+=" -smbios type=9"
 # Type 8 — Port Connectors (×2 per author's config)
 SMBIOS_ARGS+=" -smbios type=8 -smbios type=8"
 
-# Timing / power — anti-timing-detection:
-#   cpu-pm=on          : pass through host CPU power management (C-states visible to guest)
-#   driftfix=slew      : smooth RTC corrections instead of jumping
-#   lost_tick_policy   : delay PIT ticks rather than discard (reduces timing holes)
-#   ICH9-LPC S3/S4 off : prevent sleep-state transitions that expose hypervisor wake latency
-TIMING_ARGS="-overcommit cpu-pm=on -rtc base=localtime,driftfix=slew"
-TIMING_ARGS+=" -global kvm-pit.lost_tick_policy=delay"
-TIMING_ARGS+=" -global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1"
-
-# Assemble full args line
-FULL_ARGS="${ACPI_ARGS} -cpu ${CPU_FLAGS} ${SMP_ARGS} ${TIMING_ARGS}${SMBIOS_ARGS}"
+# Assemble full args line (matches upstream README for QEMU 9/10)
+FULL_ARGS="${ACPI_ARGS} -cpu ${CPU_FLAGS}${SMBIOS_ARGS}"
 
 ###############################################################################
 # Create the VM via qm
@@ -398,6 +444,7 @@ echo ""
 info "═══ Creating VM ${VMID} (${VM_NAME}) ═══"
 
 # Step 1: Create base VM with OVMF + Q35
+# --cores goes directly to PVE cores: — NO SMP override in args
 info "Creating base VM ..."
 qm create "$VMID" \
     --name "$VM_NAME" \
@@ -406,26 +453,31 @@ qm create "$VMID" \
     --ostype "$OSTYPE" \
     --cpu host \
     --sockets 1 \
-    --cores "$SMP_CORES" \
+    --cores "$CORES" \
     --memory "$MEMORY" \
     --balloon 0 \
     --numa 0 \
-    --scsihw lsi \
+    --scsihw virtio-scsi-single \
     --net0 "e1000,bridge=${BRIDGE},firewall=${FIREWALL}" \
     --vga "$VGA" \
     --localtime 1
 
 ok "Base VM created"
 
-# Step 2: Add EFI disk (4m = Secure Boot capable, pre-enrolled MS keys)
-info "Adding EFI disk (Secure Boot capable) ..."
-qm set "$VMID" --efidisk0 "${DISK_STORAGE}:1,efitype=4m,pre-enrolled-keys=1"
-ok "EFI disk added with Secure Boot keys pre-enrolled"
+# Step 2: Add EFI disk
+# Do NOT use pre-enrolled-keys — the patched Strong OVMF firmware handles
+# Secure Boot and EFI variable sanitization internally. pre-enrolled-keys
+# initializes from stock templates that contain detectable NVRAM variables.
+info "Adding EFI disk (patched Strong OVMF firmware) ..."
+qm set "$VMID" --efidisk0 "${DISK_STORAGE}:1,efitype=4m"
+ok "EFI disk added (using patched OVMF — NVRAM variables are sanitized)"
 
-# Step 2b: Add TPM 2.0 (real PCs have TPM — missing one is a detection vector)
-info "Adding TPM 2.0 device ..."
-qm set "$VMID" --tpmstate0 "${DISK_STORAGE}:1,version=v2.0"
-ok "TPM 2.0 added"
+# Step 2b: Add TPM 2.0 (optional — upstream config doesn't include it)
+if [[ "$ADD_TPM" == "true" ]]; then
+    info "Adding TPM 2.0 device ..."
+    qm set "$VMID" --tpmstate0 "${DISK_STORAGE}:1,version=v2.0"
+    ok "TPM 2.0 added"
+fi
 
 # Step 3: Add SATA system disk
 # qm expects size as bare number in GB (e.g. 256, not 256G)
@@ -459,7 +511,7 @@ if grep -q "^args:" "$CONF_FILE" 2>/dev/null; then
     sed -i "/^args:/d" "$CONF_FILE"
 fi
 
-# Remove any existing affinity line
+# Remove any stale affinity line
 sed -i "/^affinity:/d" "$CONF_FILE" 2>/dev/null || true
 
 # Prepend args as the first line (PVE convention: args at top)
@@ -467,41 +519,16 @@ sed -i "/^affinity:/d" "$CONF_FILE" 2>/dev/null || true
 # atomic rename within the same mount may behave unexpectedly
 {
     echo "args: ${FULL_ARGS}"
-    echo "affinity: ${AFFINITY}"
+    # Only add affinity if explicitly requested via --affinity
+    if [[ -n "$AFFINITY" ]]; then
+        echo "affinity: ${AFFINITY}"
+    fi
     cat "$CONF_FILE"
 } > "/tmp/pve-vm-${VMID}.conf.tmp"
 cp "/tmp/pve-vm-${VMID}.conf.tmp" "$CONF_FILE"
 rm -f "/tmp/pve-vm-${VMID}.conf.tmp"
 
 ok "Anti-detection args written to config"
-
-###############################################################################
-# Host CPU isolation guidance (timing anomaly mitigation)
-###############################################################################
-if [[ "$ISOLATE_CPUS" == "true" ]]; then
-    echo ""
-    echo -e "${YELLOW}┌─────────────────────────────────────────────────────────────┐${NC}"
-    echo -e "${YELLOW}│  HOST CPU ISOLATION — for best timing results       │${NC}"
-    echo -e "${YELLOW}└─────────────────────────────────────────────────────────────┘${NC}"
-    echo ""
-    echo -e "  To prevent the host from scheduling on the guest's CPUs:"
-    echo ""
-    echo -e "  ${CYAN}1. Add to GRUB kernel command line:${NC}"
-    echo -e "     Edit /etc/default/grub, add to GRUB_CMDLINE_LINUX:"
-    echo -e "       ${GREEN}isolcpus=${AFFINITY} nohz_full=${AFFINITY} rcu_nocbs=${AFFINITY}${NC}"
-    echo ""
-    echo -e "  ${CYAN}2. Set CPU governor to performance:${NC}"
-    echo -e "       ${GREEN}apt install cpufrequtils${NC}"
-    echo -e "       ${GREEN}echo 'GOVERNOR=performance' > /etc/default/cpufrequtils${NC}"
-    echo -e "       ${GREEN}systemctl restart cpufrequtils${NC}"
-    echo ""
-    echo -e "  ${CYAN}3. Update GRUB and reboot:${NC}"
-    echo -e "       ${GREEN}update-grub && reboot${NC}"
-    echo ""
-    echo -e "  This gives the VM exclusive, jitter-free access to cores ${AFFINITY}."
-    echo -e "  Critical for passing RDTSC / CPUID timing checks."
-    echo ""
-fi
 
 ###############################################################################
 # Final verification — display the config
@@ -517,23 +544,23 @@ echo -e "${GREEN}╔════════════════════
 echo -e "${GREEN}║   VM ${VMID} (${VM_NAME}) deployed successfully!                     ║${NC}"
 echo -e "${GREEN}╠═══════════════════════════════════════════════════════════════╣${NC}"
 echo -e "${GREEN}║                                                               ║${NC}"
-echo -e "${GREEN}║  Anti-Detection Features:                                     ║${NC}"
-echo -e "${GREEN}║    ✓ OVMF + Q35 (Strong build firmware)                      ║${NC}"
+echo -e "${GREEN}║  Anti-Detection Features (upstream-compatible):               ║${NC}"
+echo -e "${GREEN}║    ✓ OVMF + Q35 (patched Strong OVMF firmware)               ║${NC}"
 echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 0,1,2,3,4,8,9,17)               ║${NC}"
 echo -e "${GREEN}║    ✓ ACPI custom tables (ssdt, ssdt-ec, hpet)                ║${NC}"
-echo -e "${GREEN}║    ✓ Hypervisor + KVM signature hidden                       ║${NC}"
-echo -e "${GREEN}║    ✓ TSC pinning + invtsc + tsc-deadline + tsc_adjust        ║${NC}"
-echo -e "${GREEN}║    ✓ CPU topology: ${SMP_CORES}c/${SMP_THREADS}t (matches host SMT)                ║${NC}"
-echo -e "${GREEN}║    ✓ CPU power management passthrough                        ║${NC}"
-echo -e "${GREEN}║    ✓ PIT lost-tick delay + S3/S4 disabled                    ║${NC}"
-echo -e "${GREEN}║    ✓ RTC drift fix (localtime + slew)                        ║${NC}"
+echo -e "${GREEN}║    ✓ CPU: host, hypervisor=off (binary hides KVM internally) ║${NC}"
+echo -e "${GREEN}║    ✓ Cores: ${CORES} via PVE (binary handles topology internally)  ║${NC}"
+echo -e "${GREEN}║    ✓ Timers handled by binary (TSC/HPET/PIT/RTC/NVRAM)       ║${NC}"
+echo -e "${GREEN}║    ✓ EFI NVRAM sanitized (patched OVMF, no pre-enrolled-keys)║${NC}"
 echo -e "${GREEN}║    ✓ e1000 NIC with realistic MAC prefix                     ║${NC}"
 echo -e "${GREEN}║    ✓ SATA disk with custom serial (no virtio)                ║${NC}"
-echo -e "${GREEN}║    ✓ LSI SCSI controller (no virtio-scsi)                    ║${NC}"
-echo -e "${GREEN}║    ✓ Secure Boot (4m OVMF, pre-enrolled keys)                ║${NC}"
-echo -e "${GREEN}║    ✓ TPM 2.0 emulation                                       ║${NC}"
 echo -e "${GREEN}║    ✓ Balloon disabled                                        ║${NC}"
+if [[ -n "$AFFINITY" ]]; then
 echo -e "${GREEN}║    ✓ CPU affinity: ${AFFINITY}                                      ║${NC}"
+fi
+if [[ "$ADD_TPM" == "true" ]]; then
+echo -e "${GREEN}║    ✓ TPM 2.0 emulation                                       ║${NC}"
+fi
 echo -e "${GREEN}║                                                               ║${NC}"
 echo -e "${GREEN}║  Start VM:  qm start ${VMID}                                       ║${NC}"
 echo -e "${GREEN}║                                                               ║${NC}"
@@ -544,9 +571,5 @@ echo -e "${GREEN}║    • Run windows\\run-tools.bat to clean VM fingerprints 
 echo -e "${GREEN}║    • For GPU passthrough: change --vga none, add PCI device  ║${NC}"
 echo -e "${GREEN}║    • Do NOT enable Hyper-V in the guest                      ║${NC}"
 echo -e "${GREEN}║    • Test with: pafish64.exe, al-khaser, VMAware             ║${NC}"
-if [[ "$ISOLATE_CPUS" != "true" ]]; then
-echo -e "${GREEN}║                                                               ║${NC}"
-echo -e "${YELLOW}║  ⚠  Timing: re-run with --isolate-cpus for host CPU pinning  ║${NC}"
-fi
 echo -e "${GREEN}║                                                               ║${NC}"
 echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"

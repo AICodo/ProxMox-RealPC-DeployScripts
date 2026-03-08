@@ -84,13 +84,19 @@ Injected `.aml` tables add hardware that real PCs have but VMs normally lack:
 | `ssdt-battery.aml` | Virtual battery (laptop mode / NVIDIA error 43 fix) |
 
 ### Layer 5 — Runtime VM Configuration
-Applied by `pve-realpc-deploy-vm.sh`:
-- `hypervisor=off` + `kvm=off` in CPU flags
+Applied by `pve-realpc-deploy-vm.sh` (matches upstream recommended args exactly):
+- `-cpu host` with `hypervisor=off` (NO `kvm=off` — the patched binary hides KVM internally)
 - `e1000` NIC with physical vendor MAC OUI (`D8:FC:93`)
 - SATA disk with randomized serial (no VirtIO)
-- TSC frequency pinning + `invtsc`
-- CPU power management passthrough (`-overcommit cpu-pm=on`)
-- Balloon disabled, LSI SCSI controller
+- Custom ACPI tables (`ssdt.aml`, `ssdt-ec.aml`, `hpet.aml`)
+- Full SMBIOS spoofing (types 0,1,2,3,4,8,9,17)
+- Balloon disabled
+- **NO** `-smp` override (PVE's `cores:` handles topology — adding `-smp` causes thread count mismatch)
+- **NO** timing args (patched binary handles TSC/HPET/PIT/RTC/NVRAM internally)
+- **NO** extra CPU feature flags (patched binary handles CPUID hiding internally)
+- **NO** `pre-enrolled-keys` (patched OVMF handles EFI variable sanitization internally)
+
+> **Why so minimal?** The upstream author states: *"In QEMU 10, all args parameters are now handled internally except for what's shown above (others are hidden/customized)."* Adding extra flags like `kvm=off`, `-overcommit cpu-pm=on`, `-rtc`, `-smp`, `+invtsc`, `tsc-frequency=` etc. **conflicts** with the binary's built-in behavior and **causes** detection failures for timing anomalies, NVRAM, system timers, and thread count.
 
 ### Strong Build (Enhanced)
 The **Strong** build (`_Strong.deb` packages + patched `kvm.ko`) adds CPU sensor passthrough — temperature, MHz, voltage, and power consumption are visible inside the Windows guest via CPU-Z, HWiNFO, HWMonitor. Supports both Intel and AMD CPUs.
@@ -212,7 +218,7 @@ Creates a single Proxmox VM with every anti-detection measure pre-configured.
 ### Usage
 
 ```bash
-# Interactive / all defaults (auto-detects VMID, ISO, TSC frequency, CPU affinity)
+# Interactive / all defaults (auto-detects VMID, ISO, CPU version)
 bash pve-realpc-deploy-vm.sh
 
 # Custom VM
@@ -221,11 +227,11 @@ bash pve-realpc-deploy-vm.sh --vmid 200 --name win10-stealth --cores 8 --memory 
 # Laptop mode (virtual battery — useful for NVIDIA error 43 fix)
 bash pve-realpc-deploy-vm.sh --type laptop --vga none
 
-# Best anti-timing-detection setup (host CPU isolation + explicit topology)
-bash pve-realpc-deploy-vm.sh --cores 8 --threads 2 --isolate-cpus
+# Full 24-core CPU with explicit affinity pinning
+bash pve-realpc-deploy-vm.sh --cores 24 --affinity 0-23
 
-# Force single-threaded on a host with SMT (if game expects no HyperThreading)
-bash pve-realpc-deploy-vm.sh --no-smt
+# Add TPM 2.0 (optional — upstream doesn't include it)
+bash pve-realpc-deploy-vm.sh --tpm
 
 # Show all options
 bash pve-realpc-deploy-vm.sh --help
@@ -237,7 +243,7 @@ bash pve-realpc-deploy-vm.sh --help
 |---|---|---|
 | `--vmid NUM` | next available | VM ID |
 | `--name NAME` | `win10` | VM name |
-| `--cores NUM` | `8` | Total logical CPUs (auto-split into cores × threads) |
+| `--cores NUM` | `8` | CPU cores (goes directly to PVE `cores:`) |
 | `--memory MB` | `16384` | RAM in MB (realistic: `4096`, `8192`, `16384`) |
 | `--disk-size SIZE` | `256G` | System disk size |
 | `--disk-storage NAME` | `local-lvm` | Storage pool for disks |
@@ -247,36 +253,35 @@ bash pve-realpc-deploy-vm.sh --help
 | `--type desktop\|laptop` | `desktop` | Desktop = `ssdt.aml`; Laptop = `ssdt-battery.aml` |
 | `--vga TYPE` | `std` | VGA: `std`, `none` (GPU passthrough), `virtio` |
 | `--ostype TYPE` | `l26` | `l26` hides "win" from PCI config |
-| `--affinity RANGE` | auto (`0-N`) | CPU pinning range |
-| `--tsc-freq HZ` | auto-detect | TSC frequency in Hz |
+| `--tpm` | off | Add TPM 2.0 device (upstream doesn't include it) |
+| `--affinity RANGE` | none | CPU pinning range (only set if explicitly passed) |
 | `--board-mfg NAME` | `Maxsun` | Motherboard manufacturer |
 | `--board-product NAME` | `MS-Terminator B760M` | Motherboard product name |
 | `--disk-serial SERIAL` | random 20-char | Disk serial number |
-| `--threads NUM` | auto-detect | Threads per core (`1` or `2`); auto-detected from host SMT |
-| `--no-smt` | — | Force `threads=1` even if host CPU has SMT/HyperThreading |
-| `--isolate-cpus` | — | Print host CPU isolation commands after deploy (timing fix) |
 | `--firewall 0\|1` | `1` | Enable PVE firewall |
 
 ### What the VM Gets
 
-The deploy script creates a VM with these anti-detection features:
+The deploy script creates a VM matching the upstream AICodo/pve-emu-realpc recommended configuration:
 
-- **OVMF + Q35** machine type with patched firmware
-- **Secure Boot** (4M OVMF, pre-enrolled Microsoft keys)
-- **TPM 2.0** emulation
+- **OVMF + Q35** machine type with patched Strong OVMF firmware
+- **EFI disk** without `pre-enrolled-keys` (patched OVMF sanitizes NVRAM variables internally)
 - **SATA disk** with randomized serial (no VirtIO — VirtIO vendor IDs are a detection vector)
 - **e1000 NIC** with Dell/Intel MAC prefix (`D8:FC:93`)
-- **LSI SCSI controller** (not VirtIO-SCSI)
 - **SMBIOS spoofing** — Types 0 (BIOS), 1 (System), 2 (Baseboard), 3 (Chassis), 4 (Processor), 8 (Ports), 9 (Slots), 17 (Memory)
 - **ACPI tables** — fans, thermal zones, embedded controller, HPET
-- **CPU topology** — auto-detects host SMT/HyperThreading; configures matching `cores × threads` so CPUID thread count matches reality
-- **CPU flags** — `hypervisor=off`, `kvm=off`, `host-cache-info=on`, `+invtsc`, `+tsc-deadline`, `+tsc_adjust`, `+rdtscp`, TSC frequency pinning
-- **Timing mitigations** — `hv-frequencies`, `hv-time`, `hv-reenlightenment`, `hv-vapic`, `hv-spinlocks`, PIT lost-tick delay, no-hpet, S3/S4 disabled
-- **CPU power management** passthrough (`-overcommit cpu-pm=on`)
-- **RTC drift fix** — `base=localtime,driftfix=slew`
+- **CPU flags** — `host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true` (matches upstream exactly)
 - **Balloon disabled** — balloon devices are a detection vector
-- **CPU affinity** — pins vCPUs to physical cores
-- **Host CPU isolation** — optional `--isolate-cpus` prints `isolcpus`/`nohz_full`/`rcu_nocbs` kernel params + performance governor setup
+- Optional: **TPM 2.0** (`--tpm`), **CPU affinity** (`--affinity`)
+
+**What the patched QEMU 10 binary handles internally** (do NOT add these manually):
+- KVM/hypervisor CPUID leaf hiding (`kvm=off` is handled inside the binary)
+- TSC frequency pinning, `invtsc`, `tsc-deadline`, `tsc_adjust`
+- System timers: HPET, PIT, RTC, ACPI PM timer obfuscation
+- EFI NVRAM variable sanitization
+- CPU power management passthrough
+- CPU topology masking
+- S3/S4 sleep state handling
 
 ---
 
@@ -478,17 +483,38 @@ A: The AICodo releases page also provides standalone `qemu-system-x86_64` binari
 
 **Q: The VM still gets detected — what should I check?**
 1. Verify the Strong QEMU binary is installed: `ls -la /usr/bin/qemu-system-x86_64` (should be ~29.7 MB)
-2. Check ACPI tables exist: `ls /root/*.aml`
-3. Ensure the `args:` line is present in `/etc/pve/qemu-server/<VMID>.conf`
-4. Check you did NOT install VirtIO drivers or QEMU guest agent inside Windows
-5. Run `windows\run-tools.bat` to clean VM fingerprints from the guest registry
-6. Verify the patched KVM module is loaded: `modinfo kvm | grep filename`
+2. Verify the **Strong OVMF** is installed (not stock): `dpkg -l | grep pve-edk2-firmware`
+3. Check ACPI tables exist: `ls /root/*.aml`
+4. Ensure the `args:` line in `/etc/pve/qemu-server/<VMID>.conf` matches the upstream minimal format (see below)
+5. **Remove any extra args**: `kvm=off`, `-smp`, `-rtc`, `-overcommit`, `-global`, `+invtsc`, `tsc-frequency=`, `affinity:` — the binary handles these internally
+6. **Remove `pre-enrolled-keys=1`** from `efidisk0:` — stock OVMF templates contain detectable NVRAM variables
+7. Check you did NOT install VirtIO drivers or QEMU guest agent inside Windows
+8. Run `windows\run-tools.bat` to clean VM fingerprints from the guest registry
+9. Verify the patched KVM module is loaded: `modinfo kvm | grep filename`
 
-**Q: I am still failing timing anomalies or thread-count checks — what can I do?**
-1. **Thread count**: If your host CPU has HyperThreading/SMT the script auto-detects it and sets `threads=2`. If detection doesnot match, force it: `--threads 2` (HT host) or `--no-smt` (disable). Check with `lscpu | grep 'Thread(s) per core'` on the host.
-2. **CPU isolation**: Re-deploy with `--isolate-cpus`. The script will print `isolcpus`, `nohz_full`, `rcu_nocbs` kernel parameters and CPU governor setup. This prevents the host from scheduling on guest CPU cores, dramatically reducing RDTSC/CPUID timing jitter.
-3. **TSC frequency**: Ensure `--tsc-freq` matches your CPU exactly. The script auto-detects via `journalctl`, but verify with `dmesg | grep -i tsc`.
-4. **CPU governor**: Set all cores to `performance` mode: `cpufreq-set -g performance` or see the `--isolate-cpus` output.
+**Q: I'm failing timing anomalies, NVRAM, system timers, or thread count — what went wrong?**
+
+The patched QEMU 10 binary handles **all** of these internally. If you're failing, it's almost certainly because extra args flags are **conflicting** with the binary's built-in handling. The upstream author explicitly states:
+
+> *"In QEMU 10, all args parameters are now handled internally except for what's shown above (others are hidden/customized)."*
+
+**Solution:** Strip your args to match upstream exactly:
+```
+args: -acpitable file=/root/ssdt.aml -acpitable file=/root/ssdt-ec.aml -acpitable file=/root/hpet.aml -cpu host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true -smbios type=0,... -smbios type=1,... [etc.]
+```
+**Remove** these if present:
+- `kvm=off` from CPU flags (binary hides KVM internally)
+- `-smp ...` (let PVE handle topology via `cores:` and `sockets:`)
+- `-overcommit cpu-pm=on` (binary handles CPU PM)
+- `-rtc base=localtime,driftfix=slew` (binary handles RTC)
+- `-global kvm-pit.lost_tick_policy=delay` (binary handles PIT)
+- `-global ICH9-LPC.disable_s3=1` / `disable_s4=1` (binary handles S3/S4)
+- `+invtsc`, `+tsc-deadline`, `+tsc_adjust`, `+rdpid`, `+xsaves`, `+pdpe1gb`, `+umip`, `+md-clear`, `+arch-capabilities` (binary handles CPUID)
+- `tsc-frequency=...` (binary handles TSC)
+- `affinity:` line (not needed)
+- `pre-enrolled-keys=1` on `efidisk0:` (causes detectable NVRAM)
+
+Also verify your `efidisk0:` does NOT have `pre-enrolled-keys=1` — the patched OVMF handles EFI variables internally.
 
 **Q: How do I update when a new release comes out?**
 A: Edit the `RELEASE_TAG` variable at the top of `pve-realpc-setup.sh` to the new tag, then re-run the script. It will download new assets and reinstall.
