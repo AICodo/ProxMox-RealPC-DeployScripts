@@ -559,6 +559,35 @@ else
     warn "Strong OVMF .deb not found in .tgz — skipping (base install still active)"
 fi
 
+# Install virt-fw-vars for NVRAM anti-detection (host EFI variable injection)
+# The deploy script uses this to populate the VM's OVMF NVRAM with real host
+# Secure Boot certificates, defeating VMAware's NVRAM check (100pts).
+if ! command -v virt-fw-vars &>/dev/null; then
+    info "Installing python3-virt-firmware (needed for NVRAM anti-detection) ..."
+    apt-get install -y python3-virt-firmware 2>&1 | tail -5 \
+        || pip3 install virt-firmware 2>&1 | tail -3 \
+        || warn "Could not install virt-firmware — NVRAM injection in deploy script will be skipped"
+    if command -v virt-fw-vars &>/dev/null; then
+        ok "virt-fw-vars installed (NVRAM anti-detection ready)"
+    fi
+else
+    ok "virt-fw-vars already installed"
+fi
+
+# Install iasl (ACPI compiler) for PIT SSDT generation
+# The deploy script loads a custom PIT SSDT to defeat VMAware's SYSTEM_TIMERS /
+# CLOCK check (45pts). iasl compiles ASL source into the binary AML format.
+if ! command -v iasl &>/dev/null; then
+    info "Installing acpica-tools (needed for PIT SSDT compilation) ..."
+    apt-get install -y acpica-tools 2>&1 | tail -5 \
+        || warn "Could not install acpica-tools — PIT SSDT generation will be skipped"
+    if command -v iasl &>/dev/null; then
+        ok "iasl installed (PIT SSDT compilation ready)"
+    fi
+else
+    ok "iasl already installed"
+fi
+
 ###############################################################################
 # STEP 7: Overlay Debian release patched ROM/BIOS/VGA files
 ###############################################################################
@@ -759,6 +788,53 @@ for aml in "${ACPI_FILES[@]}"; do
     fi
 done
 
+# Generate PIT SSDT (defeats VMAware VM::CLOCK / SYSTEM_TIMERS detection)
+#
+# VMAware's CLOCK check (45pts) enumerates all Windows devices via SetupDi
+# searching for hardware ID "PNP0100" (the ISA 8254 Programmable Interval Timer).
+# Real PCs expose PIT in their ACPI DSDT, but QEMU's generated DSDT omits it.
+# We compile a minimal SSDT that defines PNP0100 at the standard PIT I/O ports
+# (0x40–0x43, IRQ 0) so Windows enumerates it normally.
+info "Generating PIT SSDT (anti-SYSTEM_TIMERS detection) ..."
+PIT_ASL="${WORK_DIR}/pit.asl"
+PIT_AML="${ACPI_DIR}/pit.aml"
+
+if command -v iasl &>/dev/null; then
+    cat > "$PIT_ASL" << 'PITEOF'
+DefinitionBlock ("pit.aml", "SSDT", 2, "REALPC", "PIT     ", 0x00000001)
+{
+    Scope (\_SB)
+    {
+        Device (PIT0)
+        {
+            Name (_HID, EisaId ("PNP0100"))
+            Method (_STA, 0, NotSerialized)
+            {
+                Return (0x0F)
+            }
+            Name (_CRS, ResourceTemplate ()
+            {
+                IO (Decode16, 0x0040, 0x0040, 0x01, 0x04)
+                IRQNoFlags () {0}
+            })
+        }
+    }
+}
+PITEOF
+    iasl -p "${WORK_DIR}/pit" "$PIT_ASL" &>/dev/null
+    if [[ -f "${WORK_DIR}/pit.aml" ]]; then
+        cp "${WORK_DIR}/pit.aml" "$PIT_AML"
+        chmod 644 "$PIT_AML"
+        ok "PIT SSDT compiled → ${PIT_AML} ($(stat -c%s "$PIT_AML") bytes)"
+    else
+        warn "iasl compilation failed — PIT SSDT not generated"
+    fi
+else
+    warn "iasl (acpica-tools) not found — cannot generate PIT SSDT."
+    warn "  Install with: apt-get install -y acpica-tools"
+    warn "  VMAware CLOCK/SYSTEM_TIMERS (45pts) will trigger without it."
+fi
+
 ###############################################################################
 # STEP 10: Intel Ultra iGPU Passthrough Setup (optional)
 ###############################################################################
@@ -955,6 +1031,24 @@ if grep -q "mac_prefix: ${MAC_PREFIX}" "$DATACENTER_CFG" 2>/dev/null; then
     ok "Datacenter MAC prefix: ${MAC_PREFIX}"
 fi
 
+# Check virt-fw-vars (NVRAM anti-detection)
+if command -v virt-fw-vars &>/dev/null; then
+    ok "virt-fw-vars available (NVRAM injection ready for deploy script)"
+else
+    warn "virt-fw-vars not found — deploy script cannot inject host EFI variables"
+    warn "Install with: apt install python3-virt-firmware"
+fi
+
+# Check PIT SSDT (SYSTEM_TIMERS anti-detection)
+if [[ -f "${ACPI_DIR}/pit.aml" ]]; then
+    ok "PIT SSDT: pit.aml present ($(stat -c%s "${ACPI_DIR}/pit.aml") bytes)"
+else
+    warn "PIT SSDT: pit.aml missing — VMAware CLOCK/SYSTEM_TIMERS (45pts) will trigger"
+    if ! command -v iasl &>/dev/null; then
+        warn "Install iasl: apt install acpica-tools, then re-run this script"
+    fi
+fi
+
 # Check iGPU ROM
 if [[ "$ENABLE_IGPU" == true ]]; then
     if [[ -f "${IGPU_ROM_DIR}/${IGPU_ROM_FILE}" ]]; then
@@ -982,6 +1076,12 @@ _bx "$GREEN" "Patched KVM module installed (${CPU_VENDOR})"
 _bx "$GREEN" "ACPI tables placed in /root/"
 _bx "$GREEN" "MAC prefix set to ${MAC_PREFIX}"
 _bx "$GREEN" "Packages pinned against apt upgrades"
+if command -v virt-fw-vars &>/dev/null; then
+_bx "$GREEN" "virt-fw-vars ready (host EFI→VM NVRAM injection)"
+fi
+if [[ -f "${ACPI_DIR}/pit.aml" ]]; then
+_bx "$GREEN" "PIT SSDT compiled (defeats SYSTEM_TIMERS detection)"
+fi
 if [[ "$ENABLE_IGPU" == true ]]; then
 _bx "$GREEN" "Intel Ultra iGPU ROM installed (/usr/share/kvm/)"
 _bx "$GREEN" "IOMMU enabled + i915/snd_hda_intel blacklisted"

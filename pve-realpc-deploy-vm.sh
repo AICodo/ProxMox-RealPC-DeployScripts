@@ -10,11 +10,14 @@
 # Default config (matches upstream exactly):
 #   - OVMF + Q35 machine type (patched Strong OVMF firmware)
 #   - SATA disk with custom serial
-#   - e1000 NIC with realistic MAC prefix
+#   - e1000e NIC with realistic MAC prefix (Intel 82574L)
 #   - Full SMBIOS spoofing (types 0,1,2,3,4,8,9,17)
 #   - Custom ACPI tables (ssdt.aml, ssdt-ec.aml, hpet.aml)
-#   - CPU: host with hypervisor=off (NO kvm=off — binary handles it)
+#   - CPU: host with hypervisor=off, pmu=off (binary handles CPUID/KVM hiding)
 #   - Auto-detect host -smp topology (P/E core–aware thread mapping)
+#   - Host EFI variable injection into VM NVRAM (defeats NVRAM detection)
+#   - S3/S4 sleep states enabled (defeats POWER_CAPABILITIES detection)
+#   - Custom PIT SSDT (defeats SYSTEM_TIMERS / CLOCK detection)
 #   - NO timing args (patched binary handles timers/TSC/NVRAM internally)
 #   - NO extra CPU feature flags (binary handles CPUID internally)
 #   - Optional: ssdt-battery.aml for laptop CPUs / NVIDIA error 43 fix
@@ -33,8 +36,8 @@ IFS=$'\n\t'
 # ─── Defaults (override with flags) ─────────────────────────────────────────
 VMID=""                          # Auto-detect next available if empty
 VM_NAME="win10"
-CORES=8                          # CPU cores (goes directly to PVE cores:)
-THREADS_PER_CORE=0               # 0 = auto-detect from host (P/E core aware)
+CORES=0                          # 0 = auto-detect from host (matches CPUID topology)
+THREADS_PER_CORE=0               # 0 = auto-detect from host (P/E core–aware thread mapping)
 MEMORY=16384                     # Only 4096, 8192, or 16384 look realistic
 DISK_SIZE="256G"                 # ≥128G to appear realistic
 DISK_STORAGE="local-lvm"        # Where to create the VM disk
@@ -106,7 +109,7 @@ flags for those features are intentionally omitted to avoid conflicts.
 VM Configuration:
   --vmid NUM           VM ID (default: next available)
   --name NAME          VM name (default: win10)
-  --cores NUM          CPU cores (default: 8, goes directly to PVE cores:)
+  --cores NUM          CPU cores (default: auto-detect from host CPUID topology)
   --threads NUM        Threads per core: 1|2 (default: auto-detect from host)
   --memory MB          Memory in MB: 4096|8192|16384 (default: 16384)
   --disk-size SIZE     Disk size, e.g. 256G (default: 256G)
@@ -394,13 +397,24 @@ if [[ -z "$MEM_SERIAL" ]]; then
     info "Generated memory serial: ${MEM_SERIAL}"
 fi
 
-info "CPU cores: ${CORES} (PVE handles topology via cores: + sockets:1)"
-
 ###############################################################################
 # Auto-detect host CPU topology for -smp (Priority 2)
-# Ensures VM::THREAD_MISMATCH is not triggered — the VM's thread-per-core
-# count must match what `host` CPU model reports via CPUID.
+#
+# CRITICAL: The VM's -smp topology MUST match what `cpu host` exposes via
+# CPUID, otherwise VMAware's VM::THREAD_MISMATCH triggers.
+#
+# Intel hybrid CPUs (Alder Lake, Raptor Lake, Arrow Lake):
+#   - P-cores may have HT (2 threads), E-cores always have 1 thread
+#   - Arrow Lake (Core Ultra 200S, e.g. 265K): NO HT on any core
+#   - lscpu "Thread(s) per core" shows the MAX across all core types
+#   - nproc / lscpu "CPU(s)" = total logical CPUs (ground truth)
+#
+# Strategy: Use total logical CPUs (what CPUID max logical processors
+# reports) as the authoritative count, then derive:
+#   cores = total_logical_cpus / threads_per_core
 ###############################################################################
+
+# Auto-detect threads per core
 if [[ "$THREADS_PER_CORE" -eq 0 ]] 2>/dev/null || [[ -z "$THREADS_PER_CORE" ]]; then
     HOST_THREADS=$(lscpu 2>/dev/null | grep -i 'Thread(s) per core' | awk '{print $NF}')
     if [[ -n "$HOST_THREADS" && "$HOST_THREADS" -ge 1 ]]; then
@@ -409,6 +423,21 @@ if [[ "$THREADS_PER_CORE" -eq 0 ]] 2>/dev/null || [[ -z "$THREADS_PER_CORE" ]]; 
     else
         THREADS_PER_CORE=1
         warn "Could not detect host threads-per-core, defaulting to 1"
+    fi
+fi
+
+# Auto-detect core count from host CPUID topology
+if [[ "$CORES" -eq 0 ]] 2>/dev/null || [[ -z "$CORES" ]]; then
+    HOST_TOTAL_CPUS=$(nproc 2>/dev/null)
+    if [[ -z "$HOST_TOTAL_CPUS" ]]; then
+        HOST_TOTAL_CPUS=$(lscpu 2>/dev/null | grep -i '^CPU(s):' | awk '{print $NF}')
+    fi
+    if [[ -n "$HOST_TOTAL_CPUS" && "$HOST_TOTAL_CPUS" -ge 1 ]]; then
+        CORES=$((HOST_TOTAL_CPUS / THREADS_PER_CORE))
+        info "Auto-detected host topology: ${HOST_TOTAL_CPUS} logical CPUs → ${CORES} cores × ${THREADS_PER_CORE} threads"
+    else
+        CORES=8
+        warn "Could not detect host CPU count, defaulting to 8 cores"
     fi
 fi
 
@@ -444,11 +473,30 @@ if [[ "$CPU_TYPE" == "laptop" ]]; then
     info "Laptop mode: using ssdt-battery.aml (virtual battery for NVIDIA error 43 fix)"
 fi
 
-# CPU flags — MINIMAL, matching upstream exactly.
+# Priority 1b: SYSTEM_TIMERS / CLOCK (45pts) — VMAware enumerates all Windows
+# devices via SetupDi looking for hardware ID "PNP0100" (the ISA Programmable
+# Interval Timer / 8254 PIT). Real PCs expose PIT via ACPI DSDT, but QEMU's
+# generated DSDT omits it. If PIT is absent → VM detected.
+# Fix: Load a custom SSDT that defines a PNP0100 device at the standard PIT
+# I/O ports (0x40–0x43, IRQ 0). Created by pve-realpc-setup.sh using iasl.
+if [[ -f "/root/pit.aml" ]]; then
+    ACPI_ARGS+=" -acpitable file=/root/pit.aml"
+    info "PIT SSDT loaded (defeats SYSTEM_TIMERS / CLOCK detection)"
+else
+    warn "Missing /root/pit.aml — VMAware CLOCK/SYSTEM_TIMERS (45pts) may trigger."
+    warn "  Re-run pve-realpc-setup.sh to generate it."
+fi
+
+# CPU flags — MINIMAL, matching upstream with safe AutoVirt-inspired additions.
 # The patched QEMU 10 binary handles kvm hiding, TSC, invtsc, timing, CPUID internally.
 # Do NOT add: kvm=off, +invtsc, +tsc-deadline, +tsc_adjust, +rdpid, +xsaves,
 #             +pdpe1gb, +umip, +md-clear, +arch-capabilities, tsc-frequency=
-CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true"
+#
+# pmu=off: Disable Performance Monitoring Unit — prevents CPUID PMU-related leaf
+# exposure and performance counters that can leak KVM presence. Real desktops
+# have PMU, but guest software rarely needs it and it's a detection vector.
+# Adapted from AutoVirt: --features "pmu.state=off"
+CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true,pmu=off"
 
 # NO -smp args — topology is set by PVE via cores: and sockets: in the .conf.
 # We explicitly set threads via qm (cores × threads = total vCPUs).
@@ -461,9 +509,13 @@ CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforc
 #   - PIT tick policy
 #   - RTC drift correction
 #   - ACPI PM timer obfuscation
-#   - S3/S4 state handling
 #   - CPU power management passthrough
-# Adding -rtc, -overcommit, -global flags overrides the binary and causes detection.
+# Adding -rtc, -overcommit flags overrides the binary and causes detection.
+#
+# HOWEVER, the binary does NOT handle:
+#   - S3/S4 sleep state enablement (Proxmox/QEMU defaults leave these off)
+#   - PIT device ACPI enumeration (PNP0100 not in QEMU's DSDT)
+# These are fixed below via ICH9-LPC globals and a custom PIT SSDT.
 
 # SMBIOS
 SMBIOS_ARGS=""
@@ -525,14 +577,19 @@ fi
 
 # Assemble full args line (matches upstream README for QEMU 9/10)
 #
-# Note: S3/S4 sleep states are NOT disabled here — the patched binary handles
-# power management internally. Adding -global ICH9-LPC.disable_s3/s4 conflicts
-# with the binary and triggers VMAware's POWER_CAPABILITIES check (real desktops
-# support at least S3 standby).
+# Priority 1a: POWER_CAPABILITIES (45pts) — VMAware checks system power states via
+# NtPowerInformation(SystemPowerCapabilities). Passes only if:
+#   (S0 || S3) && (S4 || HiberFilePresent)
+# Proxmox/QEMU defaults don't expose S3/S4, causing the "!(S0||S1||S2||S3)" pattern.
+# Fix: Force-enable S3 (suspend-to-RAM) and S4 (suspend-to-disk) on the ICH9 LPC.
+# Approach adapted from AutoVirt: --xml "./pm/suspend-to-mem/@enabled=yes"
+#                                  --xml "./pm/suspend-to-disk/@enabled=yes"
 #
 # ACPI PCI hotplug is disabled — real hardware doesn't expose hotplug bridges,
 # and the hotplug controller creates extra ACPI objects that fingerprint as VM.
 PCI_ARGS=" -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"
+PCI_ARGS+=" -global ICH9-LPC.disable_s3=0"
+PCI_ARGS+=" -global ICH9-LPC.disable_s4=0"
 
 # Priority 6: Suppress VMAware's FIRMWARE / BOOT_LOGO / NVRAM / DEVICES checks.
 #
@@ -547,12 +604,15 @@ PCI_ARGS=" -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"
 #   logo, but if not, the guest-side qemu-cleanup handles the registry remnant.
 #
 # NVRAM (100pts): OVMF ships Red Hat signing certs in PKDefault. VMAware scans
-#   UEFI NVRAM variables for "red hat". The patched Strong OVMF omits these certs
-#   and we do NOT use pre-enrolled-keys (which loads from stock templates).
+#   UEFI NVRAM variables for "red hat". The deploy script now injects the host's
+#   real EFI Secure Boot variables (PK, KEK, db, dbx + defaults) into the VM's
+#   OVMF_VARS using virt-fw-vars, replacing Red Hat certs with genuine Microsoft/
+#   hardware vendor certs. We also do NOT use pre-enrolled-keys.
+#   Approach adapted from: https://github.com/Scrut1ny/AutoVirt
 #
 # DEVICES (95pts): PCI vendor/device IDs 0x1af4 (VirtIO), 0x1b36 (QEMU bridge),
 #   0x1234 (bochs-display), 0x0627 (QEMU display subsystem). The patched binary
-#   remaps these. We don't use VirtIO NIC/disk (e1000 + SATA instead) reducing
+#   remaps these. We don't use VirtIO NIC/disk (e1000e + SATA instead) reducing
 #   exposure. The guest-side qemu-cleanup.ps1 removes any remaining PCI registry
 #   artefacts.
 #
@@ -596,7 +656,7 @@ qm create "$VMID" \
     --balloon 0 \
     --numa 0 \
     --scsihw virtio-scsi-single \
-    --net0 "e1000,bridge=${BRIDGE},firewall=${FIREWALL}" \
+    --net0 "e1000e,bridge=${BRIDGE},firewall=${FIREWALL}" \
     --vga "$VGA" \
     --localtime 1
 
@@ -608,7 +668,123 @@ ok "Base VM created"
 # initializes from stock templates that contain detectable NVRAM variables.
 info "Adding EFI disk (patched Strong OVMF firmware) ..."
 qm set "$VMID" --efidisk0 "${DISK_STORAGE}:1,efitype=4m"
-ok "EFI disk added (using patched OVMF — NVRAM variables are sanitized)"
+ok "EFI disk added"
+
+# Step 2a: Inject host EFI variables into VM NVRAM (defeats VMAware VM::NVRAM)
+#
+# VMAware's NVRAM check (100pts) scans UEFI variables for:
+#   1. Variables prefixed with "VMM" (e.g. VMMBootOrder)
+#   2. Missing PKDefault / KEKDefault / dbxDefault variables
+#   3. "red hat" string in PK or PKDefault (OVMF ships Red Hat signing certs)
+#   4. Missing MemoryOverwriteRequestControlLock when Secure Boot is active
+#
+# Fix: Extract the REAL host machine's EFI Secure Boot keys from
+# /sys/firmware/efi/efivars/ and inject them into the VM's OVMF_VARS image
+# using virt-fw-vars. This replaces any Red Hat / OVMF default certs with
+# genuine Microsoft / hardware vendor certificates from the host firmware.
+#
+# Approach adapted from: https://github.com/Scrut1ny/AutoVirt
+info "Injecting host EFI variables into VM NVRAM (anti-NVRAM detection) ..."
+
+NVRAM_INJECTED=false
+if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; then
+    # Resolve the VM's efidisk volume path
+    EFI_VOLID=$(grep -oP 'efidisk0:\s*\K[^,]+' "/etc/pve/qemu-server/${VMID}.conf" 2>/dev/null || true)
+    if [[ -n "$EFI_VOLID" ]]; then
+        EFI_DISK_PATH=$(pvesm path "$EFI_VOLID" 2>/dev/null || true)
+    fi
+
+    if [[ -n "$EFI_DISK_PATH" ]]; then
+        # Extract the raw OVMF_VARS partition from the efidisk
+        # PVE efidisk is a raw QCOW2 image containing only the VARS region
+        NVRAM_WORK="/tmp/pve-nvram-${VMID}"
+        mkdir -p "$NVRAM_WORK"
+        NVRAM_JSON="${NVRAM_WORK}/efivars.json"
+        NVRAM_ORIG="${NVRAM_WORK}/OVMF_VARS.fd"
+        NVRAM_NEW="${NVRAM_WORK}/OVMF_VARS_injected.fd"
+
+        # Export the current OVMF_VARS from the efidisk as raw
+        qemu-img convert -f qcow2 -O raw "$EFI_DISK_PATH" "$NVRAM_ORIG" 2>/dev/null \
+            || cp "$EFI_DISK_PATH" "$NVRAM_ORIG" 2>/dev/null || true
+
+        if [[ -f "$NVRAM_ORIG" ]]; then
+            # Collect host EFI variables (same approach as AutoVirt)
+            EFI_GLOBAL=8be4df61-93ca-11d2-aa0d-00e098032b8c
+            EFI_IMAGE_SEC=d719b2cb-3d3a-4596-a3bc-dad00e67656f
+
+            EFI_KEYS=(
+                "PK:${EFI_GLOBAL}"
+                "KEK:${EFI_GLOBAL}"
+                "db:${EFI_IMAGE_SEC}"
+                "dbx:${EFI_IMAGE_SEC}"
+                "PKDefault:${EFI_GLOBAL}"
+                "KEKDefault:${EFI_GLOBAL}"
+                "dbDefault:${EFI_GLOBAL}"
+                "dbxDefault:${EFI_GLOBAL}"
+            )
+
+            {
+                printf '{\n    "version": 2,\n    "variables": [\n'
+                first=true
+                for entry in "${EFI_KEYS[@]}"; do
+                    IFS=: read -r name guid <<< "$entry"
+                    path="/sys/firmware/efi/efivars/${name}-${guid}"
+                    [[ -f "$path" ]] || continue
+
+                    full_hex=$(hexdump -ve '1/1 "%.2x"' "$path" 2>/dev/null) || continue
+                    # First 4 bytes are attributes (little-endian)
+                    attr=$(printf '%d' "0x${full_hex:6:2}${full_hex:4:2}${full_hex:2:2}${full_hex:0:2}")
+
+                    "$first" && first=false || printf ',\n'
+                    printf '        { "name": "%s", "guid": "%s", "attr": %d, "data": "%s" }' \
+                        "$name" "$guid" "$attr" "${full_hex:8}"
+                done
+                printf '\n    ]\n}\n'
+            } > "$NVRAM_JSON"
+
+            # Count how many variables we extracted
+            VAR_COUNT=$(grep -c '"name"' "$NVRAM_JSON" 2>/dev/null || echo "0")
+
+            if [[ "$VAR_COUNT" -ge 2 ]]; then
+                # Inject host EFI variables into the OVMF_VARS image
+                virt-fw-vars \
+                    --input "$NVRAM_ORIG" \
+                    --output "$NVRAM_NEW" \
+                    --secure-boot \
+                    --set-json "$NVRAM_JSON" 2>/dev/null
+
+                if [[ -f "$NVRAM_NEW" ]]; then
+                    # Write back to the efidisk
+                    qemu-img convert -f raw -O qcow2 "$NVRAM_NEW" "$EFI_DISK_PATH" 2>/dev/null \
+                        || cp "$NVRAM_NEW" "$EFI_DISK_PATH" 2>/dev/null || true
+                    NVRAM_INJECTED=true
+                    ok "Host EFI variables injected into VM NVRAM (${VAR_COUNT} variables: PK, KEK, db, dbx, defaults)"
+                fi
+            else
+                warn "Could not extract host EFI variables (found ${VAR_COUNT}). Host may not be UEFI or Secure Boot is off."
+            fi
+        fi
+
+        # Cleanup
+        rm -rf "$NVRAM_WORK"
+    else
+        warn "Could not resolve EFI disk path for VMID ${VMID}"
+    fi
+else
+    if ! command -v virt-fw-vars &>/dev/null; then
+        warn "virt-fw-vars not found. Install python3-virt-firmware for NVRAM anti-detection."
+        warn "  apt install python3-virt-firmware   (or)   pip install virt-firmware"
+    fi
+    if [[ ! -d /sys/firmware/efi/efivars ]]; then
+        warn "Host not booted in UEFI mode — cannot extract EFI variables for NVRAM injection."
+    fi
+fi
+
+if [[ "$NVRAM_INJECTED" != true ]]; then
+    warn "NVRAM injection skipped — VM may fail VMAware's NVRAM check (100pts)."
+    warn "The Strong OVMF firmware provides partial protection, but host EFI variable"
+    warn "injection is needed for full NVRAM anti-detection."
+fi
 
 # Step 2b: Add TPM 2.0 (optional — upstream config doesn't include it)
 if [[ "$ADD_TPM" == "true" ]]; then
@@ -697,14 +873,15 @@ echo -e "${GREEN}║                                                            
 echo -e "${GREEN}║  Anti-Detection Features (upstream-compatible):               ║${NC}"
 echo -e "${GREEN}║    ✓ OVMF + Q35 (patched Strong OVMF firmware)               ║${NC}"
 echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 0,1,2,3,4,8,9,17)              ║${NC}"
-echo -e "${GREEN}║    ✓ ACPI custom tables (ssdt, ssdt-ec, hpet)                ║${NC}"
-echo -e "${GREEN}║    ✓ CPU: host, hypervisor=off (binary hides KVM internally) ║${NC}"
+echo -e "${GREEN}║    ✓ ACPI custom tables (ssdt, ssdt-ec, hpet, pit)            ║${NC}"
+echo -e "${GREEN}║    ✓ CPU: host, hypervisor=off, pmu=off (binary hides KVM)  ║${NC}"
 echo -e "${GREEN}║    ✓ Cores: ${SMP_TOTAL} vCPUs (${SMP_CORES}c × ${SMP_THREADS}t, matches host topology)  ║${NC}"
-echo -e "${GREEN}║    ✓ Timers handled by binary (TSC/HPET/PIT/RTC/NVRAM)       ║${NC}"
-echo -e "${GREEN}║    ✓ EFI NVRAM sanitized (patched OVMF, no pre-enrolled-keys)║${NC}"
+echo -e "${GREEN}║    ✓ Timers handled by binary (TSC/HPET/PIT/RTC)             ║${NC}"
+echo -e "${GREEN}║    ✓ EFI NVRAM: host variables injected (real Secure Boot certs)║${NC}"
 echo -e "${GREEN}║    ✓ ACPI PCI hotplug disabled (no hotplug fingerprint)       ║${NC}"
-echo -e "${GREEN}║    ✓ S3/S4 left to binary (avoids POWER_CAPABILITIES detect) ║${NC}"
-echo -e "${GREEN}║    ✓ e1000 NIC with realistic MAC prefix                     ║${NC}"
+echo -e "${GREEN}║    ✓ S3/S4 sleep states enabled (defeats POWER_CAPABILITIES) ║${NC}"
+echo -e "${GREEN}║    ✓ PIT SSDT loaded (defeats SYSTEM_TIMERS / CLOCK)          ║${NC}"
+echo -e "${GREEN}║    ✓ e1000e NIC with realistic MAC (Intel 82574L PCIe)       ║${NC}"
 echo -e "${GREEN}║    ✓ SATA disk with custom serial (no virtio)                ║${NC}"
 echo -e "${GREEN}║    ✓ Balloon disabled                                        ║${NC}"
 if [[ -n "$AFFINITY" ]]; then
