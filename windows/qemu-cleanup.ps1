@@ -12,7 +12,7 @@
     owned by TrustedInstaller are executed via PsExec64 running as SYSTEM.
 
     Inspired by Scrut1ny/AutoVirt  (resources/scripts/Windows/qemu-cleanup.ps1)
-    — rewritten with broader coverage, structured logging, backup support,
+    - rewritten with broader coverage, structured logging, backup support,
       and safety checks.
 
 .PARAMETER SkipPsExec
@@ -38,7 +38,7 @@ param(
     [bool]  $BackupFirst = $true
 )
 
-# ── Guard: must be admin ────────────────────────────────────────────────
+# -- Guard: must be admin ------------------------------------------------
 $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]$identity
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -46,7 +46,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit 1
 }
 
-# ── Signature strings to hunt for ──────────────────────────────────────
+# -- Signature strings to hunt for --------------------------------------
 # PCI vendor / device / subsystem IDs tied to QEMU, Red Hat, and VirtIO
 # Extended to cover ALL VMAware detection signatures
 $Signatures = @(
@@ -75,7 +75,7 @@ $Signatures = @(
 
 # Additional VMAware-specific registry paths to clean
 $VMAwareRegistryKills = @(
-    # Boot logo — VMAware checks CRC32 of BCD boot graphics (TianoCore hash)
+    # Boot logo - VMAware checks CRC32 of BCD boot graphics (TianoCore hash)
     "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation"
     # Firmware info that may contain OVMF/TianoCore strings
     "HKLM:\HARDWARE\DESCRIPTION\System\BIOS"
@@ -95,7 +95,7 @@ $EnumRoots = @(
 # Additionally wipe matching SCSI sub-keys (QEMU virtio-scsi leaves traces)
 $ScsiRoot = "HKLM:\SYSTEM\CurrentControlSet\Enum\SCSI"
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------
 $Stats = @{ Scanned = 0; Deleted = 0; Failed = 0; Backed = 0 }
 
 function Write-Banner {
@@ -182,7 +182,7 @@ function Remove-ScsiVmKeys {
     }
 }
 
-# ── Main logic (can run inline or via PsExec) ──────────────────────────
+# -- Main logic (can run inline or via PsExec) --------------------------
 function Invoke-Cleanup {
     [CmdletBinding(SupportsShouldProcess)]
     param()
@@ -219,7 +219,7 @@ function Invoke-Cleanup {
             }
     }
 
-    # ── VMAware-specific: Clean firmware BIOS info ──────────────────────
+    # -- VMAware-specific: Clean firmware BIOS info ----------------------
     # VMAware FIRMWARE/NVRAM checks: scans BIOS registry for "QEMU", "BOCHS",
     # "SeaBIOS", "EDK II", "TianoCore", "Red Hat" in vendor/version strings
     Write-Host "`n[*] Cleaning BIOS firmware registry strings ..." -ForegroundColor White
@@ -238,7 +238,7 @@ function Invoke-Cleanup {
         }
     }
 
-    # ── VMAware-specific: ACPI_SIGNATURE display path cleanup ──────────
+    # -- VMAware-specific: ACPI_SIGNATURE display path cleanup ----------
     # VMAware checks display device ACPI location paths for "#ACPI(Sxx)"
     Write-Host "`n[*] Checking display ACPI location paths ..." -ForegroundColor White
     if (Test-Path $AcpiDisplayRoot) {
@@ -260,10 +260,10 @@ function Invoke-Cleanup {
             }
     }
 
-    # ── VMAware-specific: UEFI NVRAM variable cleanup ──────────────────
+    # -- VMAware-specific: UEFI NVRAM variable cleanup ------------------
     # VMAware checks for "red hat" certs in PKDefault, and checks presence
     # of KEKDefault, dbxDefault, MemoryOverwriteRequestControlLock, etc.
-    # These are stored in firmware, not registry — patched OVMF handles this.
+    # These are stored in firmware, not registry - patched OVMF handles this.
     # But Windows caches UEFI variable names in the registry:
     $uefiFwRoot = "HKLM:\SYSTEM\CurrentControlSet\Control\FirmwareResources"
     if (Test-Path $uefiFwRoot) {
@@ -286,8 +286,8 @@ function Invoke-Cleanup {
             }
     }
 
-    # ── VMAware-specific: Boot logo CRC cleanup ────────────────────────
-    # VMAware's BOOT_LOGO checks the BCD boot graphics bitmap — TianoCore
+    # -- VMAware-specific: Boot logo CRC cleanup ------------------------
+    # VMAware's BOOT_LOGO checks the BCD boot graphics bitmap - TianoCore
     # EDK2 has a known CRC32 (0x110350C5). The bootmgr stores the logo
     # path in the BCD store. We can't change the firmware logo from the
     # guest, but we can remove the cached graphics resource if present.
@@ -295,12 +295,12 @@ function Invoke-Cleanup {
     if (Test-Path $bgfxKey) {
         Write-Host "`n[*] Checking boot logo animation cache ..." -ForegroundColor White
         $Stats.Scanned++
-        # Log presence — actual fix requires patched OVMF with custom logo
-        Write-Host "  [INFO] Boot animation key exists — logo CRC depends on OVMF firmware" -ForegroundColor DarkCyan
+        # Log presence - actual fix requires patched OVMF with custom logo
+        Write-Host "  [INFO] Boot animation key exists - logo CRC depends on OVMF firmware" -ForegroundColor DarkCyan
     }
 
     # Summary
-    Write-Host "`n────────────────────────────────────────────" -ForegroundColor Cyan
+    Write-Host "`n--------------------------------------------" -ForegroundColor Cyan
     Write-Host "  Scanned : $($Stats.Scanned)" -ForegroundColor White
     Write-Host "  Deleted : $($Stats.Deleted)" -ForegroundColor Green
     Write-Host "  Failed  : $($Stats.Failed)"  -ForegroundColor $(if ($Stats.Failed -gt 0) { 'Yellow' } else { 'White' })
@@ -308,10 +308,10 @@ function Invoke-Cleanup {
     if ($BackupFirst -and $Stats.Backed -gt 0) {
         Write-Host "  Backups : $env:TEMP\qemu-cleanup-backup" -ForegroundColor DarkGray
     }
-    Write-Host "────────────────────────────────────────────`n" -ForegroundColor Cyan
+    Write-Host "--------------------------------------------`n" -ForegroundColor Cyan
 }
 
-# ── Dispatch ────────────────────────────────────────────────────────────
+# -- Dispatch ------------------------------------------------------------
 if ($SkipPsExec) {
     Invoke-Cleanup
 } else {
@@ -340,10 +340,10 @@ if ($SkipPsExec) {
     # child runs inline instead of trying to download PsExec again.
     Write-Host "[*] Launching cleanup as SYSTEM via PsExec ..." -ForegroundColor Cyan
     $selfPath = $MyInvocation.MyCommand.Path
-    $argList  = '-accepteula -nobanner -s powershell.exe -ExecutionPolicy Bypass -File "' + $selfPath + '" -SkipPsExec'
     $startArgs = @{
         FilePath     = $psexecPath
-        ArgumentList = $argList
+        ArgumentList = @('-accepteula', '-nobanner', '-s', 'powershell.exe',
+                         '-ExecutionPolicy', 'Bypass', '-File', $selfPath, '-SkipPsExec')
         Wait         = $true
         NoNewWindow  = $true
     }

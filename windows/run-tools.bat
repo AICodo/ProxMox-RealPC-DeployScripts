@@ -2,7 +2,7 @@
 title ProxMox-RealPC Windows Guest Tools
 color 0B
 
-:: ── Self-elevate to Administrator if not already ──
+:: -- Self-elevate to Administrator if not already --
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting Administrator privileges ...
@@ -13,9 +13,9 @@ if %errorlevel% neq 0 (
 :menu
 cls
 echo.
-echo   ╔══════════════════════════════════════════╗
-echo   ║   ProxMox-RealPC  Windows Guest Tools    ║
-echo   ╚══════════════════════════════════════════╝
+echo   +==========================================+
+echo   |   ProxMox-RealPC  Windows Guest Tools    |
+echo   +==========================================+
 echo.
 echo   [1]  QEMU Cleanup        - Remove VM registry ^& driver traces
 echo   [2]  Identifier Spoofer  - Randomise machine IDs / MAC / hostname
@@ -40,7 +40,7 @@ goto menu
 cls
 echo.
 echo   Running qemu-cleanup.ps1 ...
-echo   ────────────────────────────────────────────
+echo   --------------------------------------------
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0qemu-cleanup.ps1" -SkipPsExec
 echo.
 pause
@@ -50,7 +50,7 @@ goto menu
 cls
 echo.
 echo   Running identifier-spoofer.ps1 ...
-echo   ────────────────────────────────────────────
+echo   --------------------------------------------
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0identifier-spoofer.ps1" -NoReboot
 echo.
 pause
@@ -60,7 +60,7 @@ goto menu
 cls
 echo.
 echo   Running edid-spoofer.ps1 ...
-echo   ────────────────────────────────────────────
+echo   --------------------------------------------
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0edid-spoofer.ps1"
 echo.
 pause
@@ -70,21 +70,21 @@ goto menu
 cls
 echo.
 echo   Running ALL tools sequentially ...
-echo   ════════════════════════════════════════════
+echo   ============================================
 echo.
 echo   [1/3] qemu-cleanup.ps1
-echo   ────────────────────────────────────────────
+echo   --------------------------------------------
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0qemu-cleanup.ps1" -SkipPsExec
 echo.
 echo   [2/3] identifier-spoofer.ps1
-echo   ────────────────────────────────────────────
+echo   --------------------------------------------
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0identifier-spoofer.ps1" -NoReboot
 echo.
 echo   [3/3] edid-spoofer.ps1
-echo   ────────────────────────────────────────────
+echo   --------------------------------------------
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0edid-spoofer.ps1"
 echo.
-echo   ════════════════════════════════════════════
+echo   ============================================
 echo   All done. A reboot is recommended.
 echo.
 pause

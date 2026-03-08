@@ -19,7 +19,7 @@
     -NoReboot is specified.
 
     Inspired by Scrut1ny/AutoVirt  (resources/scripts/Windows/identifier-spoofer.ps1)
-    — rewritten with wider coverage, parameterisation, backup/restore,
+    - rewritten with wider coverage, parameterisation, backup/restore,
       and structured logging.
 
 .PARAMETER ComputerName
@@ -49,7 +49,7 @@ param(
     [bool]   $BackupFirst = $true
 )
 
-# ── Guard ───────────────────────────────────────────────────────────────
+# -- Guard ---------------------------------------------------------------
 $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]$identity
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -57,7 +57,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit 1
 }
 
-# ── Helpers ─────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------
 function Get-RandomGuid   { [guid]::NewGuid().ToString() }
 function Get-RandomHex($n){ -join (1..$n | ForEach-Object { '{0:X}' -f (Get-Random -Max 16) }) }
 function Get-RandomAlphaNum($n) {
@@ -68,10 +68,10 @@ function Get-RandomAlphaNum($n) {
 function Write-Banner {
     $banner = @"
 
-  ╔══════════════════════════════════════════╗
-  ║     Windows Identifier Spoofer           ║
-  ║  ProxMox-RealPC-DeployScripts            ║
-  ╚══════════════════════════════════════════╝
+  +==========================================+
+  |     Windows Identifier Spoofer           |
+  |  ProxMox-RealPC-DeployScripts            |
+  +==========================================+
 
 "@
     Write-Host $banner -ForegroundColor Cyan
@@ -106,17 +106,17 @@ function Set-Reg {
     }
 }
 
-# ── Begin ───────────────────────────────────────────────────────────────
+# -- Begin ---------------------------------------------------------------
 Write-Banner
 
 $ntPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
 
-# ── 1. MachineGuid ──────────────────────────────────────────────────────
+# -- 1. MachineGuid ------------------------------------------------------
 Write-Host "[1/8] MachineGuid" -ForegroundColor White
 $newGuid = Get-RandomGuid
 Set-Reg -Path "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name "MachineGuid" -Value $newGuid
 
-# ── 2. InstallDate / InstallTime ────────────────────────────────────────
+# -- 2. InstallDate / InstallTime ----------------------------------------
 Write-Host "[2/8] InstallDate / InstallTime" -ForegroundColor White
 $randomDate    = Get-Date -Year (Get-Random -Min 2018 -Max 2025) `
                           -Month (Get-Random -Min 1 -Max 13) `
@@ -139,7 +139,7 @@ try {
     Write-Host "  [OK ] NTP re-synced" -ForegroundColor DarkGray
 } catch { }
 
-# ── 3. Computer / NetBIOS name ──────────────────────────────────────────
+# -- 3. Computer / NetBIOS name ------------------------------------------
 Write-Host "[3/8] Computer Name" -ForegroundColor White
 if (-not $ComputerName) { $ComputerName = "DESKTOP-" + (Get-RandomAlphaNum 7) }
 try {
@@ -149,7 +149,7 @@ try {
     Write-Host "  [ERR] Rename-Computer - $_" -ForegroundColor Yellow
 }
 
-# ── 4. MAC address ──────────────────────────────────────────────────────
+# -- 4. MAC address ------------------------------------------------------
 Write-Host "[4/8] MAC Address" -ForegroundColor White
 $adapter = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
 if ($adapter) {
@@ -168,7 +168,7 @@ if ($adapter) {
     Write-Host "  [SKIP] No active adapter found" -ForegroundColor DarkGray
 }
 
-# ── 5. Windows ProductId ────────────────────────────────────────────────
+# -- 5. Windows ProductId ------------------------------------------------
 Write-Host "[5/8] ProductId" -ForegroundColor White
 # Format: XXXXX-XXX-XXXXXXX-XXXXX  (groups of 5-3-7-5 digits)
 $newProdId = "{0}-{1}-{2}-{3}" -f (Get-RandomAlphaNum 5), (Get-RandomAlphaNum 3),
@@ -176,7 +176,7 @@ $newProdId = "{0}-{1}-{2}-{3}" -f (Get-RandomAlphaNum 5), (Get-RandomAlphaNum 3)
 Set-Reg -Path $ntPath -Name "ProductId" -Value $newProdId
 Set-Reg -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion" -Name "ProductId" -Value $newProdId
 
-# ── 6. HardwareGUID (HardwareConfig) ────────────────────────────────────
+# -- 6. HardwareGUID (HardwareConfig) ------------------------------------
 Write-Host "[6/8] HardwareGUID" -ForegroundColor White
 $hwPath = "HKLM:\SYSTEM\CurrentControlSet\Control\IDConfigDB\Hardware Profiles\0001"
 if (Test-Path $hwPath) {
@@ -187,14 +187,14 @@ if (Test-Path $hwCurrent) {
     Set-Reg -Path $hwCurrent -Name "LastConfig" -Value (Get-RandomGuid)
 }
 
-# ── 7. SQM / Telemetry MachineId ────────────────────────────────────────
+# -- 7. SQM / Telemetry MachineId ----------------------------------------
 Write-Host "[7/8] SQM MachineId" -ForegroundColor White
 $sqmPath = "HKLM:\SOFTWARE\Microsoft\SQMClient"
 if (Test-Path $sqmPath) {
     Set-Reg -Path $sqmPath -Name "MachineId" -Value ("{$( Get-RandomGuid )}")
 }
 
-# ── 8. Windows Update SusClientId ───────────────────────────────────────
+# -- 8. Windows Update SusClientId ---------------------------------------
 Write-Host "[8/8] Windows Update SusClientId" -ForegroundColor White
 $wuPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate"
 if (Test-Path $wuPath) {
@@ -204,14 +204,14 @@ if (Test-Path $wuPath) {
     Set-Reg -Path $wuPath -Name "PingID"                  -Value ""
 }
 
-# ── Backup ──────────────────────────────────────────────────────────────
+# -- Backup --------------------------------------------------------------
 if ($BackupFirst -and $script:backup.Count -gt 0) {
     $script:backup | ConvertTo-Json -Depth 3 | Set-Content -Path $backupFile -Encoding UTF8
     Write-Host "`n  Backup saved: $backupFile" -ForegroundColor DarkGray
 }
 
-# ── Summary ─────────────────────────────────────────────────────────────
-Write-Host "`n────────────────────────────────────────────" -ForegroundColor Cyan
+# -- Summary -------------------------------------------------------------
+Write-Host "`n--------------------------------------------" -ForegroundColor Cyan
 Write-Host "  All identifiers updated." -ForegroundColor Green
 if (-not $NoReboot) {
     Write-Host "  Rebooting in 5 seconds ... (Ctrl+C to cancel)" -ForegroundColor Yellow
@@ -220,4 +220,4 @@ if (-not $NoReboot) {
 } else {
     Write-Host "  Reboot skipped (-NoReboot).  Restart manually for all changes to take effect." -ForegroundColor Yellow
 }
-Write-Host "────────────────────────────────────────────`n" -ForegroundColor Cyan
+Write-Host "--------------------------------------------`n" -ForegroundColor Cyan

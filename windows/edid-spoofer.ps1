@@ -23,7 +23,7 @@
     Requires Administrator.
 
     Inspired by Scrut1ny/AutoVirt  (resources/scripts/Windows/edid-spoofer.ps1)
-    — rewritten with clearer structure, backup support, per-block
+    - rewritten with clearer structure, backup support, per-block
       extension handling, and optional driver restart.
 
 .PARAMETER NoDriverRestart
@@ -51,7 +51,7 @@ param(
     [switch] $Restore
 )
 
-# ── Guard ───────────────────────────────────────────────────────────────
+# -- Guard ---------------------------------------------------------------
 $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]$identity
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -62,10 +62,10 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 function Write-Banner {
     $banner = @"
 
-  ╔══════════════════════════════════════════╗
-  ║         EDID Serial Spoofer              ║
-  ║  ProxMox-RealPC-DeployScripts            ║
-  ╚══════════════════════════════════════════╝
+  +==========================================+
+  |         EDID Serial Spoofer              |
+  |  ProxMox-RealPC-DeployScripts            |
+  +==========================================+
 
 "@
     Write-Host $banner -ForegroundColor Cyan
@@ -93,7 +93,7 @@ function Restart-GraphicsDriver {
 
 Write-Banner
 
-# ── Restore mode ────────────────────────────────────────────────────────
+# -- Restore mode --------------------------------------------------------
 if ($Restore) {
     Write-Host "[*] Removing all EDID_OVERRIDE keys ..." -ForegroundColor White
     $wmiMonitors = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorDescriptorMethods -ErrorAction SilentlyContinue
@@ -113,7 +113,7 @@ if ($Restore) {
     exit 0
 }
 
-# ── Spoof mode ──────────────────────────────────────────────────────────
+# -- Spoof mode ----------------------------------------------------------
 $backupDir = Join-Path $env:TEMP "edid-spoofer-backup"
 if ($BackupFirst -and -not (Test-Path $backupDir)) {
     New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
@@ -131,7 +131,7 @@ foreach ($wmiMon in $wmiMonitors) {
     $pnpId = $wmiMon.InstanceName -replace "_0$", ""
     Write-Host "`n[Monitor $monIdx] $pnpId" -ForegroundColor White
 
-    # ── 1. Read full EDID (base + extensions) ───────────────────────────
+    # -- 1. Read full EDID (base + extensions) ---------------------------
     try {
         $block0 = [byte[]](Invoke-CimMethod -InputObject $wmiMon `
                     -MethodName WmiGetMonitorRawEEdidV1Block `
@@ -159,7 +159,7 @@ foreach ($wmiMon in $wmiMonitors) {
         } catch { }
     }
 
-    # ── 2. Backup original ──────────────────────────────────────────────
+    # -- 2. Backup original ----------------------------------------------
     if ($BackupFirst) {
         $safeName = ($pnpId -replace '[\\\/]', '_') + ".bin"
         $binPath  = Join-Path $backupDir $safeName
@@ -175,7 +175,7 @@ foreach ($wmiMon in $wmiMonitors) {
         Write-Host "  [BAK] $binPath" -ForegroundColor DarkGray
     }
 
-    # ── 3. Patch base block ─────────────────────────────────────────────
+    # -- 3. Patch base block ---------------------------------------------
     $target = $edidBlocks[0]
 
     # Bytes 12-15: manufacturer-assigned ID serial → zero
@@ -203,7 +203,7 @@ foreach ($wmiMon in $wmiMonitors) {
 
     $edidBlocks[0] = $target
 
-    # ── 4. Write to registry ────────────────────────────────────────────
+    # -- 4. Write to registry --------------------------------------------
     $regPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$pnpId\Device Parameters"
     if (-not (Test-Path $regPath)) {
         Write-Host "  [SKIP] Registry path not found: $regPath" -ForegroundColor DarkGray
@@ -222,14 +222,14 @@ foreach ($wmiMon in $wmiMonitors) {
     Write-Host "  [SET] EDID_OVERRIDE written ($($edidBlocks.Count) block(s))" -ForegroundColor Green
 }
 
-# ── 5. Restart driver ──────────────────────────────────────────────────
+# -- 5. Restart driver --------------------------------------------------
 Restart-GraphicsDriver
 
-# ── Summary ─────────────────────────────────────────────────────────────
-Write-Host "`n────────────────────────────────────────────" -ForegroundColor Cyan
+# -- Summary -------------------------------------------------------------
+Write-Host "`n--------------------------------------------" -ForegroundColor Cyan
 Write-Host "  Processed $monIdx monitor(s)." -ForegroundColor Green
 if ($BackupFirst) {
     Write-Host "  Backups: $backupDir" -ForegroundColor DarkGray
 }
 Write-Host "  Use -Restore to revert to factory EDID." -ForegroundColor DarkGray
-Write-Host "────────────────────────────────────────────`n" -ForegroundColor Cyan
+Write-Host "--------------------------------------------`n" -ForegroundColor Cyan
