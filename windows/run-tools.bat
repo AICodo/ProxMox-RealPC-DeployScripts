@@ -6,7 +6,11 @@ color 0B
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting Administrator privileges ...
-    powershell -Command "Start-Process -FilePath 'cmd.exe' -ArgumentList '/k \"\"%~f0\"\"' -Verb RunAs"
+    set "ELEVATE_VBS=%TEMP%\elevate_%RANDOM%.vbs"
+    echo Set UAC = CreateObject^("Shell.Application"^) > "%ELEVATE_VBS%"
+    echo UAC.ShellExecute "%~f0", "", "%~dp0", "runas", 1 >> "%ELEVATE_VBS%"
+    cscript //nologo "%ELEVATE_VBS%"
+    del /q "%ELEVATE_VBS%" 2>nul
     exit /b
 )
 

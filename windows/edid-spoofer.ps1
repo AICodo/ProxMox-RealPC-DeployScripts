@@ -133,9 +133,8 @@ foreach ($wmiMon in $wmiMonitors) {
 
     # -- 1. Read full EDID (base + extensions) ---------------------------
     try {
-        $block0 = [byte[]](Invoke-CimMethod -InputObject $wmiMon `
-                    -MethodName WmiGetMonitorRawEEdidV1Block `
-                    -Arguments @{ BlockId = 0 }).BlockContent
+        $cimParams = @{ InputObject = $wmiMon; MethodName = 'WmiGetMonitorRawEEdidV1Block'; Arguments = @{ BlockId = 0 } }
+        $block0 = [byte[]](Invoke-CimMethod @cimParams).BlockContent
         if (-not $block0 -or $block0.Length -lt 128) {
             Write-Host "  [SKIP] Cannot read base EDID block." -ForegroundColor DarkGray
             continue
@@ -152,9 +151,8 @@ foreach ($wmiMon in $wmiMonitors) {
     $extCount = $block0[126]
     for ($b = 1; $b -le $extCount; $b++) {
         try {
-            $ext = [byte[]](Invoke-CimMethod -InputObject $wmiMon `
-                        -MethodName WmiGetMonitorRawEEdidV1Block `
-                        -Arguments @{ BlockId = $b }).BlockContent
+            $cimParams = @{ InputObject = $wmiMon; MethodName = 'WmiGetMonitorRawEEdidV1Block'; Arguments = @{ BlockId = $b } }
+            $ext = [byte[]](Invoke-CimMethod @cimParams).BlockContent
             if ($ext) { $edidBlocks.Add($ext) }
         } catch { }
     }
@@ -178,7 +176,7 @@ foreach ($wmiMon in $wmiMonitors) {
     # -- 3. Patch base block ---------------------------------------------
     $target = $edidBlocks[0]
 
-    # Bytes 12-15: manufacturer-assigned ID serial → zero
+    # Bytes 12-15: manufacturer-assigned ID serial -> zero
     $target[12] = $target[13] = $target[14] = $target[15] = 0
     Write-Host "  [ZAP] Bytes 12-15 (ID serial) zeroed" -ForegroundColor Green
 
@@ -216,8 +214,8 @@ foreach ($wmiMon in $wmiMonitors) {
     }
 
     for ($i = 0; $i -lt $edidBlocks.Count; $i++) {
-        Set-ItemProperty -LiteralPath $overridePath -Name $i.ToString() `
-                         -Value $edidBlocks[$i] -Type Binary -Force
+        $setParams = @{ LiteralPath = $overridePath; Name = $i.ToString(); Value = $edidBlocks[$i]; Type = 'Binary'; Force = $true }
+        Set-ItemProperty @setParams
     }
     Write-Host "  [SET] EDID_OVERRIDE written ($($edidBlocks.Count) block(s))" -ForegroundColor Green
 }

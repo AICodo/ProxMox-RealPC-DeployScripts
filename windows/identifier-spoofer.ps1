@@ -118,12 +118,15 @@ Set-Reg -Path "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name "MachineGuid" -Value
 
 # -- 2. InstallDate / InstallTime ----------------------------------------
 Write-Host "[2/8] InstallDate / InstallTime" -ForegroundColor White
-$randomDate    = Get-Date -Year (Get-Random -Min 2018 -Max 2025) `
-                          -Month (Get-Random -Min 1 -Max 13) `
-                          -Day (Get-Random -Min 1 -Max 29) `
-                          -Hour (Get-Random -Max 24) `
-                          -Minute (Get-Random -Max 60) `
-                          -Second (Get-Random -Max 60)
+$dateParams = @{
+    Year   = Get-Random -Min 2018 -Max 2025
+    Month  = Get-Random -Min 1 -Max 13
+    Day    = Get-Random -Min 1 -Max 29
+    Hour   = Get-Random -Max 24
+    Minute = Get-Random -Max 60
+    Second = Get-Random -Max 60
+}
+$randomDate = Get-Date @dateParams
 $unixTimestamp = [int]($randomDate.ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds
 $ldapFileTime  = [int64](($unixTimestamp + 11644473600) * [long]10000000)
 
