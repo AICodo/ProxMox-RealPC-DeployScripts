@@ -46,7 +46,7 @@ The [pve-emu-realpc](https://github.com/AICodo/pve-emu-realpc) project (forked f
 
 | Script | Purpose |
 |---|---|
-| `pve-realpc-setup.sh` | **One-time host preparation.** Downloads release assets from GitHub, backs up stock packages, installs patched QEMU + OVMF + KVM module, deploys ACPI tables, sets a realistic MAC prefix, and pins packages against `apt upgrade`. |
+| `pve-realpc-setup.sh` | **One-time host preparation.** Downloads release assets from both PVE and Debian GitHub releases, backs up stock packages, installs patched QEMU + OVMF + KVM module, overlays patched ROM/BIOS files (removes VM strings from SeaBIOS/VGA/EFI), deploys ACPI tables, optionally configures Intel iGPU passthrough, sets a realistic MAC prefix, and pins packages against `apt upgrade`. |
 | `pve-realpc-deploy-vm.sh` | **Per-VM creation.** Creates a fully configured Proxmox VM with OVMF/Q35, SATA disk, e1000 NIC, full SMBIOS spoofing (8 types), custom ACPI tables, hidden hypervisor, TSC pinning, CPU power-management passthrough, and more — all via a single command. |
 
 ---
@@ -138,18 +138,22 @@ qm start <VMID>
 
 ### `pve-realpc-setup.sh`
 
-Automates all host-level preparation in 8 steps:
+Automates all host-level preparation in 12 steps:
 
 | Step | Action |
 |---|---|
 | 1 | Set MAC address prefix (`D8:FC:93` — Dell/Intel OUI) in `/etc/pve/datacenter.cfg` |
-| 2 | Download all release assets from [AICodo/pve-emu-realpc releases](https://github.com/AICodo/pve-emu-realpc/releases) with SHA-256 verification |
-| 3 | Back up stock QEMU binary, OVMF firmware, and KVM module to `/root/pve-realpc/backup/` |
-| 4 | Install base anti-detection `.deb` packages (`pve-qemu-kvm`, `pve-edk2-firmware-ovmf`) |
-| 5 | Extract and install **Strong** build packages (enhanced CPU sensor passthrough) |
-| 6 | Install patched KVM kernel module (auto-detects Intel vs AMD); **auto-downgrades kernel** if version mismatches |
-| 7 | Place ACPI table files (`ssdt.aml`, `ssdt-ec.aml`, `ssdt-battery.aml`, `hpet.aml`) into `/root/` |
-| 8 | Pin packages via APT preferences + `dpkg hold` to prevent `apt upgrade` from overwriting |
+| 2 | Download PVE release assets from [AICodo/pve-emu-realpc `v20260306-213905-pve9`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260306-213905-pve9) with SHA-256 verification |
+| 3 | Download Debian release assets (patched ROM/BIOS files only) from [`v20260307-191041-debian`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260307-191041-debian) |
+| 4 | Back up stock QEMU binary, OVMF firmware, and KVM module to `/root/pve-realpc/backup/` |
+| 5 | Install base anti-detection `.deb` packages (`pve-qemu-kvm`, `pve-edk2-firmware-ovmf`) |
+| 6 | Extract and install **Strong** build packages (enhanced CPU sensor passthrough) |
+| 7 | Overlay patched Debian ROM/BIOS/VGA files — replaces stock SeaBIOS/EFI/VGA ROMs that still contain `QEMU`/`Bochs`/`SeaBIOS` strings (PVE binary is preserved) |
+| 8 | Install patched KVM kernel module (auto-detects Intel vs AMD); **auto-downgrades kernel** if version mismatches |
+| 9 | Place ACPI table files (`ssdt.aml`, `ssdt-ec.aml`, `ssdt-battery.aml`, `hpet.aml`) into `/root/` |
+| 10 | *(Optional)* Intel Ultra iGPU passthrough setup — downloads ROM, enables IOMMU, blacklists `i915`/`snd_hda_intel` (requires `--igpu`) |
+| 11 | Pin packages via APT preferences + `dpkg hold` to prevent `apt upgrade` from overwriting |
+| 12 | Verify installation — checks binary size, ROM files, ACPI tables, KVM module, and spot-checks ROMs for leftover VM strings |
 
 ### Usage
 
@@ -166,13 +170,16 @@ bash pve-realpc-setup.sh --skip-pin
 # Skip automatic kernel downgrade (install module into current kernel even if mismatched)
 bash pve-realpc-setup.sh --skip-kernel-downgrade
 
+# Enable Intel Ultra iGPU passthrough (downloads ROM, configures IOMMU + VFIO)
+bash pve-realpc-setup.sh --igpu
+
 # Show help
 bash pve-realpc-setup.sh --help
 ```
 
 ### Automatic Kernel Downgrade
 
-The patched `kvm.ko` module is built against a specific kernel version. If your running kernel doesn't match, Step 6 will automatically:
+The patched `kvm.ko` module is built against a specific kernel version. If your running kernel doesn't match, Step 8 will automatically:
 
 1. **Search APT** for the correct `proxmox-kernel-*` (PVE 9) or `pve-kernel-*` (PVE 8) package
 2. **Install** the matching kernel package
@@ -188,16 +195,18 @@ To skip this behavior and force installation into whatever kernel is currently r
 
 | Component | Path | Description |
 |---|---|---|
-| Patched QEMU | `/usr/bin/qemu-system-x86_64` | ~29.7 MB (Strong build) |
+| Patched QEMU | `/usr/bin/qemu-system-x86_64` | ~29.7 MB (Strong build with PVE integration + sensor passthrough) |
 | Patched OVMF | `/usr/share/pve-edk2-firmware/` | UEFI firmware with anti-detection |
+| Patched ROM/BIOS | `/usr/share/kvm/` + `/usr/share/qemu/` | SeaBIOS, VGA, and EFI ROMs with VM strings removed (from Debian release) |
 | Patched KVM module | `/lib/modules/$(uname -r)/kernel/arch/x86/kvm/kvm.ko` | Hides KVM signatures |
 | ACPI tables | `/root/ssdt.aml`, `/root/ssdt-ec.aml`, `/root/hpet.aml`, `/root/ssdt-battery.aml` | Virtual hardware tables |
-| Backups | `/root/pve-realpc/backup/` | Stock binaries for rollback |
+| iGPU ROM *(optional)* | `/usr/share/kvm/ultra-1-2-qemu10.rom` | Intel Ultra iGPU passthrough ROM (with `--igpu`) |
+| Backups | `/root/pve-realpc/backup/` | Stock binaries + ROMs for rollback |
 | APT pin | `/etc/apt/preferences.d/pve-realpc-hold` | Prevents overwrite on upgrade |
 
 ### Release Assets Downloaded
 
-From tag `v20260306-213905-pve9`:
+**PVE release** — tag [`v20260306-213905-pve9`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260306-213905-pve9):
 
 | File | Purpose |
 |---|---|
@@ -205,7 +214,18 @@ From tag `v20260306-213905-pve9`:
 | `pve-edk2-firmware-ovmf_4.2025.05-2_all.deb` | Base anti-detection OVMF |
 | `pve-qemu-kvm_10.1.2-7_amd64_Strong_intel_amd.tgz` | Strong build (QEMU + OVMF + KVM modules) |
 | `ssdt.aml` / `ssdt-ec.aml` / `ssdt-battery.aml` / `hpet.aml` | ACPI tables |
-| `qemu-autoGenPatch.patch` | Full diff of all source modifications (reference) |
+| `qemu-autoGenPatch.patch` | Full diff of all source modifications (reference only) |
+
+**Debian release** — tag [`v20260307-191041-debian`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260307-191041-debian) (patched ROM/BIOS files only):
+
+| File | Purpose |
+|---|---|
+| `bios-256k.bin` / `bios.bin` / `bios-microvm.bin` | Patched SeaBIOS ROMs — `QEMU`/`Bochs`/`SeaBIOS` strings replaced |
+| `efi-e1000.rom` / `efi-e1000e.rom` / `efi-virtio.rom` | Patched EFI network boot ROMs |
+| `vgabios-qxl.bin` / `vgabios-stdvga.bin` | Patched VGA BIOS ROMs |
+| `ssdt.aml` / `ssdt-ec.aml` / `ssdt-battery.aml` / `hpet.aml` | ACPI tables (identical to PVE release — used as fallback) |
+
+> **Why two releases?** Both use the same `sedPatch` anti-detection source patches (~110 sed replacements). However, the PVE deb ships **stock unpatched ROM binaries** — the `sedPatch` modifies SeaBIOS source but Proxmox's build system doesn't recompile the prebuilt ROM blobs. The Debian release provides separately compiled ROMs with all VM-identifying strings scrubbed. The PVE QEMU binary is preferred (PVE integration + Strong sensor passthrough + larger patch set), so we take only the ROM files from the Debian release.
 
 ---
 
@@ -329,6 +349,8 @@ After installing Windows in the VM:
 
 The `windows/` directory contains PowerShell scripts to run **inside the Windows guest** after the VM is deployed.  They eliminate residual VM fingerprints that survive even a patched QEMU/OVMF setup.
 
+> **Attribution:** These guest-side cleanup scripts are based on the PowerShell tools from [Scrut1ny/AutoVirt](https://github.com/Scrut1ny/AutoVirt) (`resources/scripts/Windows/`). They have been rewritten with broader detection coverage, parameterisation, backup/restore support, and structured logging, but the original concept, registry target lists, and approach originated in AutoVirt.
+
 ### Quick Launch
 
 Double-click **`run-tools.bat`** — it auto-elevates to Administrator, bypasses the PowerShell execution policy, and presents a menu:
@@ -340,8 +362,6 @@ Double-click **`run-tools.bat`** — it auto-elevates to Administrator, bypasses
   [A]  Run ALL (1 → 2 → 3)
   [Q]  Quit
 ```
-
-> **Origin:** based on the PS1 tools in [Scrut1ny/AutoVirt](https://github.com/Scrut1ny/AutoVirt/tree/main/resources/scripts/Windows), rewritten with broader coverage, parameterisation, backup/restore support, and structured logging.
 
 ### 1. `qemu-cleanup.ps1` — Registry & Driver Artefact Removal
 
@@ -464,7 +484,9 @@ Backups of the original binaries are saved during setup in `/root/pve-realpc/bac
 
 | Resource | Link |
 |---|---|
-| **Patched packages (releases)** | [AICodo/pve-emu-realpc](https://github.com/AICodo/pve-emu-realpc/releases) |
+| **Patched packages (PVE release)** | [AICodo/pve-emu-realpc — `v20260306-213905-pve9`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260306-213905-pve9) |
+| **Patched ROMs (Debian release)** | [AICodo/pve-emu-realpc — `v20260307-191041-debian`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260307-191041-debian) |
+| **Guest cleanup scripts (origin)** | [Scrut1ny/AutoVirt](https://github.com/Scrut1ny/AutoVirt) — `resources/scripts/Windows/` |
 | **Anti-detection source code** | [lixiaoliu666/pve-anti-detection](https://github.com/lixiaoliu666/pve-anti-detection) |
 | **Technical documentation** | [DeepWiki — pve-anti-detection](https://deepwiki.com/lixiaoliu666/pve-anti-detection) |
 | **Original fork source** | [zhaodice/qemu-anti-detection](https://github.com/zhaodice/qemu-anti-detection) |
