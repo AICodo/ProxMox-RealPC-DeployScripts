@@ -11,7 +11,7 @@
 #   - OVMF + Q35 machine type (patched Strong OVMF firmware)
 #   - SATA disk with custom serial
 #   - e1000e NIC with realistic MAC prefix (Intel 82574L)
-#   - Full SMBIOS spoofing (types 0,1,2,3,4,8,9,17)
+#   - Full SMBIOS spoofing (types 1,2,3,4,8,9,17) — type 0 left to firmware
 #   - Custom ACPI tables (ssdt.aml, ssdt-ec.aml, hpet.aml)
 #   - CPU: host with hypervisor=off, pmu=off (binary handles CPUID/KVM hiding)
 #   - Auto-detect host -smp topology (P/E core–aware thread mapping)
@@ -194,6 +194,13 @@ random_serial_20() {
     local pool
     pool=$(dd if=/dev/urandom bs=128 count=1 2>/dev/null | LC_ALL=C tr -dc 'A-Z0-9')
     echo "${pool:0:20}"
+}
+
+qemu_escape_commas() {
+    # QEMU option values use commas as field separators; literal commas must be
+    # doubled (,,) to pass through. Without this, values like
+    # "Micro-Star International Co., Ltd." break QEMU's -smbios parser.
+    echo "${1//,/,,}"
 }
 
 ###############################################################################
@@ -583,20 +590,29 @@ CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforc
 # Each -smbios value containing spaces MUST be wrapped in single quotes so
 # shellwords delivers it as a single argv token to QEMU. Without this, QEMU
 # interprets the split tokens as file paths and crashes with "Could not open".
+#
+# Type 0 (BIOS) is INTENTIONALLY OMITTED from args:
+#   OVMF reads type=0 overrides from fw_cfg during its DXE phase. Replacing the
+#   firmware's own BIOS identity table externally causes OVMF's SmbiosPlatformDxe
+#   driver to produce an inconsistent SMBIOS entry point, which can crash the
+#   firmware before display initialization ("Guest has not initialized the display
+#   (yet)" / VNC proxy failure). The patched Strong OVMF firmware already sanitizes
+#   its own type=0 strings for the FIRMWARE check — let it handle its own identity.
+#
+# Type 1 (System) is handled via PVE's native smbios1: config option (see Step 1b
+# after qm create). PVE ALWAYS generates a -smbios type=1,uuid=... entry; adding
+# a second type=1 here in args creates duplicate entries that can conflict.
+# Using smbios1: is the canonical PVE approach and guarantees a single, properly-
+# formatted type=1 with the correct UUID.
 SMBIOS_ARGS=""
-# Type 0 — BIOS
-SMBIOS_ARGS+=" -smbios 'type=0,vendor=${SMBIOS_BIOS_VENDOR},version=${SMBIOS_BIOS_VERSION},date=${SMBIOS_BIOS_DATE},release=${SMBIOS_BIOS_RELEASE}'"
-# Type 1 — System (PVE also generates smbios1: uuid=... which adds a -smbios type=1,uuid=…;
-# QEMU merges duplicate types, so our fields here win for manufacturer/product/etc.)
-SMBIOS_ARGS+=" -smbios 'type=1,manufacturer=${SMBIOS_BOARD_MFG},product=${SMBIOS_BOARD_PRODUCT},version=${SMBIOS_BOARD_VERSION},serial=Default string,sku=Default string,family=Default string'"
 # Type 2 — Baseboard
-SMBIOS_ARGS+=" -smbios 'type=2,manufacturer=${SMBIOS_BOARD_MFG},product=${SMBIOS_BOARD_PRODUCT},version=${SMBIOS_BOARD_VERSION},serial=Default string,asset=Default string,location=Default string'"
+SMBIOS_ARGS+=" -smbios 'type=2,manufacturer=$(qemu_escape_commas "${SMBIOS_BOARD_MFG}"),product=$(qemu_escape_commas "${SMBIOS_BOARD_PRODUCT}"),version=$(qemu_escape_commas "${SMBIOS_BOARD_VERSION}"),serial=Default string,asset=Default string,location=Default string'"
 # Type 3 — Chassis
 SMBIOS_ARGS+=" -smbios 'type=3,manufacturer=Default string,version=Default string,serial=Default string,asset=Default string,sku=Default string'"
 # Type 17 — Memory
 SMBIOS_ARGS+=" -smbios 'type=17,serial=${MEM_SERIAL},asset=${MEM_ASSET}'"
 # Type 4 — Processor
-SMBIOS_ARGS+=" -smbios 'type=4,manufacturer=${SMBIOS_CPU_MFG},version=${SMBIOS_CPU_VERSION}'"
+SMBIOS_ARGS+=" -smbios 'type=4,manufacturer=$(qemu_escape_commas "${SMBIOS_CPU_MFG}"),version=$(qemu_escape_commas "${SMBIOS_CPU_VERSION}")'"
 # Type 9 — System Slots (bare, triggers slot info generation in Strong build)
 SMBIOS_ARGS+=" -smbios type=9"
 # Type 8 — Port Connectors (×2 per author's config)
@@ -726,6 +742,18 @@ qm create "$VMID" \
     --localtime 1
 
 ok "Base VM created"
+
+# Step 1b: Set SMBIOS type=1 (System Information) via PVE's native smbios1: option.
+# This is the canonical way to set type=1 in PVE — avoids duplicate -smbios type=1
+# entries (PVE always auto-generates one from smbios1: or a default UUID).
+# Commas are stripped from values — PVE's smbios1 parser splits on commas.
+SMBIOS1_MFG="${SMBIOS_BOARD_MFG//,/}"
+SMBIOS1_PRODUCT="${SMBIOS_BOARD_PRODUCT//,/}"
+SMBIOS1_VERSION="${SMBIOS_BOARD_VERSION//,/}"
+SYS_UUID=$(cat /proc/sys/kernel/random/uuid)
+info "Setting SMBIOS type=1 (System Information) via smbios1: ..."
+qm set "$VMID" --smbios1 "uuid=${SYS_UUID},manufacturer=${SMBIOS1_MFG},product=${SMBIOS1_PRODUCT},version=${SMBIOS1_VERSION},serial=Default string,sku=Default string,family=Default string"
+ok "SMBIOS type=1 set (uuid=${SYS_UUID})"
 
 # Step 2: Add EFI disk
 # Do NOT use pre-enrolled-keys — the patched Strong OVMF firmware handles
@@ -942,7 +970,7 @@ echo -e "${GREEN}╠════════════════════
 echo -e "${GREEN}║                                                               ║${NC}"
 echo -e "${GREEN}║  Anti-Detection Features (upstream-compatible):               ║${NC}"
 echo -e "${GREEN}║    ✓ OVMF + Q35 (patched Strong OVMF firmware)               ║${NC}"
-echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 0,1,2,3,4,8,9,17)              ║${NC}"
+echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 1,2,3,4,8,9,17 — 0 by OVMF)  ║${NC}"
 echo -e "${GREEN}║    ✓ ACPI custom tables (ssdt, ssdt-ec, hpet, pit)            ║${NC}"
 echo -e "${GREEN}║    ✓ CPU: host, hypervisor=off, pmu=off (binary hides KVM)  ║${NC}"
 echo -e "${GREEN}║    ✓ Cores: ${SMP_TOTAL} vCPUs (${SMP_CORES}c × ${SMP_THREADS}t, matches host topology)  ║${NC}"
