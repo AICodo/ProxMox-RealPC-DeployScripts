@@ -203,19 +203,11 @@ qemu_escape_commas() {
     echo "${1//,/,,}"
 }
 
-pve_urlencode() {
-    # PVE's smbios1: fields are validated against a strict regex that rejects
-    # spaces, commas, and most special characters. Values must be percent-encoded
-    # (e.g. space → %20, comma → %2C). PVE decodes them before passing to QEMU.
-    local str="$1" encoded="" i c
-    for (( i=0; i<${#str}; i++ )); do
-        c="${str:$i:1}"
-        case "$c" in
-            [a-zA-Z0-9._~-]) encoded+="$c" ;;
-            *) encoded+=$(printf '%%%02X' "'$c") ;;
-        esac
-    done
-    echo "$encoded"
+pve_smbios_b64() {
+    # PVE's smbios1: string fields (manufacturer, product, serial, etc.) are
+    # validated against regex [A-Za-z0-9+/]+={0,2} — i.e. BASE64.
+    # PVE decodes them before generating the QEMU -smbios type=1 command line.
+    echo -n "$1" | base64 -w0
 }
 
 ###############################################################################
@@ -758,20 +750,19 @@ qm create "$VMID" \
 
 ok "Base VM created"
 
-# Step 1b: Set SMBIOS type=1 (System Information) via PVE's native smbios1: option.
-# This is the canonical way to set type=1 in PVE — avoids duplicate -smbios type=1
-# entries (PVE always auto-generates one from smbios1: or a default UUID).
-# All values must be percent-encoded — PVE's smbios1 regex rejects spaces/commas.
-SMBIOS1_MFG=$(pve_urlencode "${SMBIOS_BOARD_MFG}")
-SMBIOS1_PRODUCT=$(pve_urlencode "${SMBIOS_BOARD_PRODUCT}")
-SMBIOS1_VERSION=$(pve_urlencode "${SMBIOS_BOARD_VERSION}")
-SMBIOS1_SERIAL=$(pve_urlencode "Default string")
-SMBIOS1_SKU=$(pve_urlencode "Default string")
-SMBIOS1_FAMILY=$(pve_urlencode "Default string")
+# Step 1b: Build SMBIOS type=1 line for direct conf file injection (done in Step 5).
+# PVE's smbios1: string fields require BASE64 encoding — qm set --smbios1 validates
+# against regex [A-Za-z0-9+/]+={0,2}. Using qm set is fragile, so we write the
+# smbios1: line directly to the conf file alongside args: in Step 5.
+SMBIOS1_MFG=$(pve_smbios_b64 "${SMBIOS_BOARD_MFG}")
+SMBIOS1_PRODUCT=$(pve_smbios_b64 "${SMBIOS_BOARD_PRODUCT}")
+SMBIOS1_VERSION=$(pve_smbios_b64 "${SMBIOS_BOARD_VERSION}")
+SMBIOS1_SERIAL=$(pve_smbios_b64 "Default string")
+SMBIOS1_SKU=$(pve_smbios_b64 "Default string")
+SMBIOS1_FAMILY=$(pve_smbios_b64 "Default string")
 SYS_UUID=$(cat /proc/sys/kernel/random/uuid)
-info "Setting SMBIOS type=1 (System Information) via smbios1: ..."
-qm set "$VMID" --smbios1 "uuid=${SYS_UUID},manufacturer=${SMBIOS1_MFG},product=${SMBIOS1_PRODUCT},version=${SMBIOS1_VERSION},serial=${SMBIOS1_SERIAL},sku=${SMBIOS1_SKU},family=${SMBIOS1_FAMILY}"
-ok "SMBIOS type=1 set (uuid=${SYS_UUID})"
+SMBIOS1_LINE="uuid=${SYS_UUID},manufacturer=${SMBIOS1_MFG},product=${SMBIOS1_PRODUCT},version=${SMBIOS1_VERSION},serial=${SMBIOS1_SERIAL},sku=${SMBIOS1_SKU},family=${SMBIOS1_FAMILY}"
+info "Prepared SMBIOS type=1 (uuid=${SYS_UUID}) — will write to conf directly"
 
 # Step 2: Add EFI disk
 # Do NOT use pre-enrolled-keys — the patched Strong OVMF firmware handles
@@ -944,23 +935,22 @@ ok "Boot order configured"
 # (qm doesn't support all the args flags we need via CLI)
 ###############################################################################
 CONF_FILE="/etc/pve/qemu-server/${VMID}.conf"
-info "Patching ${CONF_FILE} with anti-detection args ..."
+info "Patching ${CONF_FILE} with anti-detection config ..."
 
-# Check if args line already exists (it shouldn't for a new VM)
-if grep -q "^args:" "$CONF_FILE" 2>/dev/null; then
-    # Replace existing args line
-    sed -i "/^args:/d" "$CONF_FILE"
-fi
+# Remove any existing args/smbios1/affinity lines (shouldn't exist for a new VM,
+# but clean up just in case of re-runs or leftover state)
+sed -i '/^args:/d'     "$CONF_FILE" 2>/dev/null || true
+sed -i '/^smbios1:/d'  "$CONF_FILE" 2>/dev/null || true
+sed -i '/^affinity:/d' "$CONF_FILE" 2>/dev/null || true
 
-# Remove any stale affinity line
-sed -i "/^affinity:/d" "$CONF_FILE" 2>/dev/null || true
-
-# Prepend args as the first line (PVE convention: args at top)
-# Write to /tmp first — /etc/pve is a FUSE filesystem (pmxcfs) where
-# atomic rename within the same mount may behave unexpectedly
+# Write args + smbios1 directly to the conf file.
+# This bypasses qm set's strict regex validation for smbios1 string fields.
+# PVE reads the conf file on VM start and generates the correct QEMU command line.
+# /etc/pve is a FUSE filesystem (pmxcfs) — write to /tmp first, then copy.
 TMP_CONF=$(mktemp /tmp/pve-vm-XXXXXX.conf)
 {
     echo "args: ${FULL_ARGS}"
+    echo "smbios1: ${SMBIOS1_LINE}"
     # Only add affinity if explicitly requested via --affinity
     if [[ -n "$AFFINITY" ]]; then
         echo "affinity: ${AFFINITY}"
@@ -970,7 +960,7 @@ TMP_CONF=$(mktemp /tmp/pve-vm-XXXXXX.conf)
 cp "$TMP_CONF" "$CONF_FILE"
 rm -f "$TMP_CONF"
 
-ok "Anti-detection args written to config"
+ok "Anti-detection args + SMBIOS type=1 written to config"
 
 ###############################################################################
 # Final verification — display the config
@@ -1025,3 +1015,50 @@ echo -e "${GREEN}║    • Do NOT enable Hyper-V in the guest                  
 echo -e "${GREEN}║    • Test with: pafish64.exe, al-khaser, VMAware             ║${NC}"
 echo -e "${GREEN}║                                                               ║${NC}"
 echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+
+###############################################################################
+# Generate deployment summary file
+###############################################################################
+SUMMARY_FILE="/root/vm-${VMID}-deploy-summary.txt"
+{
+    echo "=== VM ${VMID} (${VM_NAME}) — Deployment Summary ==="
+    echo "Generated: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+    echo "--- SMBIOS Identity ---"
+    echo "Board Manufacturer : ${SMBIOS_BOARD_MFG}"
+    echo "Board Product      : ${SMBIOS_BOARD_PRODUCT}"
+    echo "Board Version      : ${SMBIOS_BOARD_VERSION}"
+    echo "BIOS Vendor        : ${SMBIOS_BIOS_VENDOR}"
+    echo "BIOS Version       : ${SMBIOS_BIOS_VERSION}"
+    echo "BIOS Date          : ${SMBIOS_BIOS_DATE}"
+    echo "CPU Manufacturer   : ${SMBIOS_CPU_MFG}"
+    echo "CPU Version        : ${SMBIOS_CPU_VERSION}"
+    echo "System UUID        : ${SYS_UUID}"
+    echo "Disk Serial        : ${DISK_SERIAL}"
+    echo "Memory Serial      : ${MEM_SERIAL}"
+    echo ""
+    echo "--- VM Hardware ---"
+    echo "VMID       : ${VMID}"
+    echo "Name       : ${VM_NAME}"
+    echo "CPU Type   : ${CPU_TYPE}"
+    echo "Topology   : ${SMP_TOTAL} vCPUs (${SMP_CORES}c × ${SMP_THREADS}t)"
+    echo "Memory     : ${MEMORY}MB"
+    echo "Disk       : ${DISK_SIZE} on ${DISK_STORAGE}"
+    echo "VGA        : ${VGA}"
+    echo "NIC        : e1000e on ${BRIDGE}"
+    echo "ISO        : ${ISO_FILE:-none}"
+    if [[ -n "$AFFINITY" ]]; then
+        echo "Affinity   : ${AFFINITY}"
+    fi
+    if [[ "$IGPU_PASSTHROUGH" == true ]]; then
+        echo "iGPU       : ${IGPU_PCI} (ROM: ${IGPU_ROM}, GMS: ${IGPU_GMS})"
+    fi
+    echo ""
+    echo "--- Full Config File ---"
+    cat "$CONF_FILE"
+    echo ""
+    echo "--- QEMU Args (decoded) ---"
+    echo "${FULL_ARGS}" | tr ' ' '\n' | grep -v '^$'
+} > "$SUMMARY_FILE"
+ok "Deployment summary saved to ${SUMMARY_FILE}"
+info "View anytime: cat ${SUMMARY_FILE}"
