@@ -166,9 +166,12 @@ foreach ($wmiMon in $wmiMonitors) {
         # Concatenate all blocks into a single byte[] using MemoryStream
         # (plain += promotes to object[] which breaks WriteAllBytes)
         $ms = [System.IO.MemoryStream]::new()
-        foreach ($blk in $edidBlocks) { $ms.Write($blk, 0, $blk.Length) }
-        [IO.File]::WriteAllBytes($binPath, $ms.ToArray())
-        $ms.Dispose()
+        try {
+            foreach ($blk in $edidBlocks) { $ms.Write($blk, 0, $blk.Length) }
+            [IO.File]::WriteAllBytes($binPath, $ms.ToArray())
+        } finally {
+            $ms.Dispose()
+        }
         Write-Host "  [BAK] $binPath" -ForegroundColor DarkGray
     }
 

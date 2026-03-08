@@ -62,7 +62,7 @@ $Signatures = @(
     "Red Hat"
     "VirtIO"
     "VBOX"              # catch any VirtualBox leftovers too
-    "0627"              # QEMU display adapter subsystem
+    "SUBSYS_0627"       # QEMU display adapter subsystem (scoped to SUBSYS)
 )
 
 # Registry roots to scan
@@ -73,7 +73,7 @@ $EnumRoots = @(
     "HKLM:\SYSTEM\CurrentControlSet\Control\Video"
 )
 
-# Additionally wipe all SCSI sub-keys (QEMU virtio-scsi leaves traces)
+# Additionally wipe matching SCSI sub-keys (QEMU virtio-scsi leaves traces)
 $ScsiRoot = "HKLM:\SYSTEM\CurrentControlSet\Enum\SCSI"
 
 # ── Helpers ─────────────────────────────────────────────────────────────
@@ -139,22 +139,25 @@ function Remove-MatchingKeys {
     }
 }
 
-function Remove-AllSubKeys {
+function Remove-ScsiVmKeys {
     [CmdletBinding(SupportsShouldProcess)]
-    param([string]$Root)
+    param([string]$Root, [string[]]$Patterns)
     if (-not (Test-Path $Root)) { return }
     $keys = Get-ChildItem -Path $Root -Recurse -ErrorAction SilentlyContinue
     foreach ($key in $keys) {
         $Stats.Scanned++
-        if ($PSCmdlet.ShouldProcess($key.PSPath, "Delete SCSI key")) {
-            Backup-Key $key.PSPath
-            try {
-                Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction Stop
-                Write-Host "  [DEL] $($key.PSPath)" -ForegroundColor Green
-                $Stats.Deleted++
-            } catch {
-                Write-Host "  [ERR] $($key.PSPath) - $_" -ForegroundColor Yellow
-                $Stats.Failed++
+        $match = $Patterns | Where-Object { $key.PSPath -like "*$_*" }
+        if ($match) {
+            if ($PSCmdlet.ShouldProcess($key.PSPath, "Delete SCSI key")) {
+                Backup-Key $key.PSPath
+                try {
+                    Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction Stop
+                    Write-Host "  [DEL] $($key.PSPath)" -ForegroundColor Green
+                    $Stats.Deleted++
+                } catch {
+                    Write-Host "  [ERR] $($key.PSPath) - $_" -ForegroundColor Yellow
+                    $Stats.Failed++
+                }
             }
         }
     }
@@ -173,8 +176,8 @@ function Invoke-Cleanup {
         Remove-MatchingKeys -Root $root -Patterns $Signatures
     }
 
-    Write-Host "`n[*] Wiping SCSI sub-keys ($ScsiRoot) ..." -ForegroundColor White
-    Remove-AllSubKeys -Root $ScsiRoot
+    Write-Host "`n[*] Scanning SCSI sub-keys ($ScsiRoot) for VM artefacts ..." -ForegroundColor White
+    Remove-ScsiVmKeys -Root $ScsiRoot -Patterns $Signatures
 
     # Extra: remove cached VirtIO / QEMU driver packages from DriverStore
     $driverStore = "$env:SystemRoot\System32\DriverStore\FileRepository"
@@ -234,19 +237,11 @@ if ($SkipPsExec) {
         }
     }
 
-    # Serialise this script to a temp file and run as SYSTEM.
-    # IMPORTANT: pass -SkipPsExec so the re-launched copy runs inline
-    # instead of trying to download PsExec again (infinite recursion).
-    $selfScript = Join-Path $tempDir "qemu-cleanup-system.ps1"
-    $scriptBody = Get-Content -Path $MyInvocation.MyCommand.Path -Raw
-    @"
-Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
-`$SkipPsExec = `$true
-$scriptBody
-"@ | Set-Content -Path $selfScript -Encoding UTF8
-
+    # Re-launch this same script as SYSTEM with -SkipPsExec so the
+    # child runs inline instead of trying to download PsExec again.
     Write-Host "[*] Launching cleanup as SYSTEM via PsExec ..." -ForegroundColor Cyan
+    $selfPath = $MyInvocation.MyCommand.Path
     Start-Process -FilePath $psexecPath `
-        -ArgumentList "-accepteula -nobanner -s powershell.exe -ExecutionPolicy Bypass -File `"$selfScript`"" `
+        -ArgumentList "-accepteula -nobanner -s powershell.exe -ExecutionPolicy Bypass -File `"$selfPath`" -SkipPsExec" `
         -Wait -NoNewWindow
 }

@@ -125,7 +125,7 @@ $randomDate    = Get-Date -Year (Get-Random -Min 2018 -Max 2025) `
                           -Minute (Get-Random -Max 60) `
                           -Second (Get-Random -Max 60)
 $unixTimestamp = [int]($randomDate.ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds
-$ldapFileTime  = [int64](($unixTimestamp + 11644473600) * 1e7)
+$ldapFileTime  = [int64](($unixTimestamp + 11644473600) * [long]10000000)
 
 Set-Reg -Path $ntPath -Name "InstallDate" -Value $unixTimestamp -Type "DWord"
 Set-Reg -Path $ntPath -Name "InstallTime" -Value $ldapFileTime  -Type "QWord"
