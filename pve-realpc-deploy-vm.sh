@@ -203,6 +203,21 @@ qemu_escape_commas() {
     echo "${1//,/,,}"
 }
 
+pve_urlencode() {
+    # PVE's smbios1: fields are validated against a strict regex that rejects
+    # spaces, commas, and most special characters. Values must be percent-encoded
+    # (e.g. space → %20, comma → %2C). PVE decodes them before passing to QEMU.
+    local str="$1" encoded="" i c
+    for (( i=0; i<${#str}; i++ )); do
+        c="${str:$i:1}"
+        case "$c" in
+            [a-zA-Z0-9._~-]) encoded+="$c" ;;
+            *) encoded+=$(printf '%%%02X' "'$c") ;;
+        esac
+    done
+    echo "$encoded"
+}
+
 ###############################################################################
 # Pre-flight
 ###############################################################################
@@ -746,13 +761,16 @@ ok "Base VM created"
 # Step 1b: Set SMBIOS type=1 (System Information) via PVE's native smbios1: option.
 # This is the canonical way to set type=1 in PVE — avoids duplicate -smbios type=1
 # entries (PVE always auto-generates one from smbios1: or a default UUID).
-# Commas are stripped from values — PVE's smbios1 parser splits on commas.
-SMBIOS1_MFG="${SMBIOS_BOARD_MFG//,/}"
-SMBIOS1_PRODUCT="${SMBIOS_BOARD_PRODUCT//,/}"
-SMBIOS1_VERSION="${SMBIOS_BOARD_VERSION//,/}"
+# All values must be percent-encoded — PVE's smbios1 regex rejects spaces/commas.
+SMBIOS1_MFG=$(pve_urlencode "${SMBIOS_BOARD_MFG}")
+SMBIOS1_PRODUCT=$(pve_urlencode "${SMBIOS_BOARD_PRODUCT}")
+SMBIOS1_VERSION=$(pve_urlencode "${SMBIOS_BOARD_VERSION}")
+SMBIOS1_SERIAL=$(pve_urlencode "Default string")
+SMBIOS1_SKU=$(pve_urlencode "Default string")
+SMBIOS1_FAMILY=$(pve_urlencode "Default string")
 SYS_UUID=$(cat /proc/sys/kernel/random/uuid)
 info "Setting SMBIOS type=1 (System Information) via smbios1: ..."
-qm set "$VMID" --smbios1 "uuid=${SYS_UUID},manufacturer=${SMBIOS1_MFG},product=${SMBIOS1_PRODUCT},version=${SMBIOS1_VERSION},serial=Default string,sku=Default string,family=Default string"
+qm set "$VMID" --smbios1 "uuid=${SYS_UUID},manufacturer=${SMBIOS1_MFG},product=${SMBIOS1_PRODUCT},version=${SMBIOS1_VERSION},serial=${SMBIOS1_SERIAL},sku=${SMBIOS1_SKU},family=${SMBIOS1_FAMILY}"
 ok "SMBIOS type=1 set (uuid=${SYS_UUID})"
 
 # Step 2: Add EFI disk
