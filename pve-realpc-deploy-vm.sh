@@ -11,7 +11,7 @@
 #   - OVMF + Q35 machine type (patched Strong OVMF firmware)
 #   - SATA disk with custom serial
 #   - e1000 NIC with realistic MAC prefix
-#   - Full SMBIOS spoofing (types 0,1,2,3,4,7,8,9,17,26,27,28)
+#   - Full SMBIOS spoofing (types 0,1,2,3,4,8,9,17)
 #   - Custom ACPI tables (ssdt.aml, ssdt-ec.aml, hpet.aml)
 #   - CPU: host with hypervisor=off (NO kvm=off — binary handles it)
 #   - Auto-detect host -smp topology (P/E core–aware thread mapping)
@@ -483,10 +483,6 @@ SMBIOS_ARGS+=" -smbios type=4,manufacturer=\"${SMBIOS_CPU_MFG}\",version=\"${SMB
 SMBIOS_ARGS+=" -smbios type=9"
 # Type 8 — Port Connectors (×2 per author's config)
 SMBIOS_ARGS+=" -smbios type=8 -smbios type=8"
-# Type 7 — CPU Cache (provides L1/L2/L3 cache info to defeat deep SMBIOS fingerprinting)
-SMBIOS_ARGS+=" -smbios type=7"
-# Types 26,27,28 — Voltage/Cooling/Temperature Probes (real systems always have these)
-SMBIOS_ARGS+=" -smbios type=26 -smbios type=27 -smbios type=28"
 
 # Intel Ultra iGPU passthrough args (when --igpu is enabled)
 IGPU_ARGS=""
@@ -658,7 +654,7 @@ echo -e "${GREEN}╠════════════════════
 echo -e "${GREEN}║                                                               ║${NC}"
 echo -e "${GREEN}║  Anti-Detection Features (upstream-compatible):               ║${NC}"
 echo -e "${GREEN}║    ✓ OVMF + Q35 (patched Strong OVMF firmware)               ║${NC}"
-echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 0,1,2,3,4,7,8,9,17,26,27,28)   ║${NC}"
+echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 0,1,2,3,4,8,9,17)              ║${NC}"
 echo -e "${GREEN}║    ✓ ACPI custom tables (ssdt, ssdt-ec, hpet)                ║${NC}"
 echo -e "${GREEN}║    ✓ CPU: host, hypervisor=off (binary hides KVM internally) ║${NC}"
 echo -e "${GREEN}║    ✓ Cores: ${SMP_TOTAL} vCPUs (${SMP_CORES}c × ${SMP_THREADS}t, matches host topology)  ║${NC}"
