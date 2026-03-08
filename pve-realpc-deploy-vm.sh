@@ -187,7 +187,10 @@ random_hex() {
 
 random_serial_20() {
     # Generate a realistic 20-char alphanumeric serial (full A-Z 0-9)
-    tr -dc 'A-Z0-9' < /dev/urandom | head -c 20
+    # Uses bounded dd read to avoid SIGPIPE with set -eo pipefail
+    local pool
+    pool=$(dd if=/dev/urandom bs=128 count=1 2>/dev/null | LC_ALL=C tr -dc 'A-Z0-9')
+    echo "${pool:0:20}"
 }
 
 ###############################################################################
