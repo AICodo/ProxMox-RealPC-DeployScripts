@@ -182,7 +182,10 @@ require_root() {
 
 random_hex() {
     local len=$1
-    od -An -tx1 -N64 /dev/urandom | tr -d ' \n' | head -c "$len" | tr '[:lower:]' '[:upper:]'
+    # Uses bounded read to avoid SIGPIPE with set -eo pipefail
+    local pool
+    pool=$(od -An -tx1 -N64 /dev/urandom | tr -d ' \n' | tr '[:lower:]' '[:upper:]')
+    echo "${pool:0:$len}"
 }
 
 random_serial_20() {
@@ -795,8 +798,9 @@ if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; th
                     [[ -f "$path" ]] || continue
 
                     full_hex=$(hexdump -ve '1/1 "%.2x"' "$path" 2>/dev/null) || continue
-                    # First 4 bytes are attributes (little-endian)
-                    attr=$(printf '%d' "0x${full_hex:6:2}${full_hex:4:2}${full_hex:2:2}${full_hex:0:2}")
+                    # First 4 bytes are attributes (little-endian); skip if too short
+                    [[ ${#full_hex} -ge 8 ]] || continue
+                    attr=$(printf '%d' "0x${full_hex:6:2}${full_hex:4:2}${full_hex:2:2}${full_hex:0:2}" 2>/dev/null) || continue
 
                     "$first" && first=false || printf ',\n'
                     printf '        { "name": "%s", "guid": "%s", "attr": %d, "data": "%s" }' \
@@ -810,11 +814,13 @@ if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; th
 
             if [[ "$VAR_COUNT" -ge 2 ]]; then
                 # Inject host EFI variables into the OVMF_VARS image
+                # || true: must not kill the script if injection fails —
+                # the VM is already created and the args line still needs to be written
                 virt-fw-vars \
                     --input "$NVRAM_ORIG" \
                     --output "$NVRAM_NEW" \
                     --secure-boot \
-                    --set-json "$NVRAM_JSON" 2>/dev/null
+                    --set-json "$NVRAM_JSON" 2>/dev/null || true
 
                 if [[ -f "$NVRAM_NEW" ]]; then
                     # Write back to the efidisk
