@@ -6,7 +6,7 @@ color 0B
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting Administrator privileges ...
-    powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    powershell -Command "Start-Process -FilePath 'cmd.exe' -ArgumentList '/k \"\"%~f0\"\"' -Verb RunAs"
     exit /b
 )
 
