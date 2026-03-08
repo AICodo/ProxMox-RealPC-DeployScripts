@@ -101,10 +101,10 @@ $Stats = @{ Scanned = 0; Deleted = 0; Failed = 0; Backed = 0 }
 function Write-Banner {
     $banner = @"
 
-  ╔══════════════════════════════════════════╗
-  ║       QEMU / VM Registry Cleanup         ║
-  ║  ProxMox-RealPC-DeployScripts            ║
-  ╚══════════════════════════════════════════╝
+  +==========================================+
+  |       QEMU / VM Registry Cleanup         |
+  |  ProxMox-RealPC-DeployScripts            |
+  +==========================================+
 
 "@
     Write-Host $banner -ForegroundColor Cyan
@@ -340,9 +340,10 @@ if ($SkipPsExec) {
     # child runs inline instead of trying to download PsExec again.
     Write-Host "[*] Launching cleanup as SYSTEM via PsExec ..." -ForegroundColor Cyan
     $selfPath = $MyInvocation.MyCommand.Path
+    $argList  = '-accepteula -nobanner -s powershell.exe -ExecutionPolicy Bypass -File "' + $selfPath + '" -SkipPsExec'
     $startArgs = @{
         FilePath     = $psexecPath
-        ArgumentList = "-accepteula -nobanner -s powershell.exe -ExecutionPolicy Bypass -File ""$selfPath"" -SkipPsExec"
+        ArgumentList = $argList
         Wait         = $true
         NoNewWindow  = $true
     }
