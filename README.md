@@ -290,7 +290,7 @@ bash pve-realpc-deploy-vm.sh --help
 | `--iso-type slim\|stock` | interactive | Auto-filter ISOs by type (see patterns below) |
 | `--bridge NAME` | `vmbr0` | Network bridge |
 | `--type desktop\|laptop` | `desktop` | Desktop = `ssdt.aml`; Laptop = `ssdt-battery.aml` |
-| `--vga TYPE` | `std` | VGA: `std`, `vmware` (recommended for v10.2.1), `none` (GPU passthrough), `virtio` |
+| `--vga TYPE` | `vmware` | VGA: `std`, `vmware` (recommended by upstream v10.2.1), `none` (GPU passthrough), `virtio` |
 | `--ostype TYPE` | `other` | `other` prevents PVE from injecting S3/S4-disable globals |
 | `--tpm` | off | Add TPM 2.0 device (upstream doesn't include it) |
 | `--affinity RANGE` | none | CPU pinning range (only set if explicitly passed) |

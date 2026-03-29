@@ -100,9 +100,11 @@ if (Test-Path $classRoot) {
     Remove-KeysMatching -Root $classRoot -Patterns $searchStrings
 }
 
-# Delete all subkeys under Enum\SCSI
+# Clean Enum\SCSI of VM-related entries only (preserve legitimate SATA/NVMe disk entries)
+# Remove-AllSubKeys is too aggressive — it nukes the active boot disk's registry keys
+# since Windows registers AHCI/SATA disks under Enum\SCSI via the SCSI miniport driver.
 if (Test-Path $scsiRoot) {
-    Remove-AllSubKeys -Root $scsiRoot
+    Remove-KeysMatching -Root $scsiRoot -Patterns $searchStrings
 }
 
 # Clean DriverStore FileRepository — remove VirtIO/QEMU driver packages

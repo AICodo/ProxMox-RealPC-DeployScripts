@@ -17,7 +17,8 @@ $randomDate = Get-Random -Minimum ([datetime]'2019-01-01').Ticks -Maximum (([dat
 
 # Convert to Unix timestamp and LDAP/FILETIME
 $unixTimestamp = [int]($randomDate.ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds
-$ldapFileTime = [int64](($unixTimestamp + 11644473600) * 1e7)
+# Use integer arithmetic to avoid float64 precision loss on large timestamps
+$ldapFileTime = [long]($unixTimestamp + 11644473600) * 10000000
 
 # Update registry values with proper numeric types
 $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
@@ -52,8 +53,12 @@ $ouiPrefixes = @('D8FC93', '3C2AF4', 'A4BB6D', '8CDFB0', '48B02D', 'B4969B')
 $oui = $ouiPrefixes | Get-Random
 $suffix = ('{0:X}' -f (Get-Random -Maximum 0xFFFFFF)).PadLeft(6, '0')
 $newMac = $oui + $suffix
-$adapter = (Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1).Name
-Set-NetAdapter -Name "$adapter" -MacAddress "$newMac" -Confirm:$false
+$adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1
+if ($adapter) {
+    Set-NetAdapter -Name $adapter.Name -MacAddress "$newMac" -Confirm:$false
+} else {
+    Write-Host "[!] No active network adapter found - skipping MAC change" -ForegroundColor Yellow
+}
 
 # ==================================
 

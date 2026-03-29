@@ -833,15 +833,25 @@ if [[ "$ENABLE_IGPU" == true ]]; then
         else
             IOMMU_PARAM="amd_iommu=on"
         fi
+        GRUB_CHANGED=false
         if ! grep -q "${IOMMU_PARAM}" "$GRUB_FILE"; then
             info "Enabling ${IGPU_VENDOR^^} IOMMU in GRUB (${IOMMU_PARAM}) ..."
             cp "$GRUB_FILE" "${BACKUP_DIR}/grub.default.igpu.bak" 2>/dev/null || true
             sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"\([^\"]*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 ${IOMMU_PARAM}\"/" "$GRUB_FILE"
+            GRUB_CHANGED=true
+        fi
+        # Add IOMMU passthrough mode — only passes assigned devices through IOMMU
+        # (reduces overhead for non-passthrough devices vs translating all DMA)
+        if ! grep -q "iommu=pt" "$GRUB_FILE"; then
+            sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"\([^\"]*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 iommu=pt\"/" "$GRUB_FILE"
+            GRUB_CHANGED=true
+        fi
+        if [[ "$GRUB_CHANGED" == true ]]; then
             if command -v update-grub &>/dev/null; then
                 update-grub 2>&1 | tail -3
             fi
             NEEDS_REBOOT=true
-            ok "${IGPU_VENDOR^^} IOMMU enabled (reboot required)"
+            ok "${IGPU_VENDOR^^} IOMMU + passthrough mode enabled (reboot required)"
         else
             ok "${IGPU_VENDOR^^} IOMMU already enabled in GRUB"
         fi
@@ -863,12 +873,13 @@ IGPUEOF
             cat > "$IGPU_BLACKLIST_FILE" <<'IGPUEOF'
 # Blacklist AMD GPU and audio drivers to allow VFIO passthrough
 # Created by pve-realpc-setup.sh --igpu
+# Note: AMD GPU audio uses the snd_hda_intel module (Intel HDA standard)
 blacklist amdgpu
 blacklist radeon
-blacklist snd_hda_amd
+blacklist snd_hda_intel
 options vfio_iommu_type1 allow_unsafe_interrupts=1
 IGPUEOF
-            ok "Created ${IGPU_BLACKLIST_FILE} (blacklist amdgpu + radeon + snd_hda_amd)"
+            ok "Created ${IGPU_BLACKLIST_FILE} (blacklist amdgpu + radeon + snd_hda_intel)"
         fi
 
         # Rebuild initramfs so VFIO claims the devices at boot
@@ -1073,7 +1084,7 @@ if [[ "$igpu_v" == "intel" ]]; then
 _bx "$GREEN" "Intel iGPU ROM installed (/usr/share/kvm/)"
 _bx "$GREEN" "Intel IOMMU enabled + i915/snd_hda_intel blacklisted"
 else
-_bx "$GREEN" "AMD IOMMU enabled + amdgpu/radeon/snd_hda_amd blacklisted"
+_bx "$GREEN" "AMD IOMMU enabled + amdgpu/radeon/snd_hda_intel blacklisted"
 fi
 fi
 _bxe

@@ -41,7 +41,11 @@ foreach ($wmiMon in $wmiMonitors) {
 			$targetBlock[$off + 2] -eq 0x00 -and
 			$targetBlock[$off + 3] -eq 0xFF
 		) {
-			[Array]::Clear($targetBlock, $off, 18)
+			# Convert serial number descriptor to dummy descriptor (tag 0x10)
+			# Zeroing all 18 bytes sets tag to 0x00 which is reserved/undefined in EDID 1.3;
+			# tag 0x10 (Dummy Descriptor) is the spec-correct way to blank a descriptor slot.
+			$targetBlock[$off + 3] = 0x10
+			for ($j = $off + 4; $j -lt $off + 18; $j++) { $targetBlock[$j] = 0x00 }
 		}
 	}
 

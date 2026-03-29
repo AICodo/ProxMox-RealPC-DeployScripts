@@ -46,7 +46,7 @@ ISO_FILE=""                      # Auto-detect if empty
 ISO_TYPE=""                      # "slim"|"stock"|"" for interactive picker
 BRIDGE="vmbr0"                   # Network bridge
 CPU_TYPE="desktop"               # "desktop" = ssdt.aml (no battery), "laptop" = ssdt-battery.aml
-VGA="std"                        # "std"|"vmware"|"none"|"virtio" (vmware recommended for v10.2.1)
+VGA="vmware"                     # "std"|"vmware"|"none"|"virtio" (vmware recommended by upstream v10.2.1)
 ADD_TPM=false                    # --tpm adds TPM 2.0 (upstream doesn't include it)
 AFFINITY=""                      # Empty = don't set; only written if --affinity passed
 IGPU_PASSTHROUGH=false           # --igpu enables iGPU passthrough (Intel or AMD)
@@ -128,8 +128,8 @@ VM Configuration:
   --iso FILENAME       ISO filename (default: auto-detect Windows ISO)
   --iso-type TYPE      ISO type: slim|stock (auto-filter ISOs by type)
   --bridge NAME        Network bridge (default: vmbr0)
-  --vga TYPE           VGA type: std|vmware|none|virtio (default: std)
-                         vmware is recommended for v10.2.1 (best 3D accel with GPU mirror)
+  --vga TYPE           VGA type: std|vmware|none|virtio (default: vmware)
+                         Recommended by upstream v10.2.1 (best 3D accel with GPU mirror)
   --ostype TYPE        OS type: other|l26|win10|win11 (default: other)
   --tpm                Add TPM 2.0 device (upstream doesn't include this)
   --affinity RANGE     CPU affinity, e.g. 0-7 (default: none)
@@ -460,17 +460,29 @@ if [[ -z "$SMBIOS_CPU_VERSION" ]]; then
     if [[ -n "$CPU_MODEL" ]]; then
         if [[ "$HOST_CPU_VENDOR" == "amd" ]]; then
             # e.g., "AMD Ryzen 9 7950X 16-Core Processor" → "AMD Ryzen 9 0000"
-            SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(AMD Ryzen [0-9]+ ).*/\10000/')
-            # Fallback if sed didn't match
+            # Also handles: Ryzen Threadripper, Ryzen PRO, EPYC
+            SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(AMD Ryzen (Threadripper |PRO )?[0-9]+ ).*/\10000/')
+            # Fallback for EPYC and other AMD CPUs
+            if [[ "$SMBIOS_CPU_VERSION" == "$CPU_MODEL" ]]; then
+                SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(AMD EPYC ).*/\10000/')
+            fi
             [[ "$SMBIOS_CPU_VERSION" == "$CPU_MODEL" ]] && SMBIOS_CPU_VERSION="AMD 0000"
         else
             # Extract generation / brand string, then replace specific model with "0000" for stealth
             # e.g., "13th Gen Intel(R) Core(TM) i7-13700K" → "13th Gen Intel(R) 0000"
-            GEN_PREFIX=$(echo "$CPU_MODEL" | grep -oP '^\d+th Gen' || echo "")
+            # Handles all ordinals: 1st, 2nd, 3rd, 4th-99th Gen
+            GEN_PREFIX=$(echo "$CPU_MODEL" | grep -oP '^\d+(st|nd|rd|th) Gen' || echo "")
             if [[ -n "$GEN_PREFIX" ]]; then
                 SMBIOS_CPU_VERSION="${GEN_PREFIX} Intel(R) 0000"
+            elif echo "$CPU_MODEL" | grep -qiP 'Core.*Ultra'; then
+                # Intel Core Ultra series (e.g., "Intel(R) Core(TM) Ultra 9 265K")
+                ULTRA_PREFIX=$(echo "$CPU_MODEL" | grep -oP 'Intel.*Ultra \d+' || echo "")
+                if [[ -n "$ULTRA_PREFIX" ]]; then
+                    SMBIOS_CPU_VERSION="${ULTRA_PREFIX} 0000"
+                else
+                    SMBIOS_CPU_VERSION="Genuine Intel(R) 0000"
+                fi
             else
-                # For newer Intel (e.g., "Intel(R) Core(TM) Ultra 9 265K")
                 SMBIOS_CPU_VERSION="Genuine Intel(R) 0000"
             fi
         fi
@@ -887,8 +899,12 @@ if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; th
         NVRAM_ORIG="${NVRAM_WORK}/OVMF_VARS.fd"
         NVRAM_NEW="${NVRAM_WORK}/OVMF_VARS_injected.fd"
 
+        # Detect efidisk format (qcow2 or raw) to preserve on write-back
+        EFI_FORMAT=$(qemu-img info --output=json "$EFI_DISK_PATH" 2>/dev/null \
+            | grep -oP '"format":\s*"\K[^"]+' || echo "qcow2")
+
         # Export the current OVMF_VARS from the efidisk as raw
-        qemu-img convert -f qcow2 -O raw "$EFI_DISK_PATH" "$NVRAM_ORIG" 2>/dev/null \
+        qemu-img convert -f "$EFI_FORMAT" -O raw "$EFI_DISK_PATH" "$NVRAM_ORIG" 2>/dev/null \
             || cp "$EFI_DISK_PATH" "$NVRAM_ORIG" 2>/dev/null || true
 
         if [[ -f "$NVRAM_ORIG" ]]; then
@@ -944,8 +960,8 @@ if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; th
                     # Verify the injected image is a valid size (should be ~256K-4M)
                     NVRAM_NEW_SIZE=$(stat -c%s "$NVRAM_NEW" 2>/dev/null || echo "0")
                     if [[ "$NVRAM_NEW_SIZE" -ge 131072 ]]; then
-                        # Write back to the efidisk
-                        qemu-img convert -f raw -O qcow2 "$NVRAM_NEW" "$EFI_DISK_PATH" 2>/dev/null \
+                        # Write back to the efidisk (preserve original format)
+                        qemu-img convert -f raw -O "$EFI_FORMAT" "$NVRAM_NEW" "$EFI_DISK_PATH" 2>/dev/null \
                             || cp "$NVRAM_NEW" "$EFI_DISK_PATH" 2>/dev/null || true
                         NVRAM_INJECTED=true
                         ok "Host EFI variables injected into VM NVRAM (${VAR_COUNT} variables: PK, KEK, db, dbx, defaults)"
@@ -1006,8 +1022,12 @@ if [[ "$IGPU_PASSTHROUGH" == true ]]; then
 fi
 
 # Step 3: Add SATA system disk
-# qm expects size as bare number in GB (e.g. 256, not 256G)
-DISK_SIZE_NUM=$(echo "$DISK_SIZE" | sed 's/[GgMmBbTt]*$//')
+# qm expects size as bare number in GB; convert T/TB to GB
+case "$DISK_SIZE" in
+    *[Tt][Bb]) DISK_SIZE_NUM=$(echo "$DISK_SIZE" | sed 's/[Tt][Bb]$//'); DISK_SIZE_NUM=$((DISK_SIZE_NUM * 1024)) ;;
+    *[Tt])     DISK_SIZE_NUM=$(echo "$DISK_SIZE" | sed 's/[Tt]$//');     DISK_SIZE_NUM=$((DISK_SIZE_NUM * 1024)) ;;
+    *)         DISK_SIZE_NUM=$(echo "$DISK_SIZE" | sed 's/[GgBb]*$//') ;;
+esac
 info "Adding SATA system disk (${DISK_SIZE_NUM}GB) ..."
 qm set "$VMID" --sata0 "${DISK_STORAGE}:${DISK_SIZE_NUM},ssd=1,serial=${DISK_SERIAL}"
 ok "SATA disk added with serial ${DISK_SERIAL}"
