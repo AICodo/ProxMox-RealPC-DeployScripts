@@ -104,6 +104,8 @@ Applied by `pve-realpc-deploy-vm.sh` (matches upstream recommended args exactly)
 - **NO** `pre-enrolled-keys` (host EFI variables injected instead)
 
 > **v10.2.1 Display Changes:** The Strong build now supports **VMware-compatible display** (`--vga vmware`), which is **recommended by upstream** for best 3D acceleration with iGPU/dGPU mirror setups. VirtIO-GPU is also supported (OVMF only). The PCI-IDs for Standard VGA, VMware, and VirtIO-GPU have all been changed from their stock QEMU values (no longer 0x1234, 0x15ad, or 0x1af4). Spice display still uses PCI-ID 0x1b36 and is not recommended.
+>
+> **VMware VGA ROM limitation:** The Debian release only provides patched `vgabios-stdvga.bin` and `vgabios-qxl.bin` ROMs (with VM strings removed). The `vgabios-vmware.bin` and `vgabios-virtio.bin` ROMs are **not** included in the Debian build output. These ROMs come from the PVE deb (pre-built blobs that bypass the sedPatch process) and may still contain `"QEMU"`/`"SeaBIOS"` strings. The setup script's verification step warns if this is detected. For maximum stealth, use `--vga std` (fully overlaid ROM) or GPU passthrough (`--vga none`).
 
 > **v10.2.1 SMBIOS Changes:** The upstream `smbios.c` was updated (commit 9859f1f) to add a `vm` field to `smbios_type0_t` for UEFI/VM awareness support. This is handled entirely by the patched binary — no changes needed in args. The binary now generates more realistic SMBIOS type 0 (BIOS) entries with proper UEFI characteristic bits and firmware revision handling.
 
@@ -335,6 +337,7 @@ The deploy script creates a VM matching the upstream AICodo/pve-emu-realpc recom
 - **OVMF + Q35** machine type with patched Strong OVMF firmware
 - **EFI disk** without `pre-enrolled-keys` (patched OVMF sanitizes NVRAM variables internally)
 - **SATA disk** with randomized serial (no VirtIO — VirtIO vendor IDs are a detection vector)
+- **SCSI controller** — `virtio-scsi-single` matching upstream (patched binary changes PCI-IDs)
 - **e1000 NIC** with Dell/Intel MAC prefix (`D8:FC:93`) — Intel 82540EM adapter (matches upstream)
 - **SMBIOS spoofing** — Types 0 (BIOS), 1 (System), 2 (Baseboard), 3 (Chassis), 4 (Processor), 8 (Ports), 9 (Slots), 17 (Memory — serial + asset by default per upstream QEMU 10; full format with manufacturer, speed, part, bank, location prefix via `--mem-*` flags)
 - **ACPI tables** — fans, thermal zones, embedded controller, HPET, PIT
@@ -399,7 +402,7 @@ Removes QEMU, VirtIO, Red Hat, Bochs, and VMware traces from the Windows registr
 
 | Feature | Detail |
 |---|---|
-| **Signature list** | `VEN_1AF4`, `DEV_1B36`, `SUBSYS_11001AF4`, `VEN_1234`, `DEV_0627`, `VEN_15AD`, `QEMU`, `BOCHS`, `VirtIO`, `VBOX`, `Red Hat`, `DEV_1050`, `DEV_1053`, `SUBSYS_00001AF4`, `VEN_1D6B`, `PCI\VEN_1B36`, `S3 Corp`, `FWCF`, `WAET`, `VS2005R2`, `KVMKVMKVM`, `DEV_1100`, `pvpanic`, `qemufwcfg`, `QXL`, `Balloon`, `viogpu` |
+| **Signature list** | `VEN_1AF4`, `DEV_1B36`, `SUBSYS_11001AF4`, `VEN_1234`, `DEV_0627`, `VEN_15AD`, `QEMU`, `BOCHS`, `VirtIO`, `VBOX`, `Red Hat`, `DEV_1050`, `DEV_1053`, `SUBSYS_00001AF4`, `VEN_1D6B`, `PCI\VEN_1B36`, `S3 Corp`, `FWCF`, `WAET`, `VS2005R2`, `KVMKVMKVM`, `DEV_1100`, `pvpanic`, `qemufwcfg`, `QXL`, `Balloon`, `viogpu`, `VMSVGA`, `vmwgfx` |
 | **Registry roots scanned** | `Enum`, `SCSI`, `Services`, `Control\Class` |
 | **SCSI wipe** | VM-matching sub-keys under `Enum\SCSI` removed (preserves legitimate SATA/NVMe entries) |
 | **DriverStore** | VirtIO/QEMU driver packages in `FileRepository` deleted (`vio*`, `qemu*`, `virtio*`, `red_hat*`, `netkvm*`, `balloon*`, `pvpanic*`, `spice*`, `qxl*`, `viogpu*`) |
@@ -435,7 +438,7 @@ Now covers 16 identifiers including Windows Update PingID, AdvertisingInfo ID, n
 | 10 | DiagTrack MachineId | `HKLM:\...\Diagnostics\DiagTrack` |
 | 11 | Hardware Profile GUID | `HKLM:\...\IDConfigDB\Hardware Profiles\0001` |
 | 12 | Windows Update PingID | `HKLM:\..\WindowsUpdate` |
-| 13 | AdvertisingInfo ID | `HKLM:\..\AdvertisingInfo` |
+| 13 | AdvertisingInfo ID | `HKLM:\..\AdvertisingInfo` + `HKCU:\..\AdvertisingInfo` |
 | 14 | Network Profile GUIDs | `HKLM:\...\NetworkList\Profiles` (cross-session fingerprint prevention) |
 | 15 | Network Signatures | `HKLM:\...\NetworkList\Signatures` (MAC/SSID cleanup) |
 | 16 | SMBIOS Validation | `HKLM:\HARDWARE\DESCRIPTION\System\BIOS` (warns if VM strings detected) |

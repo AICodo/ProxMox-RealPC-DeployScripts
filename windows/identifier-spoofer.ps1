@@ -59,7 +59,7 @@ Rename-Computer -NewName "DESKTOP-$RandomString" -Force *>$null
 
 # ========== MAC Address ==========
 
-# Use a realistic Intel OUI prefix (matches deploy script's e1000e NIC)
+# Use a realistic Intel OUI prefix (matches deploy script's e1000 NIC)
 # Common Intel NIC OUI prefixes that won't trigger VM detection
 $ouiPrefixes = @('D8FC93', '3C2AF4', 'A4BB6D', '8CDFB0', '48B02D', 'B4969B')
 $oui = $ouiPrefixes | Get-Random
@@ -185,6 +185,12 @@ if (Test-Path $adInfoPath) {
 } else {
     New-Item -Path $adInfoPath -Force | Out-Null
     Set-ItemProperty -Path $adInfoPath -Name 'Id' -Type String -Value "$([guid]::NewGuid().ToString())" -Force
+}
+
+# Also clean HKCU AdvertisingInfo (per-user copy that anti-cheat can read)
+$adInfoPathHKCU = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo"
+if (Test-Path $adInfoPathHKCU) {
+    Set-ItemProperty -Path $adInfoPathHKCU -Name 'Id' -Type String -Value "$([guid]::NewGuid().ToString())" -Force -ErrorAction SilentlyContinue
 }
 
 # ==================================

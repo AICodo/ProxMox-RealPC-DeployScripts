@@ -63,7 +63,9 @@ $searchStrings = @(
     "qemufwcfg",       # QEMU fw_cfg device driver
     "QXL",             # QXL display adapter
     "Balloon",         # QEMU memory balloon device service
-    "viogpu"           # VirtIO GPU display adapter
+    "viogpu",          # VirtIO GPU display adapter
+    "VMSVGA",          # VMware SVGA display adapter artifact
+    "vmwgfx"           # VMware graphics driver artifact
 )
 
 function Remove-KeysMatching {
@@ -80,21 +82,6 @@ function Remove-KeysMatching {
             } catch {
                 Write-Host "Failed (match): $($key.PSPath) - $_"
             }
-        }
-    }
-}
-
-function Remove-AllSubKeys {
-    param(
-        [string]$Root
-    )
-    $keys = Get-ChildItem -Path $Root -Recurse -ErrorAction SilentlyContinue
-    foreach ($key in $keys) {
-        try {
-            Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction Stop
-            Write-Host "Deleted (SCSI): $($key.PSPath)"
-        } catch {
-            Write-Host "Failed (SCSI): $($key.PSPath) - $_"
         }
     }
 }
@@ -136,7 +123,7 @@ if (Test-Path $driverStore) {
 }
 
 # Remove hidden/ghost PnP devices with VM signatures
-$vmPnpPatterns = @('VEN_1AF4', 'VEN_1234', 'VEN_15AD', 'DEV_1B36', 'QEMU', 'VirtIO', 'BOCHS', 'VBOX', 'pvpanic', 'qemufwcfg')
+$vmPnpPatterns = @('VEN_1AF4', 'VEN_1234', 'VEN_15AD', 'DEV_1B36', 'QEMU', 'VirtIO', 'BOCHS', 'VBOX', 'pvpanic', 'qemufwcfg', 'VMSVGA', 'vmwgfx')
 try {
     $allDevices = Get-PnpDevice -ErrorAction SilentlyContinue
     foreach ($dev in $allDevices) {

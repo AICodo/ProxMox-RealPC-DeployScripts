@@ -896,6 +896,21 @@ IGPUEOF
             ok "Created ${IGPU_BLACKLIST_FILE} (blacklist amdgpu + radeon + snd_hda_intel)"
         fi
 
+        # Ensure VFIO modules load at boot so VFIO claims the devices before other drivers
+        VFIO_MODULES_FILE="/etc/modules-load.d/pve-realpc-vfio.conf"
+        if [[ ! -f "$VFIO_MODULES_FILE" ]]; then
+            cat > "$VFIO_MODULES_FILE" <<'VFIOEOF'
+# Load VFIO modules at boot for iGPU passthrough
+# Created by pve-realpc-setup.sh --igpu
+vfio
+vfio_iommu_type1
+vfio_pci
+VFIOEOF
+            ok "Created ${VFIO_MODULES_FILE} (vfio, vfio_iommu_type1, vfio_pci)"
+        else
+            ok "VFIO modules already configured: ${VFIO_MODULES_FILE}"
+        fi
+
         # Rebuild initramfs so VFIO claims the devices at boot
         info "Rebuilding initramfs for VFIO changes ..."
         update-initramfs -u -k all 2>&1 | tail -3
@@ -993,15 +1008,41 @@ fi
 for check_rom in "bios-256k.bin" "vgabios-stdvga.bin"; do
     for rom_dir in "$QEMU_ROM_DIR" "$QEMU_ROM_DIR_ALT"; do
         if [[ -f "${rom_dir}/${check_rom}" ]]; then
-            if strings "${rom_dir}/${check_rom}" 2>/dev/null | grep -qi "QEMU\|Bochs\|SeaBIOS"; then
-                warn "UNPATCHED: ${rom_dir}/${check_rom} still contains VM strings!"
+            if command -v strings &>/dev/null; then
+                if strings "${rom_dir}/${check_rom}" 2>/dev/null | grep -qi "QEMU\|Bochs\|SeaBIOS"; then
+                    warn "UNPATCHED: ${rom_dir}/${check_rom} still contains VM strings!"
+                else
+                    ok "Verified: ${check_rom} is clean (no VM strings)"
+                fi
             else
-                ok "Verified: ${check_rom} is clean (no VM strings)"
+                warn "Cannot verify ROM strings — 'strings' command not found (install binutils)"
             fi
             break
         fi
     done
 done
+
+# Verify VMware/VirtIO VGA ROMs (v10.2.1 recommends VMware display, but the
+# Debian release only provides stdvga + qxl ROMs. vgabios-vmware.bin and
+# vgabios-virtio.bin come from the PVE deb and may still contain VM strings
+# since PVE ships pre-built ROM blobs that bypass the sedPatch process.)
+if command -v strings &>/dev/null; then
+    for extra_rom in "vgabios-vmware.bin" "vgabios-virtio.bin"; do
+        for rom_dir in "$QEMU_ROM_DIR" "$QEMU_ROM_DIR_ALT"; do
+            if [[ -f "${rom_dir}/${extra_rom}" ]]; then
+                if strings "${rom_dir}/${extra_rom}" 2>/dev/null | grep -qi "QEMU\|Bochs\|SeaBIOS"; then
+                    warn "${extra_rom} contains VM strings (not overlaid from Debian release)"
+                    warn "  → The Debian build doesn't produce ${extra_rom}. If using --vga vmware or"
+                    warn "    --vga virtio, firmware string scans may still detect VM signatures."
+                    warn "  → Mitigation: use --vga std (overlaid) or GPU passthrough (--vga none)."
+                else
+                    ok "Verified: ${extra_rom} is clean (no VM strings)"
+                fi
+                break
+            fi
+        done
+    done
+fi
 
 # Check ACPI files
 for aml in "${ACPI_FILES[@]}"; do

@@ -893,6 +893,7 @@ qm create "$VMID" \
     --memory "$MEMORY" \
     --balloon 0 \
     --numa 0 \
+    --scsihw virtio-scsi-single \
     --net0 "e1000,bridge=${BRIDGE},firewall=${FIREWALL}" \
     --vga "$VGA" \
     --localtime 1
@@ -1119,6 +1120,7 @@ info "Patching ${CONF_FILE} with anti-detection config ..."
 # but clean up just in case of re-runs or leftover state)
 sed -i '/^args:/d'     "$CONF_FILE" 2>/dev/null || true
 sed -i '/^smbios1:/d'  "$CONF_FILE" 2>/dev/null || true
+sed -i '/^vmgenid:/d'  "$CONF_FILE" 2>/dev/null || true
 sed -i '/^affinity:/d' "$CONF_FILE" 2>/dev/null || true
 
 # Write args + smbios1 directly to the conf file.
