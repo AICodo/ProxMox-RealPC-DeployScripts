@@ -13,7 +13,7 @@
 #   - e1000e NIC with realistic MAC prefix (Intel 82574L)
 #   - Full SMBIOS spoofing (types 0,1,2,3,4,8,9,17)
 #   - Custom ACPI tables (ssdt.aml, ssdt-ec.aml, hpet.aml)
-#   - CPU: host with hypervisor=off, pmu=off (binary handles CPUID/KVM hiding)
+#   - CPU: host with hypervisor=off (binary handles CPUID/KVM hiding)
 #   - Auto-detect host -smp topology (P/E core–aware thread mapping)
 #   - Host EFI variable injection into VM NVRAM (defeats NVRAM detection)
 #   - S3/S4 sleep states enabled (defeats POWER_CAPABILITIES detection)
@@ -21,7 +21,7 @@
 #   - NO timing args (patched binary handles timers/TSC/NVRAM internally)
 #   - NO extra CPU feature flags (binary handles CPUID internally)
 #   - Optional: ssdt-battery.aml for laptop CPUs / NVIDIA error 43 fix
-#   - Optional: Intel Ultra iGPU passthrough (--igpu) with real GPU ROM
+#   - Optional: iGPU passthrough (Intel/AMD) with vendor-specific ROM/config
 #
 # Usage:
 #   bash pve-realpc-deploy-vm.sh                    # Interactive / defaults
@@ -46,14 +46,14 @@ ISO_FILE=""                      # Auto-detect if empty
 ISO_TYPE=""                      # "slim"|"stock"|"" for interactive picker
 BRIDGE="vmbr0"                   # Network bridge
 CPU_TYPE="desktop"               # "desktop" = ssdt.aml (no battery), "laptop" = ssdt-battery.aml
-VGA="std"                        # "std" initially, "none" for GPU passthrough
+VGA="std"                        # "std"|"vmware"|"none"|"virtio" (vmware recommended for v10.2.1)
 ADD_TPM=false                    # --tpm adds TPM 2.0 (upstream doesn't include it)
 AFFINITY=""                      # Empty = don't set; only written if --affinity passed
-IGPU_PASSTHROUGH=false           # --igpu enables Intel Ultra iGPU passthrough
-IGPU_PCI=""                      # Auto-detect if empty; usually 0000:00:02.0
+IGPU_PASSTHROUGH=false           # --igpu enables iGPU passthrough (Intel or AMD)
+IGPU_PCI=""                      # Auto-detect if empty (Intel: 0000:00:02.0, AMD: varies)
 IGPU_AUDIO_PCI=""                # Auto-detect if empty; usually 0000:00:1f.3
-IGPU_GMS="0x2"                   # Pre-allocated DVMT: 0x2=64MB (must be ≥ BIOS setting)
-IGPU_ROM="ultra-1-2-qemu10.rom"  # Intel Ultra 1st/2nd gen ROM (Arrow Lake / Lunar Lake)
+IGPU_GMS="0x2"                   # (Intel only) Pre-allocated DVMT: 0x2=64MB (must be ≥ BIOS setting)
+IGPU_ROM=""                      # Auto-detect from CPU vendor if empty
 SMBIOS_BOARD_MFG=""               # Auto-detect from CPU vendor if empty
 SMBIOS_BOARD_PRODUCT=""            # Auto-detect from CPU vendor if empty
 SMBIOS_BOARD_VERSION=""            # Auto-detect from CPU vendor if empty
@@ -65,7 +65,13 @@ SMBIOS_CPU_MFG=""                 # Auto-detect from CPU vendor if empty
 SMBIOS_CPU_VERSION=""             # Auto-detect if empty
 DISK_SERIAL=""                   # Random 20-char if empty
 MEM_SERIAL=""                    # Random 8-char hex if empty
-MEM_ASSET="9876543210"
+MEM_MFG=""                       # Auto-detect from CPU vendor if empty
+MEM_SPEED=""                     # Auto-detect from CPU vendor if empty
+MEM_PART=""                      # Auto-detect from CPU vendor if empty
+MEM_ASSET=""                     # Random 10-digit if empty (upstream: "9876543210")
+MEM_BANK="BANK 0"                # Standard bank identifier
+MEM_LOC_PFX="Controller0-ChannelA-DIMM"  # Standard DIMM location prefix
+MEM_EXPLICIT=false                # true when user passes any --mem-* flag (enables full type=17)
 FIREWALL=1
 OSTYPE="other"                   # 'other' avoids PVE injecting -global ICH9-LPC.disable_s3/s4=1 (l26 does)
 
@@ -85,6 +91,10 @@ while [[ $# -gt 0 ]]; do
         --bridge)       BRIDGE="$2";            shift 2 ;;
         --type)         CPU_TYPE="$2";          shift 2 ;;  # desktop | laptop
         --vga)          VGA="$2";               shift 2 ;;
+        --mem-mfg)      MEM_MFG="$2"; MEM_EXPLICIT=true;  shift 2 ;;
+        --mem-speed)    MEM_SPEED="$2"; MEM_EXPLICIT=true; shift 2 ;;
+        --mem-part)     MEM_PART="$2"; MEM_EXPLICIT=true;  shift 2 ;;
+        --mem-asset)    MEM_ASSET="$2"; MEM_EXPLICIT=true; shift 2 ;;
         --affinity)     AFFINITY="$2";          shift 2 ;;
         --tpm)          ADD_TPM=true;           shift   ;;
         --igpu)         IGPU_PASSTHROUGH=true;  shift   ;;
@@ -118,24 +128,32 @@ VM Configuration:
   --iso FILENAME       ISO filename (default: auto-detect Windows ISO)
   --iso-type TYPE      ISO type: slim|stock (auto-filter ISOs by type)
   --bridge NAME        Network bridge (default: vmbr0)
-  --vga TYPE           VGA type: std|none|virtio (default: std)
+  --vga TYPE           VGA type: std|vmware|none|virtio (default: std)
+                         vmware is recommended for v10.2.1 (best 3D accel with GPU mirror)
   --ostype TYPE        OS type: other|l26|win10|win11 (default: other)
   --tpm                Add TPM 2.0 device (upstream doesn't include this)
   --affinity RANGE     CPU affinity, e.g. 0-7 (default: none)
   --firewall 0|1       Enable firewall (default: 1)
 
-Intel Ultra iGPU Passthrough:
-  --igpu               Enable Intel Ultra iGPU passthrough (auto-detects PCI)
+iGPU Passthrough (Intel / AMD):
+  --igpu               Enable iGPU passthrough (auto-detects vendor + PCI address)
   --igpu-pci ADDR      iGPU PCI address, e.g. 0000:00:02.0 (default: auto)
   --igpu-audio ADDR    Audio PCI address, e.g. 0000:00:1f.3 (default: auto)
-  --igpu-gms HEX       DVMT pre-alloc: 0x2=64M 0x4=128M 0x8=256M (default: 0x2)
-  --igpu-rom FILE      ROM filename in /usr/share/kvm/ (default: ultra-1-2-qemu10.rom)
+  --igpu-gms HEX       (Intel only) DVMT pre-alloc: 0x2=64M 0x4=128M 0x8=256M (default: 0x2)
+  --igpu-rom FILE      ROM filename in /usr/share/kvm/ (default: auto per vendor)
 
 Identity Spoofing:
   --type desktop|laptop  Desktop (no battery) or laptop (virtual battery)
   --board-mfg NAME       Motherboard manufacturer (default: Maxsun)
   --board-product NAME   Motherboard product (default: MS-Terminator B760M)
   --disk-serial SERIAL   20-char disk serial (default: random)
+  --mem-mfg NAME         Memory manufacturer — enables full type=17 override
+  --mem-speed SPEED      Memory speed in MT/s — enables full type=17 override
+  --mem-part PART        Memory part number — enables full type=17 override
+  --mem-asset ASSET      Memory asset tag — enables full type=17 override
+                         Without --mem-* flags, QEMU 10 simplified type=17 is used
+                         (serial+asset only; patched binary handles rest internally).
+                         Any --mem-* flag switches to full format with all fields.
 
 Notes:
   The patched QEMU 10 binary handles these INTERNALLY (do NOT add manually):
@@ -418,6 +436,9 @@ if [[ "$HOST_CPU_VENDOR" == "amd" ]]; then
     [[ -z "$SMBIOS_BIOS_DATE" ]]     && SMBIOS_BIOS_DATE="09/20/2024"
     [[ -z "$SMBIOS_BIOS_RELEASE" ]]  && SMBIOS_BIOS_RELEASE="2.29"
     [[ -z "$SMBIOS_CPU_MFG" ]]       && SMBIOS_CPU_MFG="Advanced Micro Devices, Inc."
+    [[ -z "$MEM_MFG" ]]              && MEM_MFG="G.Skill International Enterprise Ltd."
+    [[ -z "$MEM_SPEED" ]]            && MEM_SPEED="5600"
+    [[ -z "$MEM_PART" ]]             && MEM_PART="F5-5600J3036D16G"
 else
     [[ -z "$SMBIOS_BOARD_MFG" ]]    && SMBIOS_BOARD_MFG="Maxsun"
     [[ -z "$SMBIOS_BOARD_PRODUCT" ]] && SMBIOS_BOARD_PRODUCT="MS-Terminator B760M"
@@ -427,6 +448,9 @@ else
     [[ -z "$SMBIOS_BIOS_DATE" ]]     && SMBIOS_BIOS_DATE="02/21/2023"
     [[ -z "$SMBIOS_BIOS_RELEASE" ]]  && SMBIOS_BIOS_RELEASE="3.7"
     [[ -z "$SMBIOS_CPU_MFG" ]]       && SMBIOS_CPU_MFG="Intel(R) Corporation"
+    [[ -z "$MEM_MFG" ]]              && MEM_MFG="KINGSTON"
+    [[ -z "$MEM_SPEED" ]]            && MEM_SPEED="3200"
+    [[ -z "$MEM_PART" ]]             && MEM_PART="SED3200U1888S"
 fi
 info "SMBIOS vendor profile: ${HOST_CPU_VENDOR} (${SMBIOS_BOARD_MFG} / ${SMBIOS_BOARD_PRODUCT})"
 
@@ -468,6 +492,12 @@ fi
 if [[ -z "$MEM_SERIAL" ]]; then
     MEM_SERIAL=$(random_hex 8)
     info "Generated memory serial: ${MEM_SERIAL}"
+fi
+if [[ -z "$MEM_ASSET" ]]; then
+    MEM_ASSET=$(od -An -tu4 -N4 /dev/urandom | tr -d ' ' | head -c 10)
+    # Pad to 10 digits if urandom produced fewer
+    while [[ ${#MEM_ASSET} -lt 10 ]]; do MEM_ASSET+="0"; done
+    info "Generated memory asset: ${MEM_ASSET}"
 fi
 
 ###############################################################################
@@ -607,7 +637,15 @@ SMBIOS_ARGS+=" -smbios type=2,manufacturer=\"$(qemu_escape_commas "${SMBIOS_BOAR
 # Type 3 — Chassis
 SMBIOS_ARGS+=" -smbios type=3,manufacturer=\"Default string\",version=\"Default string\",serial=\"Default string\",asset=\"Default string\",sku=\"Default string\""
 # Type 17 — Memory
-SMBIOS_ARGS+=" -smbios type=17,serial=${MEM_SERIAL},asset=\"${MEM_ASSET}\""
+# QEMU 10: patched binary generates realistic DIMM entries internally.
+# Upstream uses simplified format: serial + asset only. Extra fields override
+# the binary's defaults — only include them with explicit --mem-* flags.
+if [[ "$MEM_EXPLICIT" == true ]]; then
+    SMBIOS_ARGS+=" -smbios type=17,loc_pfx=\"${MEM_LOC_PFX}\",manufacturer=\"$(qemu_escape_commas "${MEM_MFG}")\",speed=${MEM_SPEED},serial=${MEM_SERIAL},part=\"${MEM_PART}\",bank=\"${MEM_BANK}\",asset=\"${MEM_ASSET}\""
+    info "SMBIOS type=17: full format (user-specified --mem-* fields)"
+else
+    SMBIOS_ARGS+=" -smbios type=17,serial=${MEM_SERIAL},asset=\"${MEM_ASSET}\""
+fi
 # Type 4 — Processor
 SMBIOS_ARGS+=" -smbios type=4,manufacturer=\"$(qemu_escape_commas "${SMBIOS_CPU_MFG}")\",version=\"$(qemu_escape_commas "${SMBIOS_CPU_VERSION}")\""
 # Type 9 — System Slots (bare, triggers slot info generation in Strong build)
@@ -615,43 +653,82 @@ SMBIOS_ARGS+=" -smbios type=9"
 # Type 8 — Port Connectors (×2 per author's config)
 SMBIOS_ARGS+=" -smbios type=8 -smbios type=8"
 
-# Intel Ultra iGPU passthrough args (when --igpu is enabled)
+# iGPU passthrough args (when --igpu is enabled — supports Intel and AMD)
 IGPU_ARGS=""
 if [[ "$IGPU_PASSTHROUGH" == true ]]; then
     # Force VGA off — real GPU replaces virtual VGA
     VGA="none"
     info "iGPU passthrough enabled — VGA set to none"
 
-    # Auto-detect iGPU PCI address
+    # Detect GPU vendor for vendor-specific logic
+    IGPU_VENDOR=""
     if [[ -z "$IGPU_PCI" ]]; then
+        # Try Intel first, then AMD/ATI
         IGPU_PCI=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA|Display' | grep -i Intel | head -1 | awk '{print $1}')
-        if [[ -z "$IGPU_PCI" ]]; then
-            fail "Could not auto-detect Intel iGPU PCI address. Use --igpu-pci to specify."
+        if [[ -n "$IGPU_PCI" ]]; then
+            IGPU_VENDOR="intel"
+        else
+            IGPU_PCI=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA|Display' | grep -iE 'AMD|ATI|Radeon' | head -1 | awk '{print $1}')
+            if [[ -n "$IGPU_PCI" ]]; then
+                IGPU_VENDOR="amd"
+            fi
         fi
-        info "Auto-detected iGPU: ${IGPU_PCI}"
+        if [[ -z "$IGPU_PCI" ]]; then
+            fail "Could not auto-detect iGPU PCI address. Use --igpu-pci to specify."
+        fi
+        info "Auto-detected ${IGPU_VENDOR^^} iGPU: ${IGPU_PCI}"
+    else
+        # Vendor detection from manually specified PCI address
+        pci_desc=$(lspci -s "${IGPU_PCI#*:}" 2>/dev/null || true)
+        if echo "$pci_desc" | grep -qi Intel; then
+            IGPU_VENDOR="intel"
+        elif echo "$pci_desc" | grep -qiE 'AMD|ATI|Radeon'; then
+            IGPU_VENDOR="amd"
+        else
+            warn "Could not detect iGPU vendor from PCI address — assuming AMD (no IGD args)"
+            IGPU_VENDOR="amd"
+        fi
     fi
 
-    # Auto-detect audio PCI (Intel HDA, usually 00:1f.3)
+    # Auto-detect audio PCI
     if [[ -z "$IGPU_AUDIO_PCI" ]]; then
-        IGPU_AUDIO_PCI=$(lspci -Dnn 2>/dev/null | grep -i audio | grep -i Intel | head -1 | awk '{print $1}')
+        if [[ "$IGPU_VENDOR" == "intel" ]]; then
+            IGPU_AUDIO_PCI=$(lspci -Dnn 2>/dev/null | grep -i audio | grep -i Intel | head -1 | awk '{print $1}')
+        else
+            IGPU_AUDIO_PCI=$(lspci -Dnn 2>/dev/null | grep -i audio | grep -iE 'AMD|ATI' | head -1 | awk '{print $1}')
+        fi
         if [[ -n "$IGPU_AUDIO_PCI" ]]; then
             info "Auto-detected audio: ${IGPU_AUDIO_PCI}"
         else
-            info "No Intel audio device detected — skipping audio passthrough"
+            info "No ${IGPU_VENDOR^^} audio device detected — skipping audio passthrough"
         fi
     fi
 
-    # Verify ROM file exists on host
-    if [[ ! -f "/usr/share/kvm/${IGPU_ROM}" ]]; then
+    # Auto-detect ROM if not specified
+    if [[ -z "$IGPU_ROM" ]]; then
+        if [[ "$IGPU_VENDOR" == "intel" ]]; then
+            IGPU_ROM="ultra-1-2-qemu10.rom"
+        fi
+        # AMD iGPUs typically don't need a custom ROM for passthrough
+    fi
+
+    # Verify ROM file exists on host (if one is set)
+    if [[ -n "$IGPU_ROM" ]] && [[ ! -f "/usr/share/kvm/${IGPU_ROM}" ]]; then
         fail "iGPU ROM not found: /usr/share/kvm/${IGPU_ROM}. Run pve-realpc-setup.sh --igpu first."
     fi
 
-    # IGD passthrough args (QEMU 10+ Intel Ultra)
-    IGPU_ARGS=" -set device.hostpci0.addr=02.0"
-    IGPU_ARGS+=" -set device.hostpci0.x-igd-gms=${IGPU_GMS}"
-    IGPU_ARGS+=" -set device.hostpci0.x-igd-opregion=on"
-    IGPU_ARGS+=" -set device.hostpci0.x-igd-legacy-mode=on"
-    info "iGPU args: IGD opregion=on, GMS=${IGPU_GMS}, legacy-mode=on"
+    # Vendor-specific passthrough args
+    if [[ "$IGPU_VENDOR" == "intel" ]]; then
+        # Intel IGD passthrough args (QEMU 10+)
+        IGPU_ARGS=" -set device.hostpci0.addr=02.0"
+        IGPU_ARGS+=" -set device.hostpci0.x-igd-gms=${IGPU_GMS}"
+        IGPU_ARGS+=" -set device.hostpci0.x-igd-opregion=on"
+        IGPU_ARGS+=" -set device.hostpci0.x-igd-legacy-mode=on"
+        info "iGPU args: Intel IGD opregion=on, GMS=${IGPU_GMS}, legacy-mode=on"
+    else
+        # AMD iGPU — standard PCI passthrough, no IGD-specific flags
+        info "iGPU args: AMD standard PCI passthrough (no IGD flags)"
+    fi
 fi
 
 # Assemble full args line (matches upstream README for QEMU 9/10)
@@ -704,9 +781,20 @@ PCI_ARGS+=" -global ICH9-LPC.disable_s4=0"
 # bits-per-pixel (≤8 = suspicious), and DPI. stdvga appears as QEMU STD VGA with
 # limited capabilities. With GPU passthrough (--igpu) this is not an issue.
 # For stdvga users: guest-side resolution and color depth must be ≥32bpp.
+#
+# v10.2.1 DISPLAY CHANGES:
+#   - VMware compatible display is now supported and RECOMMENDED (best 3D accel
+#     with iGPU/dGPU mirror, PCI-ID no longer 0x15ad)
+#   - VirtIO-GPU is now supported (OVMF only, basic adapter, PCI-ID no longer 0x1af4)
+#   - Standard VGA PCI-ID is no longer 0x1234
+#   - Spice display still has PCI-ID 0x1b36 (NOT recommended)
+#   - VirtIO-GPU does NOT work with SeaBIOS
 if [[ "$VGA" == "std" ]]; then
-    warn "Using stdvga — VMAware GPU_CAPABILITIES (45pts) and DISPLAY (25pts) may trigger."
+    warn "Using stdvga — consider --vga vmware for v10.2.1 (recommended by upstream for best 3D accel)."
+    warn "VMAware GPU_CAPABILITIES (45pts) and DISPLAY (25pts) may trigger with stdvga."
     warn "For best results, pass a real GPU (--igpu) or set resolution to ≥1920x1080 @32bpp in-guest."
+elif [[ "$VGA" == "vmware" ]]; then
+    info "Using VMware compatible display (recommended by upstream v10.2.1 for best 3D acceleration)"
 fi
 
 # Priority 2: THREAD_MISMATCH — PVE sets topology via cores:/sockets: in the conf.
@@ -900,11 +988,16 @@ if [[ "$ADD_TPM" == "true" ]]; then
     ok "TPM 2.0 added"
 fi
 
-# Step 2c: Intel Ultra iGPU passthrough (optional)
+# Step 2c: iGPU passthrough (Intel or AMD)
 if [[ "$IGPU_PASSTHROUGH" == true ]]; then
-    info "Adding Intel Ultra iGPU passthrough ..."
-    qm set "$VMID" --hostpci0 "${IGPU_PCI},romfile=${IGPU_ROM}"
-    ok "iGPU passthrough: ${IGPU_PCI} with ${IGPU_ROM}"
+    info "Adding ${IGPU_VENDOR^^} iGPU passthrough ..."
+    if [[ -n "$IGPU_ROM" ]]; then
+        qm set "$VMID" --hostpci0 "${IGPU_PCI},romfile=${IGPU_ROM}"
+        ok "iGPU passthrough: ${IGPU_PCI} with ${IGPU_ROM}"
+    else
+        qm set "$VMID" --hostpci0 "${IGPU_PCI}"
+        ok "iGPU passthrough: ${IGPU_PCI} (no ROM)"
+    fi
 
     if [[ -n "$IGPU_AUDIO_PCI" ]]; then
         qm set "$VMID" --hostpci1 "${IGPU_AUDIO_PCI}"
@@ -981,7 +1074,7 @@ echo -e "${GREEN}║  Anti-Detection Features (upstream-compatible):            
 echo -e "${GREEN}║    ✓ OVMF + Q35 (patched Strong OVMF firmware)               ║${NC}"
 echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 0,1,2,3,4,8,9,17)              ║${NC}"
 echo -e "${GREEN}║    ✓ ACPI custom tables (ssdt, ssdt-ec, hpet, pit)            ║${NC}"
-echo -e "${GREEN}║    ✓ CPU: host, hypervisor=off, pmu=off (binary hides KVM)  ║${NC}"
+echo -e "${GREEN}║    ✓ CPU: host, hypervisor=off (binary hides KVM)          ║${NC}"
 echo -e "${GREEN}║    ✓ Cores: ${SMP_TOTAL} vCPUs (${SMP_CORES}c × ${SMP_THREADS}t, matches host topology)  ║${NC}"
 echo -e "${GREEN}║    ✓ Timers handled by binary (TSC/HPET/PIT/RTC)             ║${NC}"
 echo -e "${GREEN}║    ✓ EFI NVRAM: host variables injected (real Secure Boot certs)║${NC}"
@@ -998,10 +1091,12 @@ if [[ "$ADD_TPM" == "true" ]]; then
 echo -e "${GREEN}║    ✓ TPM 2.0 emulation                                       ║${NC}"
 fi
 if [[ "$IGPU_PASSTHROUGH" == true ]]; then
-echo -e "${GREEN}║    ✓ Intel Ultra iGPU passthrough (${IGPU_ROM})   ║${NC}"
+echo -e "${GREEN}║    ✓ ${IGPU_VENDOR^^} iGPU passthrough (${IGPU_ROM:-no ROM})   ║${NC}"
+if [[ "$IGPU_VENDOR" == "intel" ]]; then
 echo -e "${GREEN}║    ✓ IGD: opregion=on, GMS=${IGPU_GMS}, legacy-mode=on          ║${NC}"
+fi
 if [[ -n "$IGPU_AUDIO_PCI" ]]; then
-echo -e "${GREEN}║    ✓ Intel HDA audio passthrough (${IGPU_AUDIO_PCI})          ║${NC}"
+echo -e "${GREEN}║    ✓ Audio passthrough (${IGPU_AUDIO_PCI})                     ║${NC}"
 fi
 fi
 echo -e "${GREEN}║                                                               ║${NC}"
@@ -1036,7 +1131,11 @@ SUMMARY_FILE="/root/vm-${VMID}-deploy-summary.txt"
     echo "CPU Version        : ${SMBIOS_CPU_VERSION}"
     echo "System UUID        : ${SYS_UUID}"
     echo "Disk Serial        : ${DISK_SERIAL}"
+    echo "Memory Manufacturer: ${MEM_MFG}"
+    echo "Memory Speed       : ${MEM_SPEED} MT/s"
+    echo "Memory Part        : ${MEM_PART}"
     echo "Memory Serial      : ${MEM_SERIAL}"
+    echo "Memory Asset       : ${MEM_ASSET}"
     echo ""
     echo "--- VM Hardware ---"
     echo "VMID       : ${VMID}"
@@ -1052,7 +1151,7 @@ SUMMARY_FILE="/root/vm-${VMID}-deploy-summary.txt"
         echo "Affinity   : ${AFFINITY}"
     fi
     if [[ "$IGPU_PASSTHROUGH" == true ]]; then
-        echo "iGPU       : ${IGPU_PCI} (ROM: ${IGPU_ROM}, GMS: ${IGPU_GMS})"
+        echo "iGPU       : ${IGPU_VENDOR^^} ${IGPU_PCI} (ROM: ${IGPU_ROM:-none}, GMS: ${IGPU_GMS})"
     fi
     echo ""
     echo "--- Full Config File ---"

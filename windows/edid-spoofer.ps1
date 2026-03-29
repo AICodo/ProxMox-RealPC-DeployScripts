@@ -70,6 +70,11 @@ foreach ($wmiMon in $wmiMonitors) {
 # --- 4. Restart Graphics Driver ---
 Get-PnpDevice -Class Display | Where-Object { $_.Status -eq 'OK' } |
 ForEach-Object {
-    Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false
-    Enable-PnpDevice  -InstanceId $_.InstanceId -Confirm:$false
+    try {
+        Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
+        Start-Sleep -Milliseconds 500
+        Enable-PnpDevice  -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
+    } catch {
+        Write-Host "[!] Failed to restart display device $($_.InstanceId): $_" -ForegroundColor Yellow
+    }
 }

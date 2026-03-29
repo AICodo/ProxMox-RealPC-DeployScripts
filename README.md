@@ -46,7 +46,7 @@ The [pve-emu-realpc](https://github.com/AICodo/pve-emu-realpc) project (forked f
 
 | Script | Purpose |
 |---|---|
-| `pve-realpc-setup.sh` | **One-time host preparation.** Downloads release assets from both PVE and Debian GitHub releases, backs up stock packages, installs patched QEMU + OVMF + KVM module, overlays patched ROM/BIOS files (removes VM strings from SeaBIOS/VGA/EFI), deploys ACPI tables, optionally configures Intel iGPU passthrough, sets a realistic MAC prefix, and pins packages against `apt upgrade`. |
+| `pve-realpc-setup.sh` | **One-time host preparation.** Downloads release assets from both PVE and Debian GitHub releases, backs up stock packages, installs patched QEMU + OVMF + KVM module, overlays patched ROM/BIOS files (removes VM strings from SeaBIOS/VGA/EFI), deploys ACPI tables, optionally configures iGPU passthrough (Intel or AMD), sets a realistic MAC prefix, and pins packages against `apt upgrade`. |
 | `pve-realpc-deploy-vm.sh` | **Per-VM creation.** Creates a fully configured Proxmox VM with OVMF/Q35, SATA disk, e1000e NIC, full SMBIOS spoofing (8 types), custom ACPI tables, hidden hypervisor, host EFI variable injection, S3/S4 sleep states, PIT SSDT, and more — all via a single command. |
 
 ---
@@ -86,11 +86,11 @@ Injected `.aml` tables add hardware that real PCs have but VMs normally lack:
 
 ### Layer 5 — Runtime VM Configuration
 Applied by `pve-realpc-deploy-vm.sh` (matches upstream recommended args exactly):
-- `-cpu host` with `hypervisor=off,pmu=off` (NO `kvm=off` — the patched binary hides KVM internally)
+- `-cpu host` with `hypervisor=off` (NO `kvm=off` — the patched binary hides KVM internally)
 - `e1000e` NIC with physical vendor MAC OUI (`D8:FC:93`) — Intel 82574L PCIe, more realistic than legacy e1000
 - SATA disk with randomized serial (no VirtIO)
 - Custom ACPI tables (`ssdt.aml`, `ssdt-ec.aml`, `hpet.aml`, `pit.aml`)
-- Full SMBIOS spoofing (types 0,1,2,3,4,8,9,17)
+- Full SMBIOS spoofing (types 0,1,2,3,4,8,9,17 — type 17 uses upstream QEMU 10 simplified format by default: serial + asset only, patched binary handles manufacturer/speed/part/bank internally; pass `--mem-*` flags for full override)
 - Host EFI variable injection into VM NVRAM (replaces Red Hat certs with real Secure Boot keys)
 - S3/S4 sleep states enabled via ICH9-LPC globals (defeats POWER_CAPABILITIES detection)
 - PIT SSDT (PNP0100 device at I/O 0x40–0x43) defeats SYSTEM_TIMERS / CLOCK detection
@@ -99,6 +99,8 @@ Applied by `pve-realpc-deploy-vm.sh` (matches upstream recommended args exactly)
 - **NO** timing args (patched binary handles TSC/HPET/PIT/RTC internally)
 - **NO** extra CPU feature flags (patched binary handles CPUID hiding internally)
 - **NO** `pre-enrolled-keys` (host EFI variables injected instead)
+
+> **v10.2.1 Display Changes:** The Strong build now supports **VMware-compatible display** (`--vga vmware`), which is **recommended by upstream** for best 3D acceleration with iGPU/dGPU mirror setups. VirtIO-GPU is also supported (OVMF only). The PCI-IDs for Standard VGA, VMware, and VirtIO-GPU have all been changed from their stock QEMU values (no longer 0x1234, 0x15ad, or 0x1af4). Spice display still uses PCI-ID 0x1b36 and is not recommended.
 
 > **Why so minimal?** The upstream author states: *"In QEMU 10, all args parameters are now handled internally except for what's shown above (others are hidden/customized)."* Adding extra flags like `kvm=off`, `-overcommit cpu-pm=on`, `-rtc`, `-smp`, `+invtsc`, `tsc-frequency=` etc. **conflicts** with the binary's built-in behavior and **causes** detection failures for timing anomalies, NVRAM, system timers, and thread count.
 
@@ -148,15 +150,15 @@ Automates all host-level preparation in 12 steps:
 | Step | Action |
 |---|---|
 | 1 | Set MAC address prefix (`D8:FC:93` — Dell/Intel OUI) in `/etc/pve/datacenter.cfg` |
-| 2 | Download PVE release assets from [AICodo/pve-emu-realpc `v20260306-213905-pve9`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260306-213905-pve9) with SHA-256 verification |
-| 3 | Download Debian release assets (patched ROM/BIOS files only) from [`v20260307-191041-debian`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260307-191041-debian) |
+| 2 | Download PVE release assets from [AICodo/pve-emu-realpc `v20260329-214123-pve9`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260329-214123-pve9) |
+| 3 | Download Debian release assets (patched ROM/BIOS files only) from [`v20260329-212256-debian`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260329-212256-debian) |
 | 4 | Back up stock QEMU binary, OVMF firmware, and KVM module to `/root/pve-realpc/backup/` |
 | 5 | Install base anti-detection `.deb` packages (`pve-qemu-kvm`, `pve-edk2-firmware-ovmf`) |
 | 6 | Extract and install **Strong** build packages (enhanced CPU sensor passthrough) |
-| 7 | Overlay patched Debian ROM/BIOS/VGA files — replaces stock SeaBIOS/EFI/VGA ROMs that still contain `QEMU`/`Bochs`/`SeaBIOS` strings (PVE binary is preserved) |
+| 7 | Overlay patched Debian ROM/BIOS/VGA files — replaces stock SeaBIOS/EFI/VGA ROMs that still contain `QEMU`/`Bochs`/`SeaBIOS` strings (PVE binary is preserved); installs custom boot splash (`bootsplash.jpg`) to defeat VMAware BOOT_LOGO CRC32 check |
 | 8 | Install patched KVM kernel module (auto-detects Intel vs AMD); **auto-downgrades kernel** if version mismatches |
 | 9 | Place ACPI table files (`ssdt.aml`, `ssdt-ec.aml`, `ssdt-battery.aml`, `hpet.aml`) into `/root/` + compile `pit.aml` via `iasl` |
-| 10 | *(Optional)* Intel Ultra iGPU passthrough setup — downloads ROM, enables IOMMU, blacklists `i915`/`snd_hda_intel` (requires `--igpu`) |
+| 10 | *(Optional)* iGPU passthrough setup — Intel: downloads ROM + enables IOMMU + blacklists `i915`/`snd_hda_intel`; AMD: enables IOMMU + blacklists `amdgpu`/`radeon`/`snd_hda_amd` (requires `--igpu`) |
 | 11 | Pin packages via APT preferences + `dpkg hold` to prevent `apt upgrade` from overwriting |
 | 12 | Verify installation — checks binary size, ROM files, ACPI tables, KVM module, and spot-checks ROMs for leftover VM strings |
 
@@ -175,7 +177,7 @@ bash pve-realpc-setup.sh --skip-pin
 # Skip automatic kernel downgrade (install module into current kernel even if mismatched)
 bash pve-realpc-setup.sh --skip-kernel-downgrade
 
-# Enable Intel Ultra iGPU passthrough (downloads ROM, configures IOMMU + VFIO)
+# Enable iGPU passthrough (Intel: downloads ROM + IOMMU + VFIO; AMD: IOMMU + VFIO)
 bash pve-realpc-setup.sh --igpu
 
 # Show help
@@ -203,25 +205,26 @@ To skip this behavior and force installation into whatever kernel is currently r
 | Patched QEMU | `/usr/bin/qemu-system-x86_64` | ~29.7 MB (Strong build with PVE integration + sensor passthrough) |
 | Patched OVMF | `/usr/share/pve-edk2-firmware/` | UEFI firmware with anti-detection |
 | Patched ROM/BIOS | `/usr/share/kvm/` + `/usr/share/qemu/` | SeaBIOS, VGA, and EFI ROMs with VM strings removed (from Debian release) |
+| Boot splash | `/usr/share/kvm/bootsplash.jpg` | Custom boot logo replacing default EDK2/TianoCore splash (defeats VMAware BOOT_LOGO CRC32 check) |
 | Patched KVM module | `/lib/modules/$(uname -r)/kernel/arch/x86/kvm/kvm.ko` | Hides KVM signatures |
 | ACPI tables | `/root/ssdt.aml`, `/root/ssdt-ec.aml`, `/root/hpet.aml`, `/root/pit.aml`, `/root/ssdt-battery.aml` | Virtual hardware tables (pit.aml compiled locally by `iasl`) |
-| iGPU ROM *(optional)* | `/usr/share/kvm/ultra-1-2-qemu10.rom` | Intel Ultra iGPU passthrough ROM (with `--igpu`) |
+| iGPU ROM *(Intel only)* | `/usr/share/kvm/ultra-1-2-qemu10.rom` | Intel Ultra iGPU passthrough ROM (with `--igpu` on Intel hosts) |
 | Backups | `/root/pve-realpc/backup/` | Stock binaries + ROMs for rollback |
 | APT pin | `/etc/apt/preferences.d/pve-realpc-hold` | Prevents overwrite on upgrade |
 
 ### Release Assets Downloaded
 
-**PVE release** — tag [`v20260306-213905-pve9`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260306-213905-pve9):
+**PVE release** — tag [`v20260329-214123-pve9`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260329-214123-pve9):
 
 | File | Purpose |
 |---|---|
-| `pve-qemu-kvm_10.1.2-7_amd64.deb` | Base anti-detection QEMU |
+| `pve-qemu-kvm_10.2.1-1_amd64.deb` | Base anti-detection QEMU |
 | `pve-edk2-firmware-ovmf_4.2025.05-2_all.deb` | Base anti-detection OVMF |
-| `pve-qemu-kvm_10.1.2-7_amd64_Strong_intel_amd.tgz` | Strong build (QEMU + OVMF + KVM modules) |
+| `pve-qemu-kvm_10.2.1-1_amd64_Strong_intel_amd_6.17.13-2.tgz` | Strong build (QEMU + OVMF + KVM modules) |
 | `ssdt.aml` / `ssdt-ec.aml` / `ssdt-battery.aml` / `hpet.aml` | ACPI tables |
 | `qemu-autoGenPatch.patch` | Full diff of all source modifications (reference only) |
 
-**Debian release** — tag [`v20260307-191041-debian`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260307-191041-debian) (patched ROM/BIOS files only):
+**Debian release** — tag [`v20260329-212256-debian`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260329-212256-debian) (patched ROM/BIOS files only):
 
 | File | Purpose |
 |---|---|
@@ -278,7 +281,7 @@ bash pve-realpc-deploy-vm.sh --help
 |---|---|---|
 | `--vmid NUM` | next available | VM ID |
 | `--name NAME` | `win10` | VM name |
-| `--cores NUM` | `8` | CPU cores (goes directly to PVE `cores:`) |
+| `--cores NUM` | auto-detect | CPU cores (auto-detected from host CPUID topology) |
 | `--memory MB` | `16384` | RAM in MB (realistic: `4096`, `8192`, `16384`) |
 | `--disk-size SIZE` | `256G` | System disk size |
 | `--disk-storage NAME` | `local-lvm` | Storage pool for disks |
@@ -287,13 +290,22 @@ bash pve-realpc-deploy-vm.sh --help
 | `--iso-type slim\|stock` | interactive | Auto-filter ISOs by type (see patterns below) |
 | `--bridge NAME` | `vmbr0` | Network bridge |
 | `--type desktop\|laptop` | `desktop` | Desktop = `ssdt.aml`; Laptop = `ssdt-battery.aml` |
-| `--vga TYPE` | `std` | VGA: `std`, `none` (GPU passthrough), `virtio` |
+| `--vga TYPE` | `std` | VGA: `std`, `vmware` (recommended for v10.2.1), `none` (GPU passthrough), `virtio` |
 | `--ostype TYPE` | `other` | `other` prevents PVE from injecting S3/S4-disable globals |
 | `--tpm` | off | Add TPM 2.0 device (upstream doesn't include it) |
 | `--affinity RANGE` | none | CPU pinning range (only set if explicitly passed) |
+| `--igpu` | off | Enable iGPU passthrough (auto-detects Intel or AMD) |
+| `--igpu-pci ADDR` | auto-detect | iGPU PCI address (e.g. `0000:00:02.0`) |
+| `--igpu-audio ADDR` | auto-detect | Audio PCI address for passthrough |
+| `--igpu-gms HEX` | `0x2` | (Intel only) DVMT pre-alloc: `0x2`=64M, `0x4`=128M, `0x8`=256M |
+| `--igpu-rom FILE` | auto per vendor | ROM filename in `/usr/share/kvm/` (Intel default: `ultra-1-2-qemu10.rom`) |
 | `--board-mfg NAME` | `Maxsun` | Motherboard manufacturer |
 | `--board-product NAME` | `MS-Terminator B760M` | Motherboard product name |
 | `--disk-serial SERIAL` | random 20-char | Disk serial number |
+| `--mem-mfg NAME` | `KINGSTON` | Memory module manufacturer |
+| `--mem-speed SPEED` | `3200` | Memory speed in MT/s |
+| `--mem-part PART` | auto per CPU vendor | Memory part number |
+| `--mem-asset DIGITS` | random 10-digit | Memory asset tag (upstream: `9876543210`) |
 | `--firewall 0\|1` | `1` | Enable PVE firewall |
 
 ### ISO Selection
@@ -318,15 +330,15 @@ The deploy script creates a VM matching the upstream AICodo/pve-emu-realpc recom
 - **EFI disk** without `pre-enrolled-keys` (patched OVMF sanitizes NVRAM variables internally)
 - **SATA disk** with randomized serial (no VirtIO — VirtIO vendor IDs are a detection vector)
 - **e1000e NIC** with Dell/Intel MAC prefix (`D8:FC:93`) — Intel 82574L PCIe adapter
-- **SMBIOS spoofing** — Types 0 (BIOS), 1 (System), 2 (Baseboard), 3 (Chassis), 4 (Processor), 8 (Ports), 9 (Slots), 17 (Memory)
+- **SMBIOS spoofing** — Types 0 (BIOS), 1 (System), 2 (Baseboard), 3 (Chassis), 4 (Processor), 8 (Ports), 9 (Slots), 17 (Memory — serial + asset by default per upstream QEMU 10; full format with manufacturer, speed, part, bank, location prefix via `--mem-*` flags)
 - **ACPI tables** — fans, thermal zones, embedded controller, HPET, PIT
-- **CPU flags** — `host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true,pmu=off`
+- **CPU flags** — `host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true`
 - **Host EFI variable injection** — real Secure Boot certs from host replace OVMF defaults (defeats NVRAM detection)
 - **S3/S4 sleep states** enabled via ICH9-LPC globals (defeats POWER_CAPABILITIES detection)
 - **PIT SSDT** — PNP0100 device node (defeats SYSTEM_TIMERS / CLOCK detection)
 - **Auto-detected -smp topology** — matches host CPUID exactly (defeats THREAD_MISMATCH detection)
 - **Balloon disabled** — balloon devices are a detection vector
-- Optional: **TPM 2.0** (`--tpm`), **CPU affinity** (`--affinity`), **Intel iGPU passthrough** (`--igpu`)
+- Optional: **TPM 2.0** (`--tpm`), **CPU affinity** (`--affinity`), **iGPU passthrough** (`--igpu` — Intel or AMD)
 
 **What the patched QEMU 10 binary handles internally** (do NOT add these manually):
 - KVM/hypervisor CPUID leaf hiding (`kvm=off` is handled inside the binary)
@@ -361,53 +373,40 @@ The `windows/` directory contains PowerShell scripts to run **inside the Windows
 
 ### Quick Launch
 
-Double-click **`run-tools.bat`** — it auto-elevates to Administrator, bypasses the PowerShell execution policy, and presents a menu:
+Double-click **`run-tools.bat`** — it auto-elevates to Administrator, bypasses the PowerShell execution policy, and runs all three cleanup scripts in sequence:
 
 ```text
-  [1]  QEMU Cleanup        - Remove VM registry & driver traces
-  [2]  Identifier Spoofer  - Randomise machine IDs / MAC / hostname
-  [3]  EDID Spoofer        - Strip monitor serial numbers
-  [A]  Run ALL (1 → 2 → 3)
-  [Q]  Quit
+  [1/3]  QEMU Cleanup        - Remove VM registry & driver traces
+  [2/3]  Identifier Spoofer  - Randomise machine IDs / MAC / hostname
+  [3/3]  EDID Spoofer        - Strip monitor serial numbers
+         → Automatic reboot after completion
 ```
 
 ### 1. `qemu-cleanup.ps1` — Registry & Driver Artefact Removal
 
-Removes QEMU, VirtIO, Red Hat, and Bochs traces from the Windows registry and DriverStore.
+Removes QEMU, VirtIO, Red Hat, Bochs, and VMware traces from the Windows registry, SCSI tree, and DriverStore. Uses PsExec64 (auto-downloaded from Sysinternals) to run as SYSTEM for full registry access.
 
 ```powershell
-# Default: uses PsExec64 (auto-downloaded) to run as SYSTEM
+# Runs as SYSTEM via PsExec64 (auto-downloaded)
 .\qemu-cleanup.ps1
-
-# Run directly in current elevated session (no PsExec)
-.\qemu-cleanup.ps1 -SkipPsExec
-
-# Preview what would be deleted
-.\qemu-cleanup.ps1 -WhatIf
 ```
 
 | Feature | Detail |
 |---|---|
-| **Signature list** | `VEN_1AF4`, `DEV_1B36`, `VEN_1234`, `QEMU`, `BOCHS`, `VirtIO`, `VBOX`, and more |
-| **Registry roots scanned** | `Enum`, `Services`, `Control\Class`, `Control\Video` |
+| **Signature list** | `VEN_1AF4`, `DEV_1B36`, `SUBSYS_11001AF4`, `VEN_1234`, `DEV_0627`, `VEN_15AD`, `QEMU`, `BOCHS`, `VirtIO`, `VBOX`, `Red Hat`, `DEV_1050`, `DEV_1053`, `SUBSYS_00001AF4`, `VEN_1D6B`, `PCI\VEN_1B36`, `S3 Corp`, `FWCF`, `WAET`, `VS2005R2`, `KVMKVMKVM`, `DEV_1100`, `pvpanic`, `qemufwcfg` |
+| **Registry roots scanned** | `Enum`, `SCSI`, `Services`, `Control\Class` |
 | **SCSI wipe** | All sub-keys under `Enum\SCSI` removed |
-| **DriverStore** | VirtIO/QEMU driver packages in `FileRepository` deleted |
-| **Backup** | Each deleted key exported to `%TEMP%\qemu-cleanup-backup\` before removal |
-| **WhatIf** | Dry-run mode — shows what would be deleted without touching anything |
+| **DriverStore** | VirtIO/QEMU driver packages in `FileRepository` deleted (`vio*`, `qemu*`, `virtio*`, `red_hat*`, `netkvm*`, `balloon*`, `pvpanic*`, `spice*`) |
+| **Hidden device removal** | Enumerates all PnP devices (including ghost/disconnected) and removes those matching VM signatures via `pnputil` |
+| **Event log cleanup** | Clears System, Application, and Setup event logs to remove VM-related entries |
+| **Prefetch cleanup** | Deletes prefetch files for VM-related executables (QEMU, VirtIO, Balloon, Spice, etc.) |
 
 ### 2. `identifier-spoofer.ps1` — Machine Identity Randomiser
 
 Randomises 8 categories of Windows identifiers commonly used for hardware fingerprinting.
 
 ```powershell
-# Full spoof + automatic reboot
 .\identifier-spoofer.ps1
-
-# Custom computer name, skip reboot
-.\identifier-spoofer.ps1 -ComputerName "DESKTOP-MYPC01" -NoReboot
-
-# Custom MAC address
-.\identifier-spoofer.ps1 -MacAddress "A4BB6D123456"
 ```
 
 | # | Identifier | Registry / API |
@@ -420,8 +419,11 @@ Randomises 8 categories of Windows identifiers commonly used for hardware finger
 | 6 | HardwareGUID | `HKLM:\...\HardwareConfig` |
 | 7 | SQM MachineId | `HKLM:\SOFTWARE\Microsoft\SQMClient` |
 | 8 | Windows Update SusClientId | `HKLM:\...\WindowsUpdate` |
+| 9 | BuildGUID | `HKLM:\...\Windows NT\CurrentVersion` |
+| 10 | DiagTrack MachineId | `HKLM:\...\Diagnostics\DiagTrack` |
+| 11 | Hardware Profile GUID | `HKLM:\...\IDConfigDB\Hardware Profiles\0001` |
 
-Original values are saved to `%TEMP%\identifier-spoofer-backup.json` before changes.
+Reboot is handled by `run-tools.bat` after all scripts complete.
 
 ### 3. `edid-spoofer.ps1` — Monitor Serial Removal
 
@@ -430,12 +432,6 @@ Strips hardware serial numbers from the EDID data that anti-cheat reads via WMI,
 ```powershell
 # Spoof all connected monitors + restart graphics driver
 .\edid-spoofer.ps1
-
-# Spoof without restarting the driver
-.\edid-spoofer.ps1 -NoDriverRestart
-
-# Revert to factory EDID
-.\edid-spoofer.ps1 -Restore
 ```
 
 | Feature | Detail |
@@ -443,8 +439,6 @@ Strips hardware serial numbers from the EDID data that anti-cheat reads via WMI,
 | **Bytes zeroed** | EDID[12-15] (ID serial) + any 0xFF descriptor (alphanumeric serial) |
 | **Checksum** | Base-block checksum (byte 127) automatically recomputed |
 | **Extension blocks** | All CTA/DisplayID extension blocks preserved and forwarded |
-| **Backup** | Original EDID saved as `.bin` to `%TEMP%\edid-spoofer-backup\` |
-| **Restore** | `-Restore` flag removes all `EDID_OVERRIDE` keys and restarts the driver |
 
 ---
 
@@ -492,8 +486,8 @@ Backups of the original binaries are saved during setup in `/root/pve-realpc/bac
 
 | Resource | Link |
 |---|---|
-| **Patched packages (PVE release)** | [AICodo/pve-emu-realpc — `v20260306-213905-pve9`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260306-213905-pve9) |
-| **Patched ROMs (Debian release)** | [AICodo/pve-emu-realpc — `v20260307-191041-debian`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260307-191041-debian) |
+| **Patched packages (PVE release)** | [AICodo/pve-emu-realpc — `v20260329-214123-pve9`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260329-214123-pve9) |
+| **Patched ROMs (Debian release)** | [AICodo/pve-emu-realpc — `v20260329-212256-debian`](https://github.com/AICodo/pve-emu-realpc/releases/tag/v20260329-212256-debian) |
 | **Guest cleanup scripts (origin)** | [Scrut1ny/AutoVirt](https://github.com/Scrut1ny/AutoVirt) — `resources/scripts/Windows/` |
 | **Anti-detection source code** | [lixiaoliu666/pve-anti-detection](https://github.com/lixiaoliu666/pve-anti-detection) |
 | **Technical documentation** | [DeepWiki — pve-anti-detection](https://deepwiki.com/lixiaoliu666/pve-anti-detection) |
@@ -538,7 +532,7 @@ dmesg | grep -i kvm
 A: No — the setup script pins `pve-qemu-kvm` and `pve-edk2-firmware-ovmf` at priority `-1` and marks them as held. You must explicitly unpin before upgrading these packages.
 
 **Q: Which PVE version is supported?**
-A: The current release (`v20260306-213905-pve9`) targets **PVE 9**. Older releases on the [AICodo releases page](https://github.com/AICodo/pve-emu-realpc/releases) support PVE 8.
+A: The current release (`v20260329-214123-pve9`) targets **PVE 9**. Older releases on the [AICodo releases page](https://github.com/AICodo/pve-emu-realpc/releases) support PVE 8.
 
 **Q: Can I use this on bare Debian/Ubuntu (not Proxmox)?**
 A: The AICodo releases page also provides standalone `qemu-system-x86_64` binaries for Debian 13 and Ubuntu 24.04. These scripts are Proxmox-specific, but the upstream binaries work on plain Linux.

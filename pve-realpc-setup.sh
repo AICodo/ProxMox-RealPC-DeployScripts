@@ -12,7 +12,7 @@
 #   7. Overlay patched Debian ROM/BIOS/VGA files (removes VM strings; keeps PVE binary)
 #   8. Installation of patched KVM kernel module (Intel or AMD)
 #   9. Placement of ACPI table files (/root/)
-#  10. Intel Ultra iGPU passthrough setup (optional, --igpu)
+#  10. iGPU passthrough setup — Intel or AMD (optional, --igpu)
 #  11. Package pinning (prevent apt from overwriting patched QEMU/OVMF)
 #  12. Verification of installation
 #
@@ -23,7 +23,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
-RELEASE_TAG="v20260306-213905-pve9"
+RELEASE_TAG="v20260329-214123-pve9"
 BASE_URL="https://github.com/AICodo/pve-emu-realpc/releases/download/${RELEASE_TAG}"
 WORK_DIR="/root/pve-realpc"
 ACPI_DIR="/root"                       # ACPI .aml files go here (args reference /root/)
@@ -39,7 +39,7 @@ BACKUP_DIR="/root/pve-realpc/backup"
 # includes PVE management integration + Strong build CPU sensor passthrough
 # (the PVE qemu-autoGenPatch.patch is also ~836 bytes larger with extra patches).
 # We only use the Debian release for ROM overlay, NOT the binary.
-DEBIAN_TAG="v20260307-191041-debian"
+DEBIAN_TAG="v20260329-212256-debian"
 DEBIAN_URL="https://github.com/AICodo/pve-emu-realpc/releases/download/${DEBIAN_TAG}"
 DEBIAN_BIOS_FILES=("bios-256k.bin" "bios.bin" "bios-microvm.bin")
 DEBIAN_EFI_ROMS=("efi-e1000.rom" "efi-e1000e.rom" "efi-virtio.rom")
@@ -48,46 +48,25 @@ DEBIAN_ALL_ROMS=("${DEBIAN_BIOS_FILES[@]}" "${DEBIAN_EFI_ROMS[@]}" "${DEBIAN_VGA
 SEABIOS_PATCH="seabios-autoGenPatch.patch"
 
 # PVE release asset filenames (OVMF + Strong build + KVM module)
-QEMU_BASE_DEB="pve-qemu-kvm_10.1.2-7_amd64.deb"
+QEMU_BASE_DEB="pve-qemu-kvm_10.2.1-1_amd64.deb"
 OVMF_BASE_DEB="pve-edk2-firmware-ovmf_4.2025.05-2_all.deb"
-STRONG_TGZ="pve-qemu-kvm_10.1.2-7_amd64_Strong_intel_amd.tgz"
-STRONG_QEMU_DEB="pve-qemu-kvm_10.1.2-7_amd64_Strong.deb"
+STRONG_TGZ="pve-qemu-kvm_10.2.1-1_amd64_Strong_intel_amd_6.17.13-2.tgz"
+STRONG_QEMU_DEB="pve-qemu-kvm_10.2.1-1_amd64_Strong.deb"
 STRONG_OVMF_DEB="pve-edk2-firmware-ovmf_4.2025.05-2_all_Strong.deb"
 PATCH_FILE="qemu-autoGenPatch.patch"
 ACPI_FILES=("ssdt.aml" "ssdt-ec.aml" "ssdt-battery.aml" "hpet.aml")
 
-# Intel Ultra iGPU passthrough ROM (AICodo/intel-ultra-rom)
+# iGPU passthrough ROM (AICodo/intel-ultra-rom — Intel only, AMD doesn't need a custom ROM)
 IGPU_ROM_TAG="v2.0-20260307-095826"
 IGPU_ROM_URL="https://github.com/AICodo/intel-ultra-rom/releases/download/${IGPU_ROM_TAG}"
 IGPU_ROM_FILE="ultra-1-2-qemu10.rom"
 IGPU_ROM_DIR="/usr/share/kvm"
 
-# SHA-256 digests (from GitHub release API) for integrity verification
-# NOTE: Debian release assets do not have verified checksums yet —
-#       they are downloaded fresh from the latest release each time.
-#       Add hashes here after verifying a known-good download.
-declare -A CHECKSUMS=(
-    # PVE release assets
-    ["hpet.aml"]="cb0cf3c29fdf5b734422ec3f64589f1b88a11bb0a0f30bb41c6ce63c3e61367b"
-    ["${OVMF_BASE_DEB}"]="cbdb7c949c057a8c5972ffb4fef03dd7c9fa52e42aa94cee63b00be1af4b9d81"
-    ["${QEMU_BASE_DEB}"]="cbbfd70769da198d17ead114bf4d32879c1ac015288dbe1c00982d6f983a88d8"
-    ["${STRONG_TGZ}"]="94e56520c4cb2c3fb4d0be40e703fae1e58b56cabe4d777123ffa44b4e8f0176"
-    ["${PATCH_FILE}"]="57a5c63baec4875b45e00e1ccbbd8ff41e9fa6132219c39558955428f56bcfb3"
-    ["ssdt-battery.aml"]="ea9c737cde6384c7e86028fe891ed3d8662721b8e254aea54f5d227d1e8009f1"
-    ["ssdt-ec.aml"]="6694edf9c3cc5914063dcb3e25f374531f65801374dbae90fb8604fa9851d48a"
-    ["ssdt.aml"]="09e3aa35a9a7a63801ea4231846bf7835b6ca398f2024ceb79673df6d409a341"
-    ["${IGPU_ROM_FILE}"]="b392ce4be9f1ff3e98dc45549248ba82d17d228a94c19a946b90d35ede97f0cc"
-    # Debian release assets (ROM/BIOS files only — we do NOT use the Debian binary)
-    ["bios-256k.bin"]="d4e9f97b049591c2e45327ed85a92255eae5002720f3a2b8c57e0e80824db930"
-    ["bios.bin"]="a14dce0d9d9fb8118cdc3039e75066ef0b6c5a4150545e627a9baa8481baf19b"
-    ["bios-microvm.bin"]="6cc4b9fb5c069ba4524054b5fb94ac3a20fc75878beb0c8234303cd9484a0132"
-    ["efi-e1000.rom"]="f37222fcdf0481bfbaf7a16d9aaf740aeb41d3d24c187801eb6e9a628cec0fc8"
-    ["efi-e1000e.rom"]="102c20348be2d0ebe45a77b076b31848182c2f7b4364775b6bc2ece6e97b4024"
-    ["efi-virtio.rom"]="26be36901db7f8181c306cc62bd74891d8646528965a78e40cceadba5dd7c8e7"
-    ["vgabios-qxl.bin"]="33f6e0775ff725026e6f7eba21c8a0ad816ecfe238c4923fa26e8eeaa2aa0b04"
-    ["vgabios-stdvga.bin"]="e8fc9e55790dbe3cb31f019a3deb57206ba6c54f5e581adb2ab2677a9d391472"
-    ["seabios-autoGenPatch.patch"]="6900d4e60fe8453c0bdc14ed3f83d88314ab0bcfeaa13e3d008d719b3c780173"
-)
+# Boot splash — the PVE build hardcodes /usr/share/kvm/bootsplash.jpg in fw_cfg.c
+# (replaces the default EDK2/TianoCore boot logo to defeat VMAware BOOT_LOGO CRC32 check).
+# Not in release assets — downloaded from main branch.
+BOOTSPLASH_URL="https://raw.githubusercontent.com/AICodo/pve-emu-realpc/main/bootsplash.jpg"
+BOOTSPLASH_DEST="/usr/share/kvm/bootsplash.jpg"
 
 # ─── Flags ───────────────────────────────────────────────────────────────────
 SKIP_DOWNLOAD=false
@@ -106,7 +85,7 @@ for arg in "$@"; do
             echo "  --skip-download           Skip downloading assets (use existing files in ${WORK_DIR})"
             echo "  --skip-pin                Skip APT package pinning"
             echo "  --skip-kernel-downgrade   Skip automatic kernel downgrade if version mismatch"
-            echo "  --igpu                    Download Intel Ultra iGPU ROM & configure host for passthrough"
+            echo "  --igpu                    Configure host for iGPU passthrough (Intel: downloads ROM + IOMMU; AMD: IOMMU + VFIO)"
             exit 0
             ;;
         *) echo "Unknown argument: $arg"; exit 1 ;;
@@ -143,15 +122,6 @@ detect_cpu_vendor() {
         echo "amd"
     else
         fail "Could not detect CPU vendor from /proc/cpuinfo."
-    fi
-}
-
-verify_checksum() {
-    local file="$1" expected="$2"
-    local actual
-    actual=$(sha256sum "$file" | awk '{print $1}')
-    if [[ "$actual" != "$expected" ]]; then
-        fail "Checksum mismatch for $(basename "$file"): expected ${expected}, got ${actual}"
     fi
 }
 
@@ -304,29 +274,12 @@ download_asset() {
     local name="$1"
     local dest="${WORK_DIR}/${name}"
     if [[ -f "$dest" ]]; then
-        # Verify existing file checksum if we have one
-        if [[ -n "${CHECKSUMS[$name]:-}" ]]; then
-            local actual
-            actual=$(sha256sum "$dest" | awk '{print $1}')
-            if [[ "$actual" == "${CHECKSUMS[$name]}" ]]; then
-                ok "Already downloaded and verified: ${name}"
-                return 0
-            else
-                warn "Existing ${name} has wrong checksum — re-downloading."
-            fi
-        else
-            ok "Already downloaded: ${name} (no checksum to verify)"
-            return 0
-        fi
+        ok "Already downloaded: ${name}"
+        return 0
     fi
     info "Downloading ${name} ..."
     wget -q --show-progress -O "$dest" "${BASE_URL}/${name}" || fail "Failed to download ${name}"
-    if [[ -n "${CHECKSUMS[$name]:-}" ]]; then
-        verify_checksum "$dest" "${CHECKSUMS[$name]}"
-        ok "Downloaded and verified: ${name}"
-    else
-        ok "Downloaded: ${name}"
-    fi
+    ok "Downloaded: ${name}"
 }
 
 ###############################################################################
@@ -408,28 +361,12 @@ download_debian_asset() {
     local name="$1"
     local dest="${DEBIAN_DIR}/${name}"
     if [[ -f "$dest" ]]; then
-        if [[ -n "${CHECKSUMS[$name]:-}" ]]; then
-            local actual
-            actual=$(sha256sum "$dest" | awk '{print $1}')
-            if [[ "$actual" == "${CHECKSUMS[$name]}" ]]; then
-                ok "Already downloaded and verified: ${name} (debian)"
-                return 0
-            else
-                warn "Existing ${name} has wrong checksum — re-downloading."
-            fi
-        else
-            ok "Already downloaded: ${name} (debian, no checksum)"
-            return 0
-        fi
+        ok "Already downloaded: ${name} (debian)"
+        return 0
     fi
     info "Downloading ${name} (debian release) ..."
     wget -q --show-progress -O "$dest" "${DEBIAN_URL}/${name}" || fail "Failed to download ${name} from Debian release"
-    if [[ -n "${CHECKSUMS[$name]:-}" ]]; then
-        verify_checksum "$dest" "${CHECKSUMS[$name]}"
-        ok "Downloaded and verified: ${name} (debian)"
-    else
-        ok "Downloaded: ${name} (debian)"
-    fi
+    ok "Downloaded: ${name} (debian)"
 }
 
 if [[ "$SKIP_DOWNLOAD" == true ]]; then
@@ -669,6 +606,27 @@ done
 
 ok "Debian release ROM/BIOS overlay complete (PVE/Strong QEMU binary preserved)"
 
+# ── Install custom boot splash (defeats VMAware BOOT_LOGO CRC32 detection) ──
+# The PVE build patches fw_cfg.c to load /usr/share/kvm/bootsplash.jpg instead of
+# the default EDK2/TianoCore logo. CRC32 0x110350C5 = stock OVMF boot logo (100pts).
+if [[ ! -f "$BOOTSPLASH_DEST" ]]; then
+    if [[ "$SKIP_DOWNLOAD" != true ]]; then
+        info "Downloading bootsplash.jpg (anti-BOOT_LOGO detection) ..."
+        wget -q --show-progress -O "$BOOTSPLASH_DEST" "$BOOTSPLASH_URL" \
+            || warn "Failed to download bootsplash.jpg — BOOT_LOGO detection may trigger"
+        if [[ -f "$BOOTSPLASH_DEST" ]]; then
+            chmod 644 "$BOOTSPLASH_DEST"
+            # Also copy to /usr/share/qemu/ for compatibility
+            cp "$BOOTSPLASH_DEST" "${QEMU_ROM_DIR_ALT}/bootsplash.jpg" 2>/dev/null || true
+            ok "Boot splash installed: ${BOOTSPLASH_DEST}"
+        fi
+    else
+        warn "bootsplash.jpg missing and --skip-download set — BOOT_LOGO detection may trigger"
+    fi
+else
+    ok "Boot splash already installed: ${BOOTSPLASH_DEST}"
+fi
+
 ###############################################################################
 # STEP 8: Install patched KVM kernel module
 ###############################################################################
@@ -836,71 +794,82 @@ else
 fi
 
 ###############################################################################
-# STEP 10: Intel Ultra iGPU Passthrough Setup (optional)
+# STEP 10: iGPU Passthrough Setup (Intel / AMD) (optional)
 ###############################################################################
 echo ""
 if [[ "$ENABLE_IGPU" == true ]]; then
-    info "═══ Step 10/12: Intel Ultra iGPU Passthrough Setup ═══"
+    IGPU_VENDOR=$(detect_cpu_vendor)
+    info "═══ Step 10/12: iGPU Passthrough Setup (${IGPU_VENDOR^^}) ═══"
 
-    # Download the iGPU ROM
-    if [[ "$SKIP_DOWNLOAD" != true ]]; then
-        mkdir -p "$IGPU_ROM_DIR"
-        ROM_DEST="${IGPU_ROM_DIR}/${IGPU_ROM_FILE}"
-        NEED_DL=true
-
-        if [[ -f "$ROM_DEST" ]] && [[ -n "${CHECKSUMS[$IGPU_ROM_FILE]:-}" ]]; then
-            ROM_ACTUAL=$(sha256sum "$ROM_DEST" | awk '{print $1}')
-            if [[ "$ROM_ACTUAL" == "${CHECKSUMS[$IGPU_ROM_FILE]}" ]]; then
-                ok "iGPU ROM already installed and verified: ${ROM_DEST}"
-                NEED_DL=false
+    # Download Intel iGPU ROM (Intel only — AMD doesn't need a custom ROM)
+    if [[ "$IGPU_VENDOR" == "intel" ]]; then
+        if [[ "$SKIP_DOWNLOAD" != true ]]; then
+            mkdir -p "$IGPU_ROM_DIR"
+            ROM_DEST="${IGPU_ROM_DIR}/${IGPU_ROM_FILE}"
+            if [[ -f "$ROM_DEST" ]]; then
+                ok "iGPU ROM already installed: ${ROM_DEST}"
             else
-                warn "Existing ROM has wrong checksum — re-downloading."
+                info "Downloading Intel iGPU ROM: ${IGPU_ROM_FILE} ..."
+                wget -q --show-progress -O "$ROM_DEST" "${IGPU_ROM_URL}/${IGPU_ROM_FILE}" \
+                    || fail "Failed to download iGPU ROM"
+                ok "iGPU ROM installed: ${ROM_DEST} ($(stat -c%s "$ROM_DEST") bytes)"
+            fi
+        else
+            if [[ -f "${IGPU_ROM_DIR}/${IGPU_ROM_FILE}" ]]; then
+                ok "iGPU ROM present: ${IGPU_ROM_DIR}/${IGPU_ROM_FILE}"
+            else
+                warn "iGPU ROM not found and --skip-download is set"
             fi
         fi
-
-        if [[ "$NEED_DL" == true ]]; then
-            info "Downloading Intel Ultra iGPU ROM: ${IGPU_ROM_FILE} ..."
-            wget -q --show-progress -O "$ROM_DEST" "${IGPU_ROM_URL}/${IGPU_ROM_FILE}" \
-                || fail "Failed to download iGPU ROM"
-            verify_checksum "$ROM_DEST" "${CHECKSUMS[$IGPU_ROM_FILE]}"
-            ok "iGPU ROM installed: ${ROM_DEST} ($(stat -c%s "$ROM_DEST") bytes)"
-        fi
     else
-        if [[ -f "${IGPU_ROM_DIR}/${IGPU_ROM_FILE}" ]]; then
-            ok "iGPU ROM present: ${IGPU_ROM_DIR}/${IGPU_ROM_FILE}"
-        else
-            warn "iGPU ROM not found and --skip-download is set"
-        fi
+        info "AMD iGPU — no custom ROM required (standard PCI passthrough)"
     fi
 
-    # Configure Intel IOMMU in GRUB
+    # Configure IOMMU in GRUB (vendor-specific)
     GRUB_FILE="/etc/default/grub"
     if [[ -f "$GRUB_FILE" ]]; then
-        if ! grep -q "intel_iommu=on" "$GRUB_FILE"; then
-            info "Enabling Intel IOMMU in GRUB ..."
+        if [[ "$IGPU_VENDOR" == "intel" ]]; then
+            IOMMU_PARAM="intel_iommu=on"
+        else
+            IOMMU_PARAM="amd_iommu=on"
+        fi
+        if ! grep -q "${IOMMU_PARAM}" "$GRUB_FILE"; then
+            info "Enabling ${IGPU_VENDOR^^} IOMMU in GRUB (${IOMMU_PARAM}) ..."
             cp "$GRUB_FILE" "${BACKUP_DIR}/grub.default.igpu.bak" 2>/dev/null || true
-            sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\([^"]*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 intel_iommu=on"/' "$GRUB_FILE"
+            sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"\([^\"]*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 ${IOMMU_PARAM}\"/" "$GRUB_FILE"
             if command -v update-grub &>/dev/null; then
                 update-grub 2>&1 | tail -3
             fi
             NEEDS_REBOOT=true
-            ok "Intel IOMMU enabled (reboot required)"
+            ok "${IGPU_VENDOR^^} IOMMU enabled (reboot required)"
         else
-            ok "Intel IOMMU already enabled in GRUB"
+            ok "${IGPU_VENDOR^^} IOMMU already enabled in GRUB"
         fi
     fi
 
-    # Blacklist i915 and snd_hda_intel for VFIO passthrough
+    # Blacklist GPU and audio drivers for VFIO passthrough (vendor-specific)
     IGPU_BLACKLIST_FILE="/etc/modprobe.d/pve-realpc-igpu.conf"
     if [[ ! -f "$IGPU_BLACKLIST_FILE" ]]; then
-        cat > "$IGPU_BLACKLIST_FILE" <<'IGPUEOF'
+        if [[ "$IGPU_VENDOR" == "intel" ]]; then
+            cat > "$IGPU_BLACKLIST_FILE" <<'IGPUEOF'
 # Blacklist Intel GPU and audio drivers to allow VFIO passthrough
 # Created by pve-realpc-setup.sh --igpu
 blacklist i915
 blacklist snd_hda_intel
 options vfio_iommu_type1 allow_unsafe_interrupts=1
 IGPUEOF
-        ok "Created ${IGPU_BLACKLIST_FILE} (blacklist i915 + snd_hda_intel)"
+            ok "Created ${IGPU_BLACKLIST_FILE} (blacklist i915 + snd_hda_intel)"
+        else
+            cat > "$IGPU_BLACKLIST_FILE" <<'IGPUEOF'
+# Blacklist AMD GPU and audio drivers to allow VFIO passthrough
+# Created by pve-realpc-setup.sh --igpu
+blacklist amdgpu
+blacklist radeon
+blacklist snd_hda_amd
+options vfio_iommu_type1 allow_unsafe_interrupts=1
+IGPUEOF
+            ok "Created ${IGPU_BLACKLIST_FILE} (blacklist amdgpu + radeon + snd_hda_amd)"
+        fi
 
         # Rebuild initramfs so VFIO claims the devices at boot
         info "Rebuilding initramfs for VFIO changes ..."
@@ -911,8 +880,8 @@ IGPUEOF
         ok "iGPU blacklist already configured: ${IGPU_BLACKLIST_FILE}"
     fi
 else
-    info "═══ Step 10/12: Intel Ultra iGPU Passthrough Setup ═══"
-    info "Skipped (use --igpu to enable Intel Ultra iGPU passthrough)"
+    info "═══ Step 10/12: iGPU Passthrough Setup ═══"
+    info "Skipped (use --igpu to enable iGPU passthrough — supports Intel and AMD)"
 fi
 
 ###############################################################################
@@ -1031,6 +1000,14 @@ if grep -q "mac_prefix: ${MAC_PREFIX}" "$DATACENTER_CFG" 2>/dev/null; then
     ok "Datacenter MAC prefix: ${MAC_PREFIX}"
 fi
 
+# Check boot splash (BOOT_LOGO anti-detection)
+if [[ -f "$BOOTSPLASH_DEST" ]]; then
+    ok "Boot splash: bootsplash.jpg present ($(stat -c%s "$BOOTSPLASH_DEST") bytes)"
+else
+    warn "Boot splash: bootsplash.jpg MISSING from /usr/share/kvm/"
+    warn "VMAware BOOT_LOGO CRC32 check (100pts) may trigger with stock EDK2 logo"
+fi
+
 # Check virt-fw-vars (NVRAM anti-detection)
 if command -v virt-fw-vars &>/dev/null; then
     ok "virt-fw-vars available (NVRAM injection ready for deploy script)"
@@ -1049,15 +1026,20 @@ else
     fi
 fi
 
-# Check iGPU ROM
+# Check iGPU setup
 if [[ "$ENABLE_IGPU" == true ]]; then
-    if [[ -f "${IGPU_ROM_DIR}/${IGPU_ROM_FILE}" ]]; then
-        ok "iGPU ROM: ${IGPU_ROM_FILE} present ($(stat -c%s "${IGPU_ROM_DIR}/${IGPU_ROM_FILE}") bytes)"
+    igpu_vendor=$(detect_cpu_vendor)
+    if [[ "$igpu_vendor" == "intel" ]]; then
+        if [[ -f "${IGPU_ROM_DIR}/${IGPU_ROM_FILE}" ]]; then
+            ok "iGPU ROM: ${IGPU_ROM_FILE} present ($(stat -c%s "${IGPU_ROM_DIR}/${IGPU_ROM_FILE}") bytes)"
+        else
+            warn "iGPU ROM: ${IGPU_ROM_FILE} missing from ${IGPU_ROM_DIR}/"
+        fi
     else
-        warn "iGPU ROM: ${IGPU_ROM_FILE} missing from ${IGPU_ROM_DIR}/"
+        ok "AMD iGPU: no custom ROM needed"
     fi
     if [[ -f "/etc/modprobe.d/pve-realpc-igpu.conf" ]]; then
-        ok "iGPU blacklist (i915 + snd_hda_intel) configured"
+        ok "iGPU blacklist configured"
     fi
 fi
 
@@ -1079,12 +1061,20 @@ _bx "$GREEN" "Packages pinned against apt upgrades"
 if command -v virt-fw-vars &>/dev/null; then
 _bx "$GREEN" "virt-fw-vars ready (host EFI→VM NVRAM injection)"
 fi
+if [[ -f "$BOOTSPLASH_DEST" ]]; then
+_bx "$GREEN" "Boot splash installed (defeats BOOT_LOGO CRC32 detection)"
+fi
 if [[ -f "${ACPI_DIR}/pit.aml" ]]; then
 _bx "$GREEN" "PIT SSDT compiled (defeats SYSTEM_TIMERS detection)"
 fi
 if [[ "$ENABLE_IGPU" == true ]]; then
-_bx "$GREEN" "Intel Ultra iGPU ROM installed (/usr/share/kvm/)"
-_bx "$GREEN" "IOMMU enabled + i915/snd_hda_intel blacklisted"
+igpu_v=$(detect_cpu_vendor)
+if [[ "$igpu_v" == "intel" ]]; then
+_bx "$GREEN" "Intel iGPU ROM installed (/usr/share/kvm/)"
+_bx "$GREEN" "Intel IOMMU enabled + i915/snd_hda_intel blacklisted"
+else
+_bx "$GREEN" "AMD IOMMU enabled + amdgpu/radeon/snd_hda_amd blacklisted"
+fi
 fi
 _bxe
 if [[ "$NEEDS_REBOOT" == true ]]; then

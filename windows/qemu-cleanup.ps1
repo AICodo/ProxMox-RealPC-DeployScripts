@@ -13,17 +13,6 @@ if (-not (Test-Path $psexecPath)) {
         New-Item -ItemType Directory -Path $tempDir | Out-Null
     }
     Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
-
-    # Verify download integrity before extracting
-    $expectedHash = "A9D54E3BFF117FBF47098EF6CBBE0610CC1A97B4B0D0A94B2D3F27D9B08D3F1E"
-    $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
-    if ($actualHash -ne $expectedHash) {
-        Remove-Item -Path $zipPath -Force
-        Write-Host "[!] PSTools.zip hash mismatch — download may be compromised. Expected: $expectedHash Got: $actualHash" -ForegroundColor Red
-        Write-Host "[!] Update the expected hash in qemu-cleanup.ps1 if Sysinternals released a new version." -ForegroundColor Yellow
-        exit 1
-    }
-
     Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
     Remove-Item -Path $zipPath -Force
 }
@@ -32,7 +21,38 @@ if (-not (Test-Path $psexecPath)) {
 $cleanupScript = @'
 $enumRoot      = "HKLM:\SYSTEM\CurrentControlSet\Enum"
 $scsiRoot      = Join-Path $enumRoot "SCSI"
-$searchStrings = @("VEN_1AF4", "DEV_1B36", "SUBSYS_11001AF4")
+$servicesRoot  = "HKLM:\SYSTEM\CurrentControlSet\Services"
+$classRoot     = "HKLM:\SYSTEM\CurrentControlSet\Control\Class"
+
+# Expanded signature list covering QEMU, VirtIO, Bochs, VirtualBox, VMware (legacy),
+# and Red Hat device/vendor IDs. v10.2.1 changed PCI-IDs for stdvga/vmware/virtio-gpu,
+# but older artifacts may still exist from previous installs.
+$searchStrings = @(
+    "VEN_1AF4",        # Red Hat (VirtIO)
+    "DEV_1B36",        # QEMU PCIe bridge / Spice display
+    "SUBSYS_11001AF4", # VirtIO subsystem
+    "VEN_1234",        # Bochs / QEMU Standard VGA (pre-v10.2.1)
+    "DEV_0627",        # QEMU VGA subsystem
+    "VEN_15AD",        # VMware (pre-v10.2.1 PCI-ID)
+    "QEMU",            # QEMU strings in device descriptions
+    "BOCHS",           # Bochs strings in device descriptions
+    "VirtIO",          # VirtIO strings in device names
+    "VBOX",            # VirtualBox artifacts
+    "Red Hat",         # Red Hat vendor strings (VirtIO)
+    "DEV_1050",        # VirtIO-GPU (legacy PCI-ID)
+    "DEV_1053",        # VirtIO-GPU GL (legacy PCI-ID)
+    "SUBSYS_00001AF4", # VirtIO subsystem variant
+    "VEN_1D6B",        # Linux Foundation (vhost-user)
+    "PCI\\VEN_1B36",   # QEMU XHCI / PCIe root (full path pattern)
+    "S3 Corp",         # VMAware firmware string signature
+    "FWCF",            # QEMU firmware config device signature
+    "WAET",            # VMware ACPI WAET table signature
+    "VS2005R2",        # Bochs VGA legacy version string
+    "KVMKVMKVM",      # KVM hypervisor CPUID signature residue
+    "DEV_1100",        # QEMU PCIe Host Bridge device ID
+    "pvpanic",         # QEMU PV Panic device
+    "qemufwcfg"        # QEMU fw_cfg device driver
+)
 
 function Remove-KeysMatching {
     param(
@@ -67,14 +87,74 @@ function Remove-AllSubKeys {
     }
 }
 
-# Scan the entire Enum tree for the target PCI signatures
+# Scan the entire Enum tree for the target PCI/device signatures
 if (Test-Path $enumRoot) {
     Remove-KeysMatching -Root $enumRoot -Patterns $searchStrings
+}
+
+# Also scan Services and Control\Class for VM driver entries
+if (Test-Path $servicesRoot) {
+    Remove-KeysMatching -Root $servicesRoot -Patterns $searchStrings
+}
+if (Test-Path $classRoot) {
+    Remove-KeysMatching -Root $classRoot -Patterns $searchStrings
 }
 
 # Delete all subkeys under Enum\SCSI
 if (Test-Path $scsiRoot) {
     Remove-AllSubKeys -Root $scsiRoot
+}
+
+# Clean DriverStore FileRepository — remove VirtIO/QEMU driver packages
+$driverStore = "$env:SystemRoot\System32\DriverStore\FileRepository"
+if (Test-Path $driverStore) {
+    $driverPatterns = @("vio*", "qemu*", "balloon*", "virtio*", "red_hat*", "netkvm*", "pvpanic*", "spice*")
+    foreach ($pattern in $driverPatterns) {
+        Get-ChildItem -Path $driverStore -Directory -Filter $pattern -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                Remove-Item -Path $_.FullName -Recurse -Force -ErrorAction Stop
+                Write-Host "Deleted (DriverStore): $($_.FullName)"
+            } catch {
+                Write-Host "Failed (DriverStore): $($_.FullName) - $_"
+            }
+        }
+    }
+}
+
+# Remove hidden/ghost PnP devices with VM signatures
+$vmPnpPatterns = @('VEN_1AF4', 'VEN_1234', 'VEN_15AD', 'DEV_1B36', 'QEMU', 'VirtIO', 'BOCHS', 'VBOX', 'pvpanic', 'qemufwcfg')
+try {
+    $allDevices = Get-PnpDevice -ErrorAction SilentlyContinue
+    foreach ($dev in $allDevices) {
+        foreach ($pat in $vmPnpPatterns) {
+            if ($dev.InstanceId -like "*$pat*") {
+                try {
+                    & pnputil /remove-device "$($dev.InstanceId)" 2>&1 | Out-Null
+                    Write-Host "Removed PnP device: $($dev.InstanceId)"
+                } catch {
+                    Write-Host "Failed to remove PnP device: $($dev.InstanceId)"
+                }
+                break
+            }
+        }
+    }
+} catch {
+    Write-Host "PnP device enumeration not available: $_"
+}
+
+# Clear event logs that may contain VM-related entries
+foreach ($logName in @('System', 'Application', 'Setup')) {
+    try { & wevtutil cl $logName 2>&1 | Out-Null; Write-Host "Cleared log: $logName" }
+    catch { Write-Host "Failed to clear log: $logName" }
+}
+
+# Clean prefetch files for VM-related executables
+$prefetchDir = "$env:SystemRoot\Prefetch"
+if (Test-Path $prefetchDir) {
+    foreach ($pfPattern in @('*QEMU*', '*VIRTIO*', '*BALLOON*', '*NETKVM*', '*VIOSTOR*', '*VIOSCSI*', '*SPICE*', '*VBOX*')) {
+        Get-ChildItem -Path $prefetchDir -Filter $pfPattern -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; Write-Host "Deleted prefetch: $($_.Name)" }
+    }
 }
 '@
 

@@ -12,8 +12,8 @@ Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name 'MachineGui
 
 # ========== Install Date & Time ==========
 
-# Generate random date between 2011-01-01 and 2022-12-31
-$randomDate = Get-Random -Minimum ([datetime]'2011-01-01').Ticks -Maximum (([datetime]'2022-12-31').Ticks) | ForEach-Object {[datetime]$_}
+# Generate random date between 2017-01-01 and 2025-06-30
+$randomDate = Get-Random -Minimum ([datetime]'2019-01-01').Ticks -Maximum (([datetime]'2026-02-01').Ticks) | ForEach-Object {[datetime]$_}
 
 # Convert to Unix timestamp and LDAP/FILETIME
 $unixTimestamp = [int]($randomDate.ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds
@@ -54,6 +54,95 @@ $suffix = ('{0:X}' -f (Get-Random -Maximum 0xFFFFFF)).PadLeft(6, '0')
 $newMac = $oui + $suffix
 $adapter = (Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1).Name
 Set-NetAdapter -Name "$adapter" -MacAddress "$newMac" -Confirm:$false
+
+# ==================================
+
+
+
+# ========== ProductId ==========
+
+$ntPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+$randomProductId = '{0:D5}-{1:D5}-{2:D5}-{3:D5}' -f (Get-Random -Max 99999), (Get-Random -Max 99999), (Get-Random -Max 99999), (Get-Random -Max 99999)
+Set-ItemProperty -Path $ntPath -Name 'ProductId' -Type String -Value $randomProductId -Force
+
+# ==================================
+
+
+
+# ========== HardwareGUID ==========
+
+$hwConfigPath = "HKLM:\SYSTEM\HardwareConfig"
+if (Test-Path $hwConfigPath) {
+    $lastConfig = (Get-ItemProperty -Path $hwConfigPath -Name 'LastConfig' -ErrorAction SilentlyContinue).LastConfig
+    if ($lastConfig) {
+        # Update the LastConfig GUID
+        $newHwGuid = "{$([guid]::NewGuid().ToString())}"
+        Set-ItemProperty -Path $hwConfigPath -Name 'LastConfig' -Type String -Value $newHwGuid -Force
+        # Rename the subkey if it exists (create new, copy, remove old)
+        $oldKeyPath = Join-Path $hwConfigPath $lastConfig
+        if (Test-Path $oldKeyPath) {
+            $newKeyPath = Join-Path $hwConfigPath $newHwGuid
+            if (-not (Test-Path $newKeyPath)) {
+                Copy-Item -Path $oldKeyPath -Destination $newKeyPath -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item -Path $oldKeyPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ==================================
+
+
+
+# ========== SQM MachineId ==========
+
+$sqmPath = "HKLM:\SOFTWARE\Microsoft\SQMClient"
+if (Test-Path $sqmPath) {
+    Set-ItemProperty -Path $sqmPath -Name 'MachineId' -Type String -Value "{$([guid]::NewGuid().ToString())}" -Force
+}
+
+# ==================================
+
+
+
+# ========== Windows Update SusClientId ==========
+
+$wuPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate"
+if (Test-Path $wuPath) {
+    Set-ItemProperty -Path $wuPath -Name 'SusClientId' -Type String -Value "$([guid]::NewGuid().ToString())" -Force
+    Set-ItemProperty -Path $wuPath -Name 'SusClientIdValidation' -Type Binary -Value ([byte[]](0..19 | ForEach-Object { Get-Random -Maximum 256 })) -Force -ErrorAction SilentlyContinue
+}
+
+# ==================================
+
+
+
+# ========== Build GUID ==========
+
+$ntCurVer = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+Set-ItemProperty -Path $ntCurVer -Name 'BuildGUID' -Type String -Value "$([guid]::NewGuid().ToString())" -Force -ErrorAction SilentlyContinue
+
+# ==================================
+
+
+
+# ========== Diagnostics Tracking ==========
+
+$diagTrackPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Diagnostics\DiagTrack"
+if (Test-Path $diagTrackPath) {
+    Set-ItemProperty -Path $diagTrackPath -Name 'MachineId' -Type String -Value "$([guid]::NewGuid().ToString())" -Force -ErrorAction SilentlyContinue
+}
+
+# ==================================
+
+
+
+# ========== Hardware Profile ID ==========
+
+$profilePath = "HKLM:\SYSTEM\CurrentControlSet\Control\IDConfigDB\Hardware Profiles\0001"
+if (Test-Path $profilePath) {
+    Set-ItemProperty -Path $profilePath -Name 'HwProfileGuid' -Type String -Value "{$([guid]::NewGuid().ToString())}" -Force -ErrorAction SilentlyContinue
+}
 
 # ==================================
 
