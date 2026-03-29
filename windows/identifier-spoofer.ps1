@@ -12,8 +12,8 @@ Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name 'MachineGui
 
 # ========== Install Date & Time ==========
 
-# Generate random date between 2017-01-01 and 2025-06-30
-$randomDate = Get-Random -Minimum ([datetime]'2019-01-01').Ticks -Maximum (([datetime]'2026-02-01').Ticks) | ForEach-Object {[datetime]$_}
+# Generate random date between 2019-01-01 and 30 days before today
+$randomDate = Get-Random -Minimum ([datetime]'2019-01-01').Ticks -Maximum (([datetime]::Now.AddDays(-30)).Ticks) | ForEach-Object {[datetime]$_}
 
 # Convert to Unix timestamp and LDAP/FILETIME
 $unixTimestamp = [int]($randomDate.ToUniversalTime() - [datetime]'1970-01-01').TotalSeconds
@@ -22,13 +22,25 @@ $ldapFileTime = [long]($unixTimestamp + 11644473600) * 10000000
 
 # Update registry values with proper numeric types
 $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
-Set-ItemProperty -Path $regPath -Name "InstallDate" -Value $unixTimestamp -Force
-Set-ItemProperty -Path $regPath -Name "InstallTime" -Value $ldapFileTime -Force
+Set-ItemProperty -Path $regPath -Name "InstallDate" -Value ([int]$unixTimestamp) -Type DWord -Force
+Set-ItemProperty -Path $regPath -Name "InstallTime" -Value ([long]$ldapFileTime) -Type QWord -Force
 
 # Ensure time service is running and reconfigure
-Get-Service w32time | Where Status -ne Running | Start-Service
-w32tm /config /syncfromflags:manual /manualpeerlist:"0.pool.ntp.org,1.pool.ntp.org,2.pool.ntp.org,3.pool.ntp.org" /update
-Restart-Service w32time -Force; w32tm /resync
+# Handle slim ISOs where w32time may be disabled or missing
+$w32svc = Get-Service w32time -ErrorAction SilentlyContinue
+if ($w32svc) {
+    if ($w32svc.StartType -eq 'Disabled') {
+        Set-Service w32time -StartupType Manual -ErrorAction SilentlyContinue
+    }
+    if ($w32svc.Status -ne 'Running') {
+        Start-Service w32time -ErrorAction SilentlyContinue
+    }
+    w32tm /config /syncfromflags:manual /manualpeerlist:"0.pool.ntp.org,1.pool.ntp.org,2.pool.ntp.org,3.pool.ntp.org" /update 2>$null
+    Restart-Service w32time -Force -ErrorAction SilentlyContinue
+    w32tm /resync 2>$null
+} else {
+    Write-Host "[!] w32time service not found (common on slim ISOs) - skipping NTP sync" -ForegroundColor Yellow
+}
 
 # ==================================
 
@@ -147,6 +159,96 @@ if (Test-Path $diagTrackPath) {
 $profilePath = "HKLM:\SYSTEM\CurrentControlSet\Control\IDConfigDB\Hardware Profiles\0001"
 if (Test-Path $profilePath) {
     Set-ItemProperty -Path $profilePath -Name 'HwProfileGuid' -Type String -Value "{$([guid]::NewGuid().ToString())}" -Force -ErrorAction SilentlyContinue
+}
+
+# ==================================
+
+
+
+# ========== Windows Update PingID ==========
+
+$wuPingPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate"
+if (Test-Path $wuPingPath) {
+    Set-ItemProperty -Path $wuPingPath -Name 'PingID' -Type String -Value "$([guid]::NewGuid().ToString())" -Force -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $wuPingPath -Name 'AccountDomainSid' -Type String -Value "S-1-5-21-$(Get-Random -Max 999999999)-$(Get-Random -Max 999999999)-$(Get-Random -Max 999999999)" -Force -ErrorAction SilentlyContinue
+}
+
+# ==================================
+
+
+
+# ========== AdvertisingInfo ==========
+
+$adInfoPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo"
+if (Test-Path $adInfoPath) {
+    Set-ItemProperty -Path $adInfoPath -Name 'Id' -Type String -Value "$([guid]::NewGuid().ToString())" -Force -ErrorAction SilentlyContinue
+} else {
+    New-Item -Path $adInfoPath -Force | Out-Null
+    Set-ItemProperty -Path $adInfoPath -Name 'Id' -Type String -Value "$([guid]::NewGuid().ToString())" -Force
+}
+
+# ==================================
+
+
+# ========== Network Profile Cleanup ==========
+
+# Network profiles persist across reboots and contain GUIDs, timestamps, and MACs
+# that can be used for cross-session fingerprinting by anti-cheat systems.
+$nlProfiles = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles"
+if (Test-Path $nlProfiles) {
+    Get-ChildItem -Path $nlProfiles -ErrorAction SilentlyContinue | ForEach-Object {
+        Set-ItemProperty -Path $_.PSPath -Name 'ProfileGuid' -Type String -Value "{$([guid]::NewGuid().ToString())}" -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Network signatures contain MAC addresses and SSIDs that fingerprint the environment
+$nlSignatures = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures"
+if (Test-Path $nlSignatures) {
+    Get-ChildItem -Path $nlSignatures -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ==================================
+
+
+
+# ========== SMBIOS Registry Validation ==========
+
+# Verify HKLM:\HARDWARE\DESCRIPTION\System\BIOS doesn't contain VM strings.
+# These values are populated at boot from SMBIOS tables — if the patched QEMU
+# provides correct SMBIOS, they should be clean. Detection tools (VMAware,
+# pafish, al-khaser) scan this path directly.
+$biosRegPath = "HKLM:\HARDWARE\DESCRIPTION\System\BIOS"
+$vmBiosStrings = @("QEMU", "BOCHS", "VBOX", "Virtual Machine", "VMware", "SeaBIOS", "OVMF", "innotek")
+if (Test-Path $biosRegPath) {
+    $biosProps = Get-ItemProperty -Path $biosRegPath -ErrorAction SilentlyContinue
+    $leaked = $false
+    foreach ($prop in $biosProps.PSObject.Properties) {
+        if ($prop.Value -is [string]) {
+            foreach ($vmStr in $vmBiosStrings) {
+                if ($prop.Value -match [regex]::Escape($vmStr)) {
+                    Write-Host "[!] BIOS leak: $($prop.Name) contains '$vmStr' - SMBIOS spoofing may not be active" -ForegroundColor Red
+                    $leaked = $true
+                }
+            }
+        }
+    }
+    if (-not $leaked) {
+        Write-Host "[+] SMBIOS registry validation passed (no VM strings detected)" -ForegroundColor Green
+    }
+}
+
+# ==================================
+
+
+
+# ========== Telemetry Device ID ==========
+
+# Microsoft.Windows.DeviceMetadataRetrievalClient uses this for device identification
+$deviceMetaPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata"
+if (Test-Path $deviceMetaPath) {
+    Set-ItemProperty -Path $deviceMetaPath -Name 'DeviceMetadataServiceURL' -Type String -Value "" -Force -ErrorAction SilentlyContinue
 }
 
 # ==================================

@@ -27,6 +27,15 @@ $classRoot     = "HKLM:\SYSTEM\CurrentControlSet\Control\Class"
 # Expanded signature list covering QEMU, VirtIO, Bochs, VirtualBox, VMware (legacy),
 # and Red Hat device/vendor IDs. v10.2.1 changed PCI-IDs for stdvga/vmware/virtio-gpu,
 # but older artifacts may still exist from previous installs.
+#
+# v10.2.1 PCI-ID changes (these are the NEW patched values — NOT targeted here):
+#   Standard VGA: no longer 0x1234 (patched to non-detectable value)
+#   VMware compat: no longer 0x15ad (patched to non-detectable value)
+#   VirtIO-GPU:    no longer 0x1af4 (patched to non-detectable value)
+# We target the OLD stock QEMU IDs below to clean up artifacts from:
+#   - Initial Windows PnP device enumeration during install
+#   - Previous unpatched QEMU installs
+#   - Cached driver store entries from VirtIO/QEMU guest tools
 $searchStrings = @(
     "VEN_1AF4",        # Red Hat (VirtIO)
     "DEV_1B36",        # QEMU PCIe bridge / Spice display
@@ -51,7 +60,10 @@ $searchStrings = @(
     "KVMKVMKVM",      # KVM hypervisor CPUID signature residue
     "DEV_1100",        # QEMU PCIe Host Bridge device ID
     "pvpanic",         # QEMU PV Panic device
-    "qemufwcfg"        # QEMU fw_cfg device driver
+    "qemufwcfg",       # QEMU fw_cfg device driver
+    "QXL",             # QXL display adapter
+    "Balloon",         # QEMU memory balloon device service
+    "viogpu"           # VirtIO GPU display adapter
 )
 
 function Remove-KeysMatching {
@@ -110,7 +122,7 @@ if (Test-Path $scsiRoot) {
 # Clean DriverStore FileRepository — remove VirtIO/QEMU driver packages
 $driverStore = "$env:SystemRoot\System32\DriverStore\FileRepository"
 if (Test-Path $driverStore) {
-    $driverPatterns = @("vio*", "qemu*", "balloon*", "virtio*", "red_hat*", "netkvm*", "pvpanic*", "spice*")
+    $driverPatterns = @("vio*", "qemu*", "balloon*", "virtio*", "red_hat*", "netkvm*", "pvpanic*", "spice*", "qxl*", "viogpu*")
     foreach ($pattern in $driverPatterns) {
         Get-ChildItem -Path $driverStore -Directory -Filter $pattern -ErrorAction SilentlyContinue | ForEach-Object {
             try {
@@ -157,6 +169,75 @@ if (Test-Path $prefetchDir) {
         Get-ChildItem -Path $prefetchDir -Filter $pfPattern -ErrorAction SilentlyContinue |
             ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; Write-Host "Deleted prefetch: $($_.Name)" }
     }
+}
+
+# Clean Task Scheduler tasks that may reference VM tools
+$vmTaskPatterns = @('*QEMU*', '*VirtIO*', '*Spice*', '*qemu-ga*', '*balloon*')
+foreach ($pattern in $vmTaskPatterns) {
+    Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like $pattern } | ForEach-Object {
+        try { Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction Stop; Write-Host "Removed task: $($_.TaskName)" }
+        catch { Write-Host "Failed to remove task: $($_.TaskName)" }
+    }
+}
+
+# Validate BIOS/SMBIOS registry entries for residual VM strings
+# Detection tools (VMAware, pafish, al-khaser) scan this path directly rather than
+# doing live SMBIOS queries — values are populated at boot from SMBIOS tables.
+# If the patched QEMU provides correct SMBIOS, these should be clean. Log warnings
+# for any that still contain VM-identifying strings.
+$biosRegPath = "HKLM:\HARDWARE\DESCRIPTION\System\BIOS"
+$vmBiosStrings = @("QEMU", "BOCHS", "VBOX", "Virtual", "VMware", "SeaBIOS", "OVMF", "KVM", "Red Hat", "innotek")
+if (Test-Path $biosRegPath) {
+    $biosProps = Get-ItemProperty -Path $biosRegPath -ErrorAction SilentlyContinue
+    foreach ($prop in $biosProps.PSObject.Properties) {
+        if ($prop.Value -is [string]) {
+            foreach ($vmStr in $vmBiosStrings) {
+                if ($prop.Value -match [regex]::Escape($vmStr)) {
+                    Write-Host "WARNING: BIOS registry leak: $($prop.Name) = $($prop.Value) (contains '$vmStr')" -ForegroundColor Red
+                }
+            }
+        }
+    }
+}
+
+# Validate processor registry (CPUID brand string cache)
+# Windows caches CPU brand string at HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0
+# With cpu host + hypervisor=off, this should show the real host CPU.
+$cpuRegPath = "HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0"
+if (Test-Path $cpuRegPath) {
+    $cpuName = (Get-ItemProperty -Path $cpuRegPath -Name "ProcessorNameString" -ErrorAction SilentlyContinue).ProcessorNameString
+    if ($cpuName -and ($cpuName -match "QEMU|Virtual|KVM")) {
+        Write-Host "WARNING: CPU registry leak: ProcessorNameString = $cpuName" -ForegroundColor Red
+    }
+}
+
+# Clean setupapi logs — device installation traces that record VM hardware PnP events
+# These logs can reveal that VirtIO/QEMU devices were enumerated during install
+$setupApiLogs = @(
+    "$env:SystemRoot\INF\setupapi.dev.log",
+    "$env:SystemRoot\INF\setupapi.app.log",
+    "$env:SystemRoot\INF\setupapi.dev.log.old",
+    "$env:SystemRoot\INF\setupapi.app.log.old"
+)
+foreach ($log in $setupApiLogs) {
+    if (Test-Path $log) {
+        try {
+            Remove-Item $log -Force -ErrorAction Stop
+            Write-Host "Deleted setup log: $log"
+        } catch {
+            # Log may be locked by a service — truncate instead
+            try { Set-Content -Path $log -Value "" -Force -ErrorAction Stop; Write-Host "Truncated setup log: $log" }
+            catch { Write-Host "Failed to clean: $log" }
+        }
+    }
+}
+
+# Clean Windows Error Reporting (WER) reports that may reference VM hardware
+$werDir = "$env:ProgramData\Microsoft\Windows\WER"
+if (Test-Path $werDir) {
+    Get-ChildItem -Path $werDir -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match "QEMU|VirtIO|BOCHS|VBOX|balloon" } |
+        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; Write-Host "Deleted WER report: $($_.Name)" }
 }
 '@
 

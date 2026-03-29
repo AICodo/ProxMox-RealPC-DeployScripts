@@ -6,6 +6,8 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     exit 1
 }
 
+Write-Host "[*] EDID Spoofer: Randomizing monitor serial numbers..." -ForegroundColor Cyan
+
 # Get monitors via WMI for full EDID data
 $wmiMonitors = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorDescriptorMethods
 
@@ -30,8 +32,14 @@ foreach ($wmiMon in $wmiMonitors) {
     # --- 2. Modify Base Block ---
     $targetBlock = $edidBlocks[0]
 
-	# EDID[12–15]: Manufacturer-assigned ID Serial Number zeroed
-    $targetBlock[12] = $targetBlock[13] = $targetBlock[14] = $targetBlock[15] = 0
+	# EDID[12–15]: Manufacturer-assigned ID Serial Number randomized
+	# Non-zero random serial is more realistic than zeroed (zero = "no serial assigned")
+    $targetBlock[12] = Get-Random -Maximum 256
+    $targetBlock[13] = Get-Random -Maximum 256
+    $targetBlock[14] = Get-Random -Maximum 256
+    $targetBlock[15] = Get-Random -Maximum 256
+    # Ensure not all zero (zero = "no serial" which is suspicious for named monitors)
+    if (($targetBlock[12] -bor $targetBlock[13] -bor $targetBlock[14] -bor $targetBlock[15]) -eq 0) { $targetBlock[12] = 1 }
 
 	# EDID[54–125]: Display Descriptor Type 0xFF (Monitor Serial Number) zeroed (18-byte descriptors)
 	foreach ($off in 54, 72, 90, 108) {
@@ -41,11 +49,19 @@ foreach ($wmiMon in $wmiMonitors) {
 			$targetBlock[$off + 2] -eq 0x00 -and
 			$targetBlock[$off + 3] -eq 0xFF
 		) {
-			# Convert serial number descriptor to dummy descriptor (tag 0x10)
-			# Zeroing all 18 bytes sets tag to 0x00 which is reserved/undefined in EDID 1.3;
-			# tag 0x10 (Dummy Descriptor) is the spec-correct way to blank a descriptor slot.
-			$targetBlock[$off + 3] = 0x10
-			for ($j = $off + 4; $j -lt $off + 18; $j++) { $targetBlock[$j] = 0x00 }
+			# Randomize serial string in the 0xFF descriptor instead of blanking to 0x10 (dummy).
+			# A blank/dummy descriptor says "no serial" — suspicious for real monitors.
+			# Random 7-char alphanumeric serial is realistic and defeats cross-session fingerprinting.
+			$chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+			$serial = -join ($chars.ToCharArray() | Get-Random -Count 7)
+			# EDID 0xFF descriptor: [off+4]=reserved, [off+5..off+17]=13 bytes serial text
+			# Format: serial chars + 0x0A terminator + 0x20 padding
+			$targetBlock[$off + 4] = 0x00
+			for ($j = 0; $j -lt 13; $j++) {
+				if ($j -lt $serial.Length) { $targetBlock[$off + 5 + $j] = [byte][char]$serial[$j] }
+				elseif ($j -eq $serial.Length) { $targetBlock[$off + 5 + $j] = 0x0A }
+				else { $targetBlock[$off + 5 + $j] = 0x20 }
+			}
 		}
 	}
 
@@ -71,7 +87,10 @@ foreach ($wmiMon in $wmiMonitors) {
     }
 }
 
+Write-Host "[+] EDID override written for all detected monitors." -ForegroundColor Green
+
 # --- 4. Restart Graphics Driver ---
+Write-Host "[*] Restarting graphics driver to apply EDID changes..." -ForegroundColor Cyan
 Get-PnpDevice -Class Display | Where-Object { $_.Status -eq 'OK' } |
 ForEach-Object {
     try {

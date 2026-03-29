@@ -279,7 +279,14 @@ download_asset() {
     fi
     info "Downloading ${name} ..."
     wget -q --show-progress -O "$dest" "${BASE_URL}/${name}" || fail "Failed to download ${name}"
-    ok "Downloaded: ${name}"
+    # Validate download — GitHub error pages are ~10KB of HTML, not real assets
+    local fsize
+    fsize=$(stat -c%s "$dest" 2>/dev/null || echo "0")
+    if [[ "$fsize" -lt 50 ]]; then
+        rm -f "$dest"
+        fail "Downloaded ${name} is too small (${fsize} bytes) — likely a download error"
+    fi
+    ok "Downloaded: ${name} (${fsize} bytes)"
 }
 
 ###############################################################################
@@ -366,7 +373,14 @@ download_debian_asset() {
     fi
     info "Downloading ${name} (debian release) ..."
     wget -q --show-progress -O "$dest" "${DEBIAN_URL}/${name}" || fail "Failed to download ${name} from Debian release"
-    ok "Downloaded: ${name} (debian)"
+    # Validate download — reject truncated files or error pages
+    local fsize
+    fsize=$(stat -c%s "$dest" 2>/dev/null || echo "0")
+    if [[ "$fsize" -lt 50 ]]; then
+        rm -f "$dest"
+        fail "Downloaded ${name} (debian) is too small (${fsize} bytes) — likely a download error"
+    fi
+    ok "Downloaded: ${name} (debian, ${fsize} bytes)"
 }
 
 if [[ "$SKIP_DOWNLOAD" == true ]]; then
@@ -1100,3 +1114,9 @@ _bx "$GREEN" "To restore stock: apt-mark unhold pve-qemu-kvm"
 _bx "$GREEN" "                  apt reinstall pve-qemu-kvm"
 _bx "$GREEN" "                  apt reinstall pve-edk2-firmware-ovmf"
 echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+echo ""
+if [[ "$NEEDS_REBOOT" == true ]]; then
+    warn "Reboot now, then run: bash pve-realpc-deploy-vm.sh"
+else
+    info "Ready! Next step: bash pve-realpc-deploy-vm.sh"
+fi

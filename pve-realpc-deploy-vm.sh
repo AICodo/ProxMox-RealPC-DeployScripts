@@ -10,7 +10,7 @@
 # Default config (matches upstream exactly):
 #   - OVMF + Q35 machine type (patched Strong OVMF firmware)
 #   - SATA disk with custom serial
-#   - e1000e NIC with realistic MAC prefix (Intel 82574L)
+#   - e1000 NIC with realistic MAC prefix (Intel 82540EM)
 #   - Full SMBIOS spoofing (types 0,1,2,3,4,8,9,17)
 #   - Custom ACPI tables (ssdt.aml, ssdt-ec.aml, hpet.aml)
 #   - CPU: host with hypervisor=off (binary handles CPUID/KVM hiding)
@@ -237,6 +237,12 @@ case "$CPU_TYPE" in
     *) fail "Invalid --type '${CPU_TYPE}'. Use: desktop | laptop" ;;
 esac
 
+# Validate --vga type
+case "$VGA" in
+    std|vmware|none|virtio) ;;
+    *) fail "Invalid --vga '${VGA}'. Use: std | vmware | none | virtio" ;;
+esac
+
 # Normalize --iso-type to lowercase
 if [[ -n "$ISO_TYPE" ]]; then
     ISO_TYPE=$(echo "$ISO_TYPE" | tr '[:upper:]' '[:lower:]')
@@ -246,6 +252,20 @@ fi
 case "$MEMORY" in
     4096|8192|16384) ;;
     *) warn "Memory ${MEMORY}MB is non-standard. Realistic values: 4096, 8192, 16384. Proceeding anyway." ;;
+esac
+
+# ─── CRITICAL: Validate --ostype for S3/S4 compatibility ────────────────────
+# PVE injects -global ICH9-LPC.disable_s3=1 and disable_s4=1 for guest types
+# l26, win10, win11 etc. This OVERRIDES our explicit disable_s3=0 / disable_s4=0
+# in the args line, breaking VMAware POWER_CAPABILITIES detection (45pts).
+# Only ostype=other avoids PVE's forced S3/S4 disablement.
+case "$OSTYPE" in
+    other) ;;
+    *)
+        warn "OSTYPE '${OSTYPE}' causes PVE to inject ICH9-LPC.disable_s3=1 and disable_s4=1."
+        warn "This OVERRIDES our S3/S4 enablement args and breaks POWER_CAPABILITIES detection (45pts VMAware)."
+        warn "Recommended: use --ostype other (default). Proceeding anyway."
+        ;;
 esac
 
 # Validate ACPI files exist
@@ -460,11 +480,28 @@ if [[ -z "$SMBIOS_CPU_VERSION" ]]; then
     if [[ -n "$CPU_MODEL" ]]; then
         if [[ "$HOST_CPU_VENDOR" == "amd" ]]; then
             # e.g., "AMD Ryzen 9 7950X 16-Core Processor" → "AMD Ryzen 9 0000"
-            # Also handles: Ryzen Threadripper, Ryzen PRO, EPYC
-            SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(AMD Ryzen (Threadripper |PRO )?[0-9]+ ).*/\10000/')
+            # Handles: Threadripper [PRO], Ryzen AI, Ryzen [PRO] [3/5/7/9], EPYC
+            # Threadripper first (model number directly follows "Threadripper [PRO ]")
+            SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(AMD Ryzen Threadripper( PRO)? ).*/\10000/')
+            # Ryzen AI (e.g. "AMD Ryzen AI 9 HX 370" → "AMD Ryzen AI 9 0000")
+            if [[ "$SMBIOS_CPU_VERSION" == "$CPU_MODEL" ]]; then
+                SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(AMD Ryzen AI [0-9]+ ).*/\10000/')
+            fi
+            # Standard Ryzen with tier number (e.g. "AMD Ryzen 9 7950X3D" → "AMD Ryzen 9 0000")
+            if [[ "$SMBIOS_CPU_VERSION" == "$CPU_MODEL" ]]; then
+                SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(AMD Ryzen (PRO )?[0-9]+ ).*/\10000/')
+            fi
             # Fallback for EPYC and other AMD CPUs
             if [[ "$SMBIOS_CPU_VERSION" == "$CPU_MODEL" ]]; then
                 SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(AMD EPYC ).*/\10000/')
+            fi
+            # AMD Athlon (e.g., "AMD Athlon Gold 3150U" → "AMD Athlon 0000")
+            if [[ "$SMBIOS_CPU_VERSION" == "$CPU_MODEL" ]]; then
+                SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(AMD Athlon ).*/\10000/')
+            fi
+            # AMD A-Series (e.g., "AMD A10-7800" → "AMD 0000")
+            if [[ "$SMBIOS_CPU_VERSION" == "$CPU_MODEL" ]]; then
+                SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(AMD A[0-9]+-).*/AMD 0000/')
             fi
             [[ "$SMBIOS_CPU_VERSION" == "$CPU_MODEL" ]] && SMBIOS_CPU_VERSION="AMD 0000"
         else
@@ -482,6 +519,20 @@ if [[ -z "$SMBIOS_CPU_VERSION" ]]; then
                 else
                     SMBIOS_CPU_VERSION="Genuine Intel(R) 0000"
                 fi
+            elif echo "$CPU_MODEL" | grep -qiP 'Xeon'; then
+                # Intel Xeon (e.g., "Intel(R) Xeon(R) w5-3435X" → "Intel(R) Xeon(R) 0000")
+                SMBIOS_CPU_VERSION=$(echo "$CPU_MODEL" | sed -E 's/(Intel.*Xeon[^[:space:]]*).*/\1 0000/')
+                [[ "$SMBIOS_CPU_VERSION" == "$CPU_MODEL" ]] && SMBIOS_CPU_VERSION="Intel(R) Xeon(R) 0000"
+            elif echo "$CPU_MODEL" | grep -qP 'Intel.*N[0-9]'; then
+                # Intel N-series (e.g., "Intel(R) N100" → "Intel(R) N 0000")
+                SMBIOS_CPU_VERSION="Intel(R) N 0000"
+            elif echo "$CPU_MODEL" | grep -qiP 'Pentium|Celeron'; then
+                # Intel Pentium/Celeron (e.g., "Intel(R) Celeron(R) N5105" → "Intel(R) Celeron(R) 0000")
+                BRAND=$(echo "$CPU_MODEL" | grep -oiP 'Pentium|Celeron' | head -1)
+                SMBIOS_CPU_VERSION="Intel(R) ${BRAND}(R) 0000"
+            elif echo "$CPU_MODEL" | grep -qiP 'Core.*i[3579]-'; then
+                # Older Intel Core without Gen prefix (e.g., "Intel(R) Core(TM) i7-6700K")
+                SMBIOS_CPU_VERSION="Intel(R) Core(TM) 0000"
             else
                 SMBIOS_CPU_VERSION="Genuine Intel(R) 0000"
             fi
@@ -500,6 +551,10 @@ fi
 if [[ -z "$DISK_SERIAL" ]]; then
     DISK_SERIAL=$(random_serial_20)
     info "Generated disk serial: ${DISK_SERIAL}"
+fi
+# Upstream expects exactly 20-character SATA disk serials
+if [[ ${#DISK_SERIAL} -ne 20 ]]; then
+    warn "Disk serial is ${#DISK_SERIAL} chars (upstream expects 20). May look non-standard."
 fi
 if [[ -z "$MEM_SERIAL" ]]; then
     MEM_SERIAL=$(random_hex 8)
@@ -824,6 +879,8 @@ info "═══ Creating VM ${VMID} (${VM_NAME}) ═══"
 
 # Step 1: Create base VM with OVMF + Q35
 # --cores goes directly to PVE cores: — NO SMP override in args
+# NIC: e1000 (Intel 82540EM) — matches upstream for compatibility.
+# The Debian release includes a patched efi-e1000.rom boot ROM.
 info "Creating base VM ..."
 qm create "$VMID" \
     --name "$VM_NAME" \
@@ -836,7 +893,7 @@ qm create "$VMID" \
     --memory "$MEMORY" \
     --balloon 0 \
     --numa 0 \
-    --net0 "e1000e,bridge=${BRIDGE},firewall=${FIREWALL}" \
+    --net0 "e1000,bridge=${BRIDGE},firewall=${FIREWALL}" \
     --vga "$VGA" \
     --localtime 1
 
@@ -848,6 +905,13 @@ ok "Base VM created"
 SYS_UUID=$(cat /proc/sys/kernel/random/uuid)
 SMBIOS1_LINE="uuid=${SYS_UUID}"
 info "Prepared SMBIOS type=1 (uuid=${SYS_UUID})"
+
+# Generate vmgenid (VM Generation ID) to match upstream config.
+# This Microsoft-defined GUID changes on snapshot restore / migration, which is
+# how Windows detects unsafe VM replays (important for Secure Boot, licensing).
+# Upstream includes it explicitly; PVE auto-generates one but we set it to ensure
+# it's present in the conf file for transparency.
+VMGENID=$(cat /proc/sys/kernel/random/uuid)
 
 # Step 2: Add EFI disk
 # Do NOT use pre-enrolled-keys — the patched Strong OVMF firmware handles
@@ -1065,6 +1129,7 @@ TMP_CONF=$(mktemp /tmp/pve-vm-XXXXXX.conf)
 {
     echo "args: ${FULL_ARGS}"
     echo "smbios1: ${SMBIOS1_LINE}"
+    echo "vmgenid: ${VMGENID}"
     # Only add affinity if explicitly requested via --affinity
     if [[ -n "$AFFINITY" ]]; then
         echo "affinity: ${AFFINITY}"
@@ -1074,7 +1139,7 @@ TMP_CONF=$(mktemp /tmp/pve-vm-XXXXXX.conf)
 cp "$TMP_CONF" "$CONF_FILE"
 rm -f "$TMP_CONF"
 
-ok "Anti-detection args + SMBIOS type=1 written to config"
+ok "Anti-detection args + SMBIOS type=1 + vmgenid written to config"
 
 ###############################################################################
 # Final verification — display the config
@@ -1101,7 +1166,7 @@ echo -e "${GREEN}║    ✓ EFI NVRAM: host variables injected (real Secure Boot
 echo -e "${GREEN}║    ✓ ACPI PCI hotplug disabled (no hotplug fingerprint)       ║${NC}"
 echo -e "${GREEN}║    ✓ S3/S4 sleep states enabled (defeats POWER_CAPABILITIES) ║${NC}"
 echo -e "${GREEN}║    ✓ PIT SSDT loaded (defeats SYSTEM_TIMERS / CLOCK)          ║${NC}"
-echo -e "${GREEN}║    ✓ e1000e NIC with realistic MAC (Intel 82574L PCIe)       ║${NC}"
+echo -e "${GREEN}║    ✓ e1000 NIC with realistic MAC (Intel 82540EM)            ║${NC}"
 echo -e "${GREEN}║    ✓ SATA disk with custom serial (no virtio)                ║${NC}"
 echo -e "${GREEN}║    ✓ Balloon disabled                                        ║${NC}"
 if [[ -n "$AFFINITY" ]]; then
@@ -1165,7 +1230,7 @@ SUMMARY_FILE="/root/vm-${VMID}-deploy-summary.txt"
     echo "Memory     : ${MEMORY}MB"
     echo "Disk       : ${DISK_SIZE} on ${DISK_STORAGE}"
     echo "VGA        : ${VGA}"
-    echo "NIC        : e1000e on ${BRIDGE}"
+    echo "NIC        : e1000 on ${BRIDGE}"
     echo "ISO        : ${ISO_FILE:-none}"
     if [[ -n "$AFFINITY" ]]; then
         echo "Affinity   : ${AFFINITY}"
