@@ -349,8 +349,13 @@ releases_of_kind() {
 }
 
 # Best-effort pick: first line matching KIND (= newest of that kind).
+# Calls awk directly with `{print; exit}` rather than piping releases_of_kind
+# through `head -1` — `head` closing its stdin after one line would SIGPIPE
+# the upstream awk and abort the pipeline under `set -euo pipefail`.
 latest_of_kind() {
-    releases_of_kind "$1" | head -1
+    local kind="$1"
+    [[ -f "$RELEASE_CACHE" ]] || return 1
+    awk -F'|' -v k="$kind" '$1 == k {print; exit}' "$RELEASE_CACHE"
 }
 
 # Pretty-print a release line for menu labels.
@@ -373,7 +378,9 @@ release_summary() {
 # Sets the install-time variables from user choices instead of hard-coded
 # constants. Anything the user explicitly passed via flag is preserved; the
 # interactive prompts only fire for fields that weren't pre-set on the CLI.
-INTERACTIVE_MODE=auto       # auto | force | off — see flag parser
+# (INTERACTIVE_MODE is declared and parsed above in the flag-parser block —
+# do NOT re-assign it here or --interactive / --non-interactive get silently
+# clobbered back to "auto".)
 WT_BACK="PVE RealPC Setup"  # whiptail --backtitle
 
 # whiptail wrappers — soft-fail back to plain read if whiptail is missing.

@@ -16,7 +16,18 @@ net session >nul 2>&1
 if %errorlevel% equ 0 goto :admin_ok
 
 echo [!] Requesting Administrator privileges...
-powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList 'elevated' -Verb RunAs"
+:: Use try/catch with -ErrorAction Stop so we can distinguish "UAC accepted"
+:: (Start-Process returns) from "UAC cancelled / system blocked elevation"
+:: (Start-Process throws Win32Exception). Propagate the failure as exit 1 so
+:: callers (CI, double-clickers chained from another launcher) get a clear
+:: signal rather than a silent no-op.
+powershell -NoProfile -Command "try { Start-Process -FilePath '%~f0' -ArgumentList 'elevated' -Verb RunAs -ErrorAction Stop } catch { Write-Host ('[X] Elevation failed: ' + $_); exit 1 }"
+if %errorlevel% neq 0 (
+    echo [X] Elevation was cancelled or blocked. Nothing was run.
+    echo     Right-click run-tools.bat and pick "Run as administrator" to retry.
+    pause
+    exit /b 1
+)
 exit /b 0
 
 :admin_ok

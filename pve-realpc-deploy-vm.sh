@@ -814,7 +814,8 @@ if [[ "$IGPU_PASSTHROUGH" == true ]]; then
         # consumer/server x86 host). This avoids accidentally selecting a
         # discrete Intel Arc / AMD Radeon at 03:00.0 when the host also has
         # an iGPU at 00:02.0 — passing a dGPU with IGD-mode flags is fatal.
-        local _lspci_out
+        # NOTE: `local` is only valid inside a function — this if-block lives at
+        # script top level under `set -e`, so we just use a regular variable.
         _lspci_out=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA|Display' || true)
         # Intel iGPU
         IGPU_PCI=$(echo "$_lspci_out" | grep -i Intel | awk '$1 ~ /^0000:00:/ {print $1; exit}')
