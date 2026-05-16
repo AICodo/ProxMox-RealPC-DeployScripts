@@ -1,3 +1,19 @@
+# edid-spoofer.ps1 — Randomise monitor EDID serial fields
+#
+# Structure mirrors Scrut1ny/AutoVirt's EDID_OVERRIDE.ps1 (WMI raw EDID fetch ->
+# in-memory mutation -> EDID_OVERRIDE registry write -> driver disable/enable).
+# Deliberate differences:
+#   * Bytes 12-15 (manufacturer-assigned serial): AutoVirt zeroes them. We
+#     randomise to a non-zero value because an all-zero serial on a monitor
+#     that advertises a model name reads as "no serial assigned" which is
+#     itself a signal. Guarded so we never produce 0,0,0,0 by accident.
+#   * 0xFF descriptors at 54/72/90/108 (monitor serial string): AutoVirt wipes
+#     them to 0x00 (treated as a dummy descriptor). We write a realistic
+#     7-char A-Z0-9 string + 0x0A terminator + 0x20 padding, matching how real
+#     monitors encode this descriptor.
+#   * Driver-restart sleep is 3 s (matches AutoVirt — 500 ms is too short on
+#     multi-monitor / slower hosts and leaves the override unapplied).
+
 $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]$identity
 
@@ -8,8 +24,14 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 Write-Host "[*] EDID Spoofer: Randomizing monitor serial numbers..." -ForegroundColor Cyan
 
-# Get monitors via WMI for full EDID data
-$wmiMonitors = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorDescriptorMethods
+# Get monitors via WMI for full EDID data. Some debloated ISOs (tiny11/ghost)
+# strip the WmiMonitorDescriptorMethods provider — handle that gracefully
+# rather than crashing with a "term not recognized" terminating error.
+$wmiMonitors = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorDescriptorMethods -ErrorAction SilentlyContinue
+if (-not $wmiMonitors) {
+    Write-Host "[!] WmiMonitorDescriptorMethods unavailable (stripped on slim ISO?); skipping EDID spoof." -ForegroundColor Yellow
+    exit 0
+}
 
 foreach ($wmiMon in $wmiMonitors) {
     # --- 1. Fetch Full EDID (Base + Extensions) ---
@@ -17,6 +39,13 @@ foreach ($wmiMon in $wmiMonitors) {
 		$block0 = [byte[]](Invoke-CimMethod -InputObject $wmiMon -MethodName WmiGetMonitorRawEEdidV1Block -Arguments @{ BlockId = 0 }).BlockContent
 		if (-not $block0) { continue }
 	} catch { continue }
+
+    # A real base EDID block is exactly 128 bytes; anything shorter is a stub
+    # we cannot safely mutate (writing past the end throws IndexOutOfRange).
+    if ($block0.Length -lt 128) {
+        Write-Host "[!] EDID block too short ($($block0.Length) bytes) for $($wmiMon.InstanceName); skipping." -ForegroundColor Yellow
+        continue
+    }
 
     # Initialize block list
     $edidBlocks = @(,$block0)
@@ -31,6 +60,7 @@ foreach ($wmiMon in $wmiMonitors) {
 
     # --- 2. Modify Base Block ---
     $targetBlock = $edidBlocks[0]
+    if ($null -eq $targetBlock -or $targetBlock.Length -lt 128) { continue }
 
 	# EDID[12–15]: Manufacturer-assigned ID Serial Number randomized
 	# Non-zero random serial is more realistic than zeroed (zero = "no serial assigned")
@@ -90,12 +120,15 @@ foreach ($wmiMon in $wmiMonitors) {
 Write-Host "[+] EDID override written for all detected monitors." -ForegroundColor Green
 
 # --- 4. Restart Graphics Driver ---
+# Match AutoVirt's 3 second wait between disable and enable — 500ms is unreliable
+# on slower hosts / multi-monitor setups and the graphics stack can fail to
+# release / reattach cleanly, leaving the EDID override unapplied until reboot.
 Write-Host "[*] Restarting graphics driver to apply EDID changes..." -ForegroundColor Cyan
 Get-PnpDevice -Class Display | Where-Object { $_.Status -eq 'OK' } |
 ForEach-Object {
     try {
         Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Seconds 3
         Enable-PnpDevice  -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
     } catch {
         Write-Host "[!] Failed to restart display device $($_.InstanceId): $_" -ForegroundColor Yellow
