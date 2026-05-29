@@ -65,11 +65,26 @@ $ouiPrefixes = @('D8FC93', '3C2AF4', 'A4BB6D', '8CDFB0', '48B02D', 'B4969B')
 $oui = $ouiPrefixes | Get-Random
 $suffix = ('{0:X}' -f (Get-Random -Maximum 0xFFFFFF)).PadLeft(6, '0')
 $newMac = $oui + $suffix
-$adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1
-if ($adapter) {
-    Set-NetAdapter -Name $adapter.Name -MacAddress "$newMac" -Confirm:$false
+# Get-NetAdapter is missing on tiny11 / certain Server SKUs. Guard it.
+if (Get-Command Get-NetAdapter -ErrorAction SilentlyContinue) {
+    $adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1
+    if ($adapter) {
+        # Many emulated NICs (Intel e1000, virtio-net) refuse MAC change at the
+        # driver level. Wrap in try/catch so a refusal doesn't bring down the
+        # rest of the spoofer (ProductId / HardwareGUID / network profiles
+        # haven't run yet at this point).
+        try {
+            Set-NetAdapter -Name $adapter.Name -MacAddress $newMac -Confirm:$false -ErrorAction Stop
+            Write-Host "[+] MAC randomized to $newMac on $($adapter.Name)" -ForegroundColor Green
+        } catch {
+            Write-Host "[!] Adapter '$($adapter.Name)' driver refused MAC change: $_" -ForegroundColor Yellow
+            Write-Host "    (Common with e1000/virtio emulated NICs — not fatal; continuing.)" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "[!] No active network adapter found - skipping MAC change" -ForegroundColor Yellow
+    }
 } else {
-    Write-Host "[!] No active network adapter found - skipping MAC change" -ForegroundColor Yellow
+    Write-Host "[!] Get-NetAdapter cmdlet not available (debloated ISO?) - skipping MAC change" -ForegroundColor Yellow
 }
 
 # ==================================

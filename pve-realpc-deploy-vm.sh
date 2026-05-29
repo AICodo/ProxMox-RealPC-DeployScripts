@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 ###############################################################################
 # pve-realpc-deploy-vm.sh — Deploy a Perfect Anti-Detection Windows VM
 #
 # Creates a fully configured Proxmox VM matching the upstream AICodo/pve-emu-realpc
-# recommended configuration. The patched QEMU 10 binary handles most anti-detection
-# internally (timing, NVRAM, system timers, CPUID, etc.) — the args line is kept
-# intentionally minimal to avoid conflicting with the binary's built-in hiding.
+# recommended configuration. The patched QEMU 11 binary handles most anti-detection
+# internally (timing, NVRAM, system timers, CPUID, fw_cfg DMA signature, etc.) — the
+# args line is kept intentionally minimal to avoid conflicting with the binary's
+# built-in hiding.
 #
 # Default config (matches upstream exactly):
 #   - OVMF + Q35 machine type (patched Strong OVMF firmware)
@@ -46,7 +48,7 @@ ISO_FILE=""                      # Auto-detect if empty
 ISO_TYPE=""                      # "slim"|"stock"|"" for interactive picker
 BRIDGE="vmbr0"                   # Network bridge
 CPU_TYPE="desktop"               # "desktop" = ssdt.aml (no battery), "laptop" = ssdt-battery.aml
-VGA="vmware"                     # "std"|"vmware"|"none"|"virtio" (vmware recommended by upstream v10.2.1)
+VGA="vmware"                     # "std"|"vmware"|"none"|"virtio" (vmware recommended by upstream v10.2.1+ / v11)
 ADD_TPM=false                    # --tpm adds TPM 2.0 (upstream doesn't include it)
 AFFINITY=""                      # Empty = don't set; only written if --affinity passed
 IGPU_PASSTHROUGH=false           # --igpu enables iGPU passthrough (Intel or AMD)
@@ -112,7 +114,7 @@ while [[ $# -gt 0 ]]; do
 Usage: pve-realpc-deploy-vm.sh [OPTIONS]
 
 This script creates VMs using the EXACT args recommended by the upstream
-AICodo/pve-emu-realpc project. The patched QEMU 10 binary handles timing,
+AICodo/pve-emu-realpc project. The patched QEMU 11 binary handles timing,
 NVRAM, system timers, CPUID hiding, and topology INTERNALLY — extra args
 flags for those features are intentionally omitted to avoid conflicts.
 
@@ -129,7 +131,7 @@ VM Configuration:
   --iso-type TYPE      ISO type: slim|stock (auto-filter ISOs by type)
   --bridge NAME        Network bridge (default: vmbr0)
   --vga TYPE           VGA type: std|vmware|none|virtio (default: vmware)
-                         Recommended by upstream v10.2.1 (best 3D accel with GPU mirror)
+                         Recommended by upstream v10.2.1+ / v11 (best 3D accel with GPU mirror)
   --ostype TYPE        OS type: other|l26|win10|win11 (default: other)
   --tpm                Add TPM 2.0 device (upstream doesn't include this)
   --affinity RANGE     CPU affinity, e.g. 0-7 (default: none)
@@ -151,12 +153,12 @@ Identity Spoofing:
   --mem-speed SPEED      Memory speed in MT/s — enables full type=17 override
   --mem-part PART        Memory part number — enables full type=17 override
   --mem-asset ASSET      Memory asset tag — enables full type=17 override
-                         Without --mem-* flags, QEMU 10 simplified type=17 is used
+                         Without --mem-* flags, QEMU 10+/11 simplified type=17 is used
                          (serial+asset only; patched binary handles rest internally).
                          Any --mem-* flag switches to full format with all fields.
 
 Notes:
-  The patched QEMU 10 binary handles these INTERNALLY (do NOT add manually):
+  The patched QEMU 11 binary handles these INTERNALLY (do NOT add manually):
     - TSC frequency / pinning / invtsc
     - HPET, PIT, RTC system timers
     - KVM/hypervisor CPUID leaf hiding
@@ -197,6 +199,21 @@ fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
 require_root() {
     [[ $EUID -eq 0 ]] || fail "This script must be run as root."
 }
+
+# ─── VM-creation rollback ────────────────────────────────────────────────────
+# If we die between `qm create` and the end of the deploy flow (Ctrl-C, SIGTERM,
+# any `set -e` abort), tear down the half-built VM so the next run isn't stuck
+# on "VM already exists". Cleared at the very end on success.
+CLEANUP_VMID=""
+cleanup_partial_vm() {
+    local rc=$?
+    if [[ -n "$CLEANUP_VMID" ]]; then
+        warn "Deploy interrupted (exit ${rc}); destroying half-built VM ${CLEANUP_VMID}..."
+        qm stop "$CLEANUP_VMID" --skiplock 1 2>/dev/null || true
+        qm destroy "$CLEANUP_VMID" --purge 1 --destroy-unreferenced-disks 1 2>/dev/null || true
+    fi
+}
+trap cleanup_partial_vm ERR INT TERM HUP
 
 random_hex() {
     local len=$1
@@ -282,6 +299,24 @@ if (( QEMU_SIZE < 29000000 )); then
     warn "qemu-system-x86_64 seems to be stock (${QEMU_SIZE} bytes). Run pve-realpc-setup.sh first!"
 fi
 
+# ─── Validate / auto-detect disk storage ────────────────────────────────────
+# Default DISK_STORAGE=local-lvm doesn't exist on ZFS-only or Ceph-only PVE
+# installs. If the requested storage isn't usable, pick the first one that
+# advertises 'images' content and is active so the script works out of the box.
+storage_supports_images() {
+    local name="$1"
+    pvesm status -content images 2>/dev/null | awk -v n="$name" '$1 == n && $3 == "active" { found=1 } END { exit !found }'
+}
+if ! storage_supports_images "$DISK_STORAGE"; then
+    AUTO_STORAGE=$(pvesm status -content images 2>/dev/null | awk 'NR>1 && $3 == "active" { print $1; exit }')
+    if [[ -n "$AUTO_STORAGE" ]]; then
+        warn "Requested --disk-storage '${DISK_STORAGE}' not found or not active for images. Falling back to '${AUTO_STORAGE}'."
+        DISK_STORAGE="$AUTO_STORAGE"
+    else
+        fail "No active storage with 'images' content found. Pass --disk-storage NAME explicitly (see: pvesm status)."
+    fi
+fi
+
 ###############################################################################
 # Auto-detect values
 ###############################################################################
@@ -295,6 +330,21 @@ fi
 # Validate VMID is not already in use
 if qm status "$VMID" &>/dev/null; then
     fail "VM ${VMID} already exists. Use --vmid to specify a different ID."
+fi
+
+# ─── Auto-detect ISO storage if the requested one doesn't carry ISOs ────────
+storage_supports_iso() {
+    local name="$1"
+    pvesm status -content iso 2>/dev/null | awk -v n="$name" '$1 == n && $3 == "active" { found=1 } END { exit !found }'
+}
+if ! storage_supports_iso "$ISO_STORAGE"; then
+    AUTO_ISO_STORAGE=$(pvesm status -content iso 2>/dev/null | awk 'NR>1 && $3 == "active" { print $1; exit }')
+    if [[ -n "$AUTO_ISO_STORAGE" ]]; then
+        warn "Requested --iso-storage '${ISO_STORAGE}' not found or not active for ISOs. Falling back to '${AUTO_ISO_STORAGE}'."
+        ISO_STORAGE="$AUTO_ISO_STORAGE"
+    else
+        warn "No active storage with 'iso' content found. ISO attach will be skipped — attach manually after install."
+    fi
 fi
 
 # ─── ISO Selection ───────────────────────────────────────────────────────────
@@ -311,15 +361,18 @@ SLIM_PATTERNS="tiny11|tiny10|atlas|revi|ghost|spectre|slim|lite|compact|debloat|
 STOCK_PATTERNS="Win10|Win11|en-us_windows|en_windows|SW_DVD|MediaCreation"
 
 resolve_iso_path() {
-    local iso_dir="/var/lib/vz/template/iso"
-    if [[ "$ISO_STORAGE" != "local" ]]; then
-        # pvesm path needs a volume ID, not a directory — use a dummy filename
-        local resolved
-        resolved=$(pvesm path "${ISO_STORAGE}:iso/dummy.iso" 2>/dev/null || true)
-        if [[ -n "$resolved" ]]; then
-            iso_dir=$(dirname "$resolved")
+    # pvesm path needs a volume ID — use a dummy filename to learn the directory
+    local resolved iso_dir=""
+    resolved=$(pvesm path "${ISO_STORAGE}:iso/dummy.iso" 2>/dev/null || true)
+    if [[ -n "$resolved" ]]; then
+        iso_dir=$(dirname "$resolved")
+    fi
+    # Fall back to the conventional 'local' path only when we couldn't resolve
+    # AND the requested storage actually is 'local'.
+    if [[ -z "$iso_dir" || ! -d "$iso_dir" ]]; then
+        if [[ "$ISO_STORAGE" == "local" ]]; then
+            iso_dir="/var/lib/vz/template/iso"
         fi
-        [[ -d "$iso_dir" ]] || iso_dir="/var/lib/vz/template/iso"
     fi
     echo "$iso_dir"
 }
@@ -356,14 +409,15 @@ if [[ -z "$ISO_FILE" ]]; then
                         for i in "${!FILTERED[@]}"; do
                             echo -e "   ${CYAN}$((i+1))${NC}) ${FILTERED[$i]}"
                         done
-                        echo -ne "${CYAN}Select [1-${#FILTERED[@]}]:${NC} "
-                        read -r choice
-                        choice=$((choice - 1))
-                        if [[ $choice -ge 0 && $choice -lt ${#FILTERED[@]} ]]; then
-                            ISO_FILE="${FILTERED[$choice]}"
-                        else
-                            fail "Invalid selection."
-                        fi
+                        while true; do
+                            echo -ne "${CYAN}Select [1-${#FILTERED[@]}]:${NC} "
+                            read -r choice
+                            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#FILTERED[@]} )); then
+                                ISO_FILE="${FILTERED[$((choice-1))]}"
+                                break
+                            fi
+                            warn "Enter a number between 1 and ${#FILTERED[@]}."
+                        done
                         ok "Selected slim ISO: ${ISO_FILE}"
                     fi
                     ;;
@@ -385,14 +439,15 @@ if [[ -z "$ISO_FILE" ]]; then
                         for i in "${!FILTERED[@]}"; do
                             echo -e "   ${CYAN}$((i+1))${NC}) ${FILTERED[$i]}"
                         done
-                        echo -ne "${CYAN}Select [1-${#FILTERED[@]}]:${NC} "
-                        read -r choice
-                        choice=$((choice - 1))
-                        if [[ $choice -ge 0 && $choice -lt ${#FILTERED[@]} ]]; then
-                            ISO_FILE="${FILTERED[$choice]}"
-                        else
-                            fail "Invalid selection."
-                        fi
+                        while true; do
+                            echo -ne "${CYAN}Select [1-${#FILTERED[@]}]:${NC} "
+                            read -r choice
+                            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#FILTERED[@]} )); then
+                                ISO_FILE="${FILTERED[$((choice-1))]}"
+                                break
+                            fi
+                            warn "Enter a number between 1 and ${#FILTERED[@]}."
+                        done
                         ok "Selected stock ISO: ${ISO_FILE}"
                     fi
                     ;;
@@ -424,18 +479,23 @@ if [[ -z "$ISO_FILE" ]]; then
             done
             echo -e "   ${CYAN}0${NC})  Skip — no ISO (attach later)"
             echo ""
-            echo -ne "${CYAN}Select ISO [0-${#ALL_ISOS[@]}]:${NC} "
-            read -r choice
-
-            if [[ "$choice" == "0" ]]; then
-                ISO_FILE=""
-                warn "No ISO selected. Attach later: qm set ${VMID} -ide2 ${ISO_STORAGE}:iso/YOUR_ISO.iso,media=cdrom"
-            elif [[ $choice -ge 1 && $choice -le ${#ALL_ISOS[@]} ]]; then
-                ISO_FILE="${ALL_ISOS[$((choice-1))]}"
-                ok "Selected ISO: ${ISO_FILE}"
-            else
-                fail "Invalid selection."
-            fi
+            while true; do
+                echo -ne "${CYAN}Select ISO [0-${#ALL_ISOS[@]}, Enter = skip]:${NC} "
+                read -r choice
+                # Empty input = skip (treat as 0)
+                [[ -z "$choice" ]] && choice=0
+                if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice <= ${#ALL_ISOS[@]} )); then
+                    if (( choice == 0 )); then
+                        ISO_FILE=""
+                        warn "No ISO selected. Attach later: qm set ${VMID} -ide2 ${ISO_STORAGE}:iso/YOUR_ISO.iso,media=cdrom"
+                    else
+                        ISO_FILE="${ALL_ISOS[$((choice-1))]}"
+                        ok "Selected ISO: ${ISO_FILE}"
+                    fi
+                    break
+                fi
+                warn "Enter a number 0..${#ALL_ISOS[@]} (0 or Enter to skip)."
+            done
         fi
     fi
 fi
@@ -561,9 +621,15 @@ if [[ -z "$MEM_SERIAL" ]]; then
     info "Generated memory serial: ${MEM_SERIAL}"
 fi
 if [[ -z "$MEM_ASSET" ]]; then
-    MEM_ASSET=$(od -An -tu4 -N4 /dev/urandom | tr -d ' ' | head -c 10)
-    # Pad to 10 digits if urandom produced fewer
-    while [[ ${#MEM_ASSET} -lt 10 ]]; do MEM_ASSET+="0"; done
+    # Pull plenty of entropy and reduce to digits, then take 10 chars. Avoids
+    # the previous bug where trailing-zero padding produced a fingerprint-able
+    # pattern (e.g. "1234567800") when the digit pool was short.
+    MEM_ASSET=$(LC_ALL=C tr -dc '0-9' </dev/urandom | head -c 10)
+    # Left-pad with a random non-zero digit if for some reason we got fewer
+    # than 10 chars (shouldn't happen — /dev/urandom is unbounded).
+    while [[ ${#MEM_ASSET} -lt 10 ]]; do
+        MEM_ASSET="$(LC_ALL=C tr -dc '1-9' </dev/urandom | head -c 1)${MEM_ASSET}"
+    done
     info "Generated memory asset: ${MEM_ASSET}"
 fi
 
@@ -586,13 +652,23 @@ fi
 
 # Auto-detect threads per core
 if [[ "$THREADS_PER_CORE" -eq 0 ]] 2>/dev/null || [[ -z "$THREADS_PER_CORE" ]]; then
-    HOST_THREADS=$(lscpu 2>/dev/null | grep -i 'Thread(s) per core' | awk '{print $NF}')
-    if [[ -n "$HOST_THREADS" && "$HOST_THREADS" -ge 1 ]]; then
-        THREADS_PER_CORE="$HOST_THREADS"
-        info "Auto-detected host threads-per-core: ${THREADS_PER_CORE}"
-    else
+    # Intel Core Ultra (Arrow Lake / Lunar Lake) has NO Hyper-Threading on any
+    # core type, but lscpu can still report "Thread(s) per core: 2" on systems
+    # where the kernel detected SMT-capable silicon (mismatched between
+    # E-cores' 1-thread and P-cores' 1-thread Arrow-Lake configurations).
+    # Force threads=1 on these CPUs to avoid VMAware THREAD_MISMATCH detection.
+    if grep -qE 'Core\(TM\) Ultra' /proc/cpuinfo 2>/dev/null; then
         THREADS_PER_CORE=1
-        warn "Could not detect host threads-per-core, defaulting to 1"
+        info "Detected Intel Core Ultra (no HT) — forcing threads-per-core=1"
+    else
+        HOST_THREADS=$(lscpu 2>/dev/null | grep -i 'Thread(s) per core' | awk '{print $NF}')
+        if [[ -n "$HOST_THREADS" && "$HOST_THREADS" -ge 1 ]]; then
+            THREADS_PER_CORE="$HOST_THREADS"
+            info "Auto-detected host threads-per-core: ${THREADS_PER_CORE}"
+        else
+            THREADS_PER_CORE=1
+            warn "Could not detect host threads-per-core, defaulting to 1"
+        fi
     fi
 fi
 
@@ -621,9 +697,11 @@ info "SMP topology: ${SMP_TOTAL} vCPUs (1 socket × ${SMP_CORES} cores × ${SMP_
 ###############################################################################
 # Build QEMU args string
 # ─── IMPORTANT ───────────────────────────────────────────────────────────────
-# The patched QEMU 10 binary (Strong build) handles most anti-detection
+# The patched QEMU 11 binary (Strong build) handles most anti-detection
 # INTERNALLY, including: timing (TSC/HPET/PIT/RTC), NVRAM/EFI variables,
-# CPUID leaf hiding, system timer obfuscation, and CPU topology masking.
+# CPUID leaf hiding, system timer obfuscation, CPU topology masking,
+# fw_cfg DMA signature rewrite ("QEMU CFG" → "AUSU CFG"), and FADT/DSDT
+# revision bumps (FADT rev 3→4, DSDT rev 1→3 in QEMU 11).
 #
 # Adding timer/CPU override flags like -rtc, -overcommit, kvm=off, +invtsc
 # CONFLICTS with the binary's built-in behavior and CAUSES detection.
@@ -662,7 +740,7 @@ fi
 
 # CPU flags — matches upstream exactly:
 #   host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true
-# The patched QEMU 10 binary handles kvm hiding, TSC, invtsc, timing, CPUID internally.
+# The patched QEMU 11 binary handles kvm hiding, TSC, invtsc, timing, CPUID internally.
 # Do NOT add: kvm=off, +invtsc, +tsc-deadline, +tsc_adjust, +rdpid, +xsaves,
 #             +pdpe1gb, +umip, +md-clear, +arch-capabilities, tsc-frequency=
 CPU_FLAGS="host,host-cache-info=on,hypervisor=off,vmware-cpuid-freq=false,enforce=false,host-phys-bits=true"
@@ -704,9 +782,11 @@ SMBIOS_ARGS+=" -smbios type=2,manufacturer=\"$(qemu_escape_commas "${SMBIOS_BOAR
 # Type 3 — Chassis
 SMBIOS_ARGS+=" -smbios type=3,manufacturer=\"Default string\",version=\"Default string\",serial=\"Default string\",asset=\"Default string\",sku=\"Default string\""
 # Type 17 — Memory
-# QEMU 10: patched binary generates realistic DIMM entries internally.
+# QEMU 10+/11: patched binary generates realistic DIMM entries internally.
 # Upstream uses simplified format: serial + asset only. Extra fields override
 # the binary's defaults — only include them with explicit --mem-* flags.
+# QEMU 11 additionally auto-generates SMBIOS types 7 (Cache), 20 (Mapped
+# Address), 26 (Voltage Probe), and 27 (Cooling Device) — no args needed.
 if [[ "$MEM_EXPLICIT" == true ]]; then
     SMBIOS_ARGS+=" -smbios type=17,loc_pfx=\"${MEM_LOC_PFX}\",manufacturer=\"$(qemu_escape_commas "${MEM_MFG}")\",speed=${MEM_SPEED},serial=${MEM_SERIAL},part=\"${MEM_PART}\",bank=\"${MEM_BANK}\",asset=\"${MEM_ASSET}\""
     info "SMBIOS type=17: full format (user-specified --mem-* fields)"
@@ -730,23 +810,44 @@ if [[ "$IGPU_PASSTHROUGH" == true ]]; then
     # Detect GPU vendor for vendor-specific logic
     IGPU_VENDOR=""
     if [[ -z "$IGPU_PCI" ]]; then
-        # Try Intel first, then AMD/ATI
-        IGPU_PCI=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA|Display' | grep -i Intel | head -1 | awk '{print $1}')
+        # Prefer bus 0000:00 (the integrated graphics bus on every Intel/AMD
+        # consumer/server x86 host). This avoids accidentally selecting a
+        # discrete Intel Arc / AMD Radeon at 03:00.0 when the host also has
+        # an iGPU at 00:02.0 — passing a dGPU with IGD-mode flags is fatal.
+        # NOTE: `local` is only valid inside a function — this if-block lives at
+        # script top level under `set -e`, so we just use a regular variable.
+        _lspci_out=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA|Display' || true)
+        # Intel iGPU
+        IGPU_PCI=$(echo "$_lspci_out" | grep -i Intel | awk '$1 ~ /^0000:00:/ {print $1; exit}')
         if [[ -n "$IGPU_PCI" ]]; then
             IGPU_VENDOR="intel"
         else
-            IGPU_PCI=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA|Display' | grep -iE 'AMD|ATI|Radeon' | head -1 | awk '{print $1}')
+            # AMD iGPU on Ryzen APUs is typically at 0000:0d:00.0 or similar,
+            # but virtually always on bus 00 on consumer boards. Still prefer
+            # bus-00, then fall back to any AMD GPU.
+            IGPU_PCI=$(echo "$_lspci_out" | grep -iE 'AMD|ATI|Radeon' | awk '$1 ~ /^0000:00:/ {print $1; exit}')
+            if [[ -z "$IGPU_PCI" ]]; then
+                IGPU_PCI=$(echo "$_lspci_out" | grep -iE 'AMD|ATI|Radeon' | awk 'NR==1 {print $1; exit}')
+            fi
             if [[ -n "$IGPU_PCI" ]]; then
                 IGPU_VENDOR="amd"
             fi
+        fi
+        # Last resort: any Intel GPU (handles hosts where the iGPU lives off
+        # bus 00 for an unusual reason).
+        if [[ -z "$IGPU_PCI" ]]; then
+            IGPU_PCI=$(echo "$_lspci_out" | grep -i Intel | awk 'NR==1 {print $1; exit}')
+            [[ -n "$IGPU_PCI" ]] && IGPU_VENDOR="intel"
         fi
         if [[ -z "$IGPU_PCI" ]]; then
             fail "Could not auto-detect iGPU PCI address. Use --igpu-pci to specify."
         fi
         info "Auto-detected ${IGPU_VENDOR^^} iGPU: ${IGPU_PCI}"
     else
-        # Vendor detection from manually specified PCI address
-        pci_desc=$(lspci -s "${IGPU_PCI#*:}" 2>/dev/null || true)
+        # Vendor detection from manually specified PCI address.
+        # lspci -s accepts the full [domain:]bus:dev.func form — pass it through
+        # verbatim so we don't collide with other domains on multi-IOMMU hosts.
+        pci_desc=$(lspci -s "${IGPU_PCI}" 2>/dev/null || true)
         if echo "$pci_desc" | grep -qi Intel; then
             IGPU_VENDOR="intel"
         elif echo "$pci_desc" | grep -qiE 'AMD|ATI|Radeon'; then
@@ -849,19 +950,19 @@ PCI_ARGS+=" -global ICH9-LPC.disable_s4=0"
 # limited capabilities. With GPU passthrough (--igpu) this is not an issue.
 # For stdvga users: guest-side resolution and color depth must be ≥32bpp.
 #
-# v10.2.1 DISPLAY CHANGES:
-#   - VMware compatible display is now supported and RECOMMENDED (best 3D accel
+# v10.2.1+ / v11 DISPLAY CHANGES:
+#   - VMware compatible display is supported and RECOMMENDED by upstream (best 3D accel
 #     with iGPU/dGPU mirror, PCI-ID no longer 0x15ad)
-#   - VirtIO-GPU is now supported (OVMF only, basic adapter, PCI-ID no longer 0x1af4)
+#   - VirtIO-GPU is supported (OVMF only, basic adapter, PCI-ID no longer 0x1af4)
 #   - Standard VGA PCI-ID is no longer 0x1234
 #   - Spice display still has PCI-ID 0x1b36 (NOT recommended)
 #   - VirtIO-GPU does NOT work with SeaBIOS
 if [[ "$VGA" == "std" ]]; then
-    warn "Using stdvga — consider --vga vmware for v10.2.1 (recommended by upstream for best 3D accel)."
-    warn "VMAware GPU_CAPABILITIES (45pts) and DISPLAY (25pts) may trigger with stdvga."
-    warn "For best results, pass a real GPU (--igpu) or set resolution to ≥1920x1080 @32bpp in-guest."
+    warn "Using stdvga — consider --vga vmware (recommended by upstream v10.2.1+/v11 for best 3D accel)."
+    warn "VMAware GPU_CAPABILITIES (25%) and DISPLAY (25%) may trigger with stdvga."
+    warn "For best results, pass a real GPU (--igpu) or set resolution to >=1920x1080 @32bpp in-guest."
 elif [[ "$VGA" == "vmware" ]]; then
-    info "Using VMware compatible display (recommended by upstream v10.2.1 for best 3D acceleration)"
+    info "Using VMware compatible display (recommended by upstream for best 3D acceleration)"
 fi
 
 # Priority 2: THREAD_MISMATCH — PVE sets topology via cores:/sockets: in the conf.
@@ -899,6 +1000,9 @@ qm create "$VMID" \
     --localtime 1
 
 ok "Base VM created"
+
+# Arm the rollback trap now that the VM definition exists on disk.
+CLEANUP_VMID="$VMID"
 
 # Step 1b: smbios1: uuid-only (matching upstream exactly).
 # PVE generates `-smbios type=1,uuid=UUID` from this line. The args: line provides
@@ -1022,17 +1126,34 @@ if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; th
                     --set-json "$NVRAM_JSON" 2>/dev/null || true
 
                 if [[ -f "$NVRAM_NEW" ]]; then
-                    # Verify the injected image is a valid size (should be ~256K-4M)
                     NVRAM_NEW_SIZE=$(stat -c%s "$NVRAM_NEW" 2>/dev/null || echo "0")
-                    if [[ "$NVRAM_NEW_SIZE" -ge 131072 ]]; then
-                        # Write back to the efidisk (preserve original format)
-                        qemu-img convert -f raw -O "$EFI_FORMAT" "$NVRAM_NEW" "$EFI_DISK_PATH" 2>/dev/null \
-                            || cp "$NVRAM_NEW" "$EFI_DISK_PATH" 2>/dev/null || true
-                        NVRAM_INJECTED=true
-                        ok "Host EFI variables injected into VM NVRAM (${VAR_COUNT} variables: PK, KEK, db, dbx, defaults)"
+                    NVRAM_ORIG_SIZE=$(stat -c%s "$NVRAM_ORIG" 2>/dev/null || echo "0")
+                    # Validate: must be a reasonable size AND virt-fw-vars must be
+                    # able to read it back (a structural sanity check that catches
+                    # truncated / corrupt writes the bare size check misses).
+                    NVRAM_VALID=false
+                    if [[ "$NVRAM_NEW_SIZE" -ge 131072 ]] \
+                       && [[ "$NVRAM_NEW_SIZE" -le $((NVRAM_ORIG_SIZE + 4096)) ]] \
+                       && [[ "$NVRAM_NEW_SIZE" -ge $((NVRAM_ORIG_SIZE - 4096)) ]] \
+                       && virt-fw-vars --input "$NVRAM_NEW" --print >/dev/null 2>&1; then
+                        NVRAM_VALID=true
+                    fi
+                    if [[ "$NVRAM_VALID" == true ]]; then
+                        # Convert back to the original format. If conversion fails,
+                        # do NOT fall back to a raw cp — that would write a raw image
+                        # over a qcow2 file and brick the efidisk. Leave pristine in place.
+                        if qemu-img convert -f raw -O "$EFI_FORMAT" "$NVRAM_NEW" "${EFI_DISK_PATH}.new" 2>/dev/null; then
+                            mv -f "${EFI_DISK_PATH}.new" "$EFI_DISK_PATH"
+                            NVRAM_INJECTED=true
+                            ok "Host EFI variables injected into VM NVRAM (${VAR_COUNT} variables: PK, KEK, db, dbx, defaults)"
+                        else
+                            rm -f "${EFI_DISK_PATH}.new"
+                            warn "qemu-img convert failed (format=${EFI_FORMAT}); keeping pristine NVRAM."
+                            [[ -f "$EFI_BACKUP_PATH" ]] && cp "$EFI_BACKUP_PATH" "$EFI_DISK_PATH" 2>/dev/null || true
+                        fi
                     else
-                        warn "NVRAM injection produced undersized image (${NVRAM_NEW_SIZE} bytes) — restoring pristine backup"
-                        [[ -n "$EFI_BACKUP_PATH" && -f "$EFI_BACKUP_PATH" ]] && cp "$EFI_BACKUP_PATH" "$EFI_DISK_PATH" 2>/dev/null || true
+                        warn "NVRAM injection produced an image that failed round-trip validation (size=${NVRAM_NEW_SIZE}, original=${NVRAM_ORIG_SIZE}) — restoring pristine backup"
+                        [[ -f "$EFI_BACKUP_PATH" ]] && cp "$EFI_BACKUP_PATH" "$EFI_DISK_PATH" 2>/dev/null || true
                     fi
                 fi
             else
@@ -1040,9 +1161,17 @@ if command -v virt-fw-vars &>/dev/null && [[ -d /sys/firmware/efi/efivars ]]; th
             fi
         fi
 
-        # Cleanup
+        # Work tree cleanup. We KEEP the pristine efidisk backup at
+        # /root/pve-realpc/efidisk-${VMID}-pristine.qcow2 so the user can
+        # manually restore if the first boot fails ("Guest has not initialized
+        # the display"). The trap'd cleanup_partial_vm also leaves it alone.
         rm -rf "$NVRAM_WORK"
-        [[ -n "$EFI_BACKUP_PATH" && -f "$EFI_BACKUP_PATH" ]] && rm -f "$EFI_BACKUP_PATH"
+        if [[ -n "$EFI_BACKUP_PATH" && -f "$EFI_BACKUP_PATH" ]]; then
+            mkdir -p /root/pve-realpc 2>/dev/null || true
+            PERSISTED_BACKUP="/root/pve-realpc/efidisk-${VMID}-pristine.qcow2"
+            mv -f "$EFI_BACKUP_PATH" "$PERSISTED_BACKUP" 2>/dev/null && \
+                info "Pristine OVMF_VARS preserved at ${PERSISTED_BACKUP} (delete after first successful boot)."
+        fi
     else
         warn "Could not resolve EFI disk path for VMID ${VMID}"
     fi
@@ -1087,12 +1216,26 @@ if [[ "$IGPU_PASSTHROUGH" == true ]]; then
 fi
 
 # Step 3: Add SATA system disk
-# qm expects size as bare number in GB; convert T/TB to GB
-case "$DISK_SIZE" in
-    *[Tt][Bb]) DISK_SIZE_NUM=$(echo "$DISK_SIZE" | sed 's/[Tt][Bb]$//'); DISK_SIZE_NUM=$((DISK_SIZE_NUM * 1024)) ;;
-    *[Tt])     DISK_SIZE_NUM=$(echo "$DISK_SIZE" | sed 's/[Tt]$//');     DISK_SIZE_NUM=$((DISK_SIZE_NUM * 1024)) ;;
-    *)         DISK_SIZE_NUM=$(echo "$DISK_SIZE" | sed 's/[GgBb]*$//') ;;
+# qm expects size as bare number in GB; accept TB/T/GB/G/GiB/MiB/M variants.
+# Validate explicitly — silently accepting "1024M" as 1024 (= 1 GB) when the
+# user meant 1024 GB is a real data-loss footgun.
+_disk_in="${DISK_SIZE,,}"   # lowercase
+case "$_disk_in" in
+    *tib)  DISK_SIZE_NUM=$(( ${_disk_in%tib} * 1024 )) ;;
+    *tb)   DISK_SIZE_NUM=$(( ${_disk_in%tb}  * 1024 )) ;;
+    *t)    DISK_SIZE_NUM=$(( ${_disk_in%t}   * 1024 )) ;;
+    *gib)  DISK_SIZE_NUM="${_disk_in%gib}" ;;
+    *gb)   DISK_SIZE_NUM="${_disk_in%gb}"  ;;
+    *g)    DISK_SIZE_NUM="${_disk_in%g}"   ;;
+    *mib)  DISK_SIZE_NUM=$(( ${_disk_in%mib} / 1024 )) ;;
+    *mb)   DISK_SIZE_NUM=$(( ${_disk_in%mb}  / 1024 )) ;;
+    *m)    DISK_SIZE_NUM=$(( ${_disk_in%m}   / 1024 )) ;;
+    *[0-9]) DISK_SIZE_NUM="$_disk_in" ;;
+    *) fail "Could not parse --disk-size '${DISK_SIZE}'. Use forms like 256G, 1T, 1024GiB." ;;
 esac
+unset _disk_in
+[[ "$DISK_SIZE_NUM" =~ ^[0-9]+$ ]] || fail "Disk size resolved to non-numeric: '${DISK_SIZE_NUM}' from '${DISK_SIZE}'"
+(( DISK_SIZE_NUM >= 32 )) || fail "Disk size ${DISK_SIZE_NUM} GB is too small. Use at least 32G (128G+ recommended for realism)."
 info "Adding SATA system disk (${DISK_SIZE_NUM}GB) ..."
 qm set "$VMID" --sata0 "${DISK_STORAGE}:${DISK_SIZE_NUM},ssd=1,serial=${DISK_SERIAL}"
 ok "SATA disk added with serial ${DISK_SERIAL}"
@@ -1249,3 +1392,7 @@ SUMMARY_FILE="/root/vm-${VMID}-deploy-summary.txt"
 } > "$SUMMARY_FILE"
 ok "Deployment summary saved to ${SUMMARY_FILE}"
 info "View anytime: cat ${SUMMARY_FILE}"
+
+# Deploy reached the end successfully — disarm the rollback trap.
+CLEANUP_VMID=""
+trap - ERR INT TERM HUP

@@ -1,3 +1,23 @@
+# qemu-cleanup.ps1 — Remove VM fingerprints from a Windows guest
+#
+# Structure mirrors Scrut1ny/AutoVirt's qemu-cleanup.ps1: download PSTools,
+# build a here-string cleanup payload, run it as SYSTEM via PsExec64 so we can
+# reach Enum, Services, and DriverStore keys that even an elevated user can't
+# touch.
+#
+# Deliberate differences from AutoVirt:
+#   * AutoVirt deletes EVERY subkey under Enum\SCSI ("Remove-AllSubKeys $scsiRoot").
+#     This nukes the active SATA/AHCI boot disk's registry entries on most PVE
+#     setups because Windows enumerates SATA disks through the SCSI miniport
+#     driver. We instead pattern-filter Enum\SCSI with the same VM-signature
+#     list as the rest of the Enum tree so legitimate disks survive.
+#   * Pattern list expanded from 3 entries to 30+ (VirtIO/QEMU/Bochs/VBOX/VMware/
+#     KVM/Red Hat/Spice/QXL/balloon/pvpanic/qemufwcfg + ACPI sig strings).
+#   * Added cleanup layers: DriverStore FileRepository, hidden/ghost PnP devices
+#     via pnputil, event logs (System/Application/Setup), Prefetch traces,
+#     Task Scheduler entries, setupapi.dev.log, WER reports, and BIOS/CPU
+#     registry leak validation with warnings.
+#
 # Set execution policy to bypass for the process
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 
@@ -7,14 +27,37 @@ $zipPath         = "$tempDir.zip"
 $psexecPath      = Join-Path $tempDir "PsExec64.exe"
 $cleanupScriptPath = Join-Path $tempDir "cleanup.ps1"
 
-# Download and extract PSTools only if PsExec64.exe is missing
+# Download and extract PSTools only if PsExec64.exe is missing.
+# We don't pin a SHA256 (Sysinternals updates PsExec on its own cadence —
+# pinning would create unbounded maintenance burden). Instead:
+#   1. Force TLS 1.2 (Invoke-WebRequest's defaults vary by PS version).
+#   2. After extraction, verify the Authenticode signature on PsExec64.exe is
+#      valid AND issued to Microsoft. Refuse to run if either check fails.
+#   3. Unblock-File to clear the Mark-of-the-Web so we don't trigger the
+#      "downloaded from internet" prompt under PsExec.
 if (-not (Test-Path $psexecPath)) {
     if (-not (Test-Path $tempDir)) {
-        New-Item -ItemType Directory -Path $tempDir | Out-Null
+        New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
     }
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
+    } catch {
+        Write-Host "[X] Failed to download PSTools.zip: $_" -ForegroundColor Red
+        Write-Host "    Manually download from $downloadUrl and extract to $tempDir, then re-run." -ForegroundColor Yellow
+        exit 1
+    }
     Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
     Remove-Item -Path $zipPath -Force
+    Get-ChildItem $tempDir -Filter *.exe | ForEach-Object { Unblock-File $_.FullName -ErrorAction SilentlyContinue }
+}
+
+# Verify Authenticode signature on PsExec64.exe before we hand it SYSTEM rights.
+$sig = Get-AuthenticodeSignature -FilePath $psexecPath -ErrorAction SilentlyContinue
+if ($null -eq $sig -or $sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+    Write-Host "[X] PsExec64.exe signature check failed (Status=$($sig.Status), Subject=$($sig.SignerCertificate.Subject))." -ForegroundColor Red
+    Write-Host "    Refusing to run an unverified binary as SYSTEM. Delete $tempDir and try again, or run cleanup payload manually." -ForegroundColor Yellow
+    exit 1
 }
 
 # Cleanup script as a string, executed as SYSTEM via PsExec
@@ -73,9 +116,17 @@ function Remove-KeysMatching {
         [string]$Root,
         [string[]]$Patterns
     )
+    # Build a single anchored regex from $Patterns. We require each pattern to
+    # be flanked by a registry-path delimiter (backslash, ampersand, slash) or
+    # by start/end-of-string, so substring collisions with legitimate vendor
+    # strings can't accidentally trigger deletion.
+    #     bad:  *DEV_1100*  matches a perfectly legit DEV_11005 (Intel chipset)
+    #    good:  (?<=\\|&|/|^)DEV_1100(?=\\|&|/|$|\.)
+    $escaped = $Patterns | ForEach-Object { [regex]::Escape($_) }
+    $combined = '(?:(?<=[\\&/])|^)(?:' + ($escaped -join '|') + ')(?:(?=[\\&/.])|$)'
     $keys = Get-ChildItem -Path $Root -Recurse -ErrorAction SilentlyContinue
     foreach ($key in $keys) {
-        if ($Patterns | Where-Object { $key.PSPath -like "*$_*" }) {
+        if ($key.PSPath -match $combined) {
             try {
                 Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction Stop
                 Write-Host "Deleted (match): $($key.PSPath)"
@@ -158,13 +209,20 @@ if (Test-Path $prefetchDir) {
     }
 }
 
-# Clean Task Scheduler tasks that may reference VM tools
-$vmTaskPatterns = @('*QEMU*', '*VirtIO*', '*Spice*', '*qemu-ga*', '*balloon*')
-foreach ($pattern in $vmTaskPatterns) {
-    Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like $pattern } | ForEach-Object {
-        try { Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction Stop; Write-Host "Removed task: $($_.TaskName)" }
-        catch { Write-Host "Failed to remove task: $($_.TaskName)" }
+# Clean Task Scheduler tasks that may reference VM tools.
+# Get-ScheduledTask isn't shipped on every Windows SKU (some Server LTSC and
+# debloated builds strip the ScheduledTasks PS module). Guard it so the rest
+# of the payload (setupapi log scrub, WER cleanup) still runs.
+if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+    $vmTaskPatterns = @('*QEMU*', '*VirtIO*', '*Spice*', '*qemu-ga*', '*balloon*')
+    foreach ($pattern in $vmTaskPatterns) {
+        Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like $pattern } | ForEach-Object {
+            try { Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction Stop; Write-Host "Removed task: $($_.TaskName)" }
+            catch { Write-Host "Failed to remove task: $($_.TaskName)" }
+        }
     }
+} else {
+    Write-Host "Get-ScheduledTask unavailable (debloated build) - skipping scheduled-task scrub"
 }
 
 # Validate BIOS/SMBIOS registry entries for residual VM strings
@@ -228,7 +286,10 @@ if (Test-Path $werDir) {
 }
 '@
 
-$cleanupScript | Set-Content -Path $cleanupScriptPath -Encoding UTF8
+# Write the payload as BOM-less UTF-8. PS 5.1's `Set-Content -Encoding UTF8`
+# writes a BOM which some PowerShell host versions choke on when invoked via
+# `powershell -File ...` under PsExec64.
+[System.IO.File]::WriteAllText($cleanupScriptPath, $cleanupScript, [System.Text.UTF8Encoding]::new($false))
 
 Start-Process -FilePath $psexecPath -ArgumentList "-accepteula -nobanner -s powershell -ExecutionPolicy Bypass -File `"$cleanupScriptPath`"" -WindowStyle Hidden -Wait
 
