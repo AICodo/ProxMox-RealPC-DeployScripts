@@ -16,6 +16,7 @@ GN=$(echo -e "\033[1;92m")
 DGN=$(echo -e "\033[32m")
 MG=$(echo -e "\033[0;35m")
 CL=$(echo -e "\033[m")
+NC=$(echo -e "\033[m")
 BOLD=$(echo -e "\033[1m")
 DIM=$(echo -e "\033[2m")
 BFR="\\r\\033[K"
@@ -87,7 +88,11 @@ function exit_script() {
 function check_root() {
   if [[ "$(id -u)" -ne 0 || $(ps -o comm= -p $PPID) == "sudo" ]]; then
     clear
-    msg_error "Please run this script as root."
+    if [[ "$(id -u)" -ne 0 ]]; then
+      msg_error "Please run this script as root (su -)."
+    else
+      msg_error "sudo detected — please log in as root directly (su -) instead of using sudo."
+    fi
     sleep 2
     exit
   fi
@@ -1079,23 +1084,20 @@ echo -e "${ID}${BOLD}VM ${VMID} · ${VM_NAME} · ${VM_TYPE} · VGA: ${VGA}${CL}"
 
 msg_info "Creating VM ${VMID}"
 
-# qm create with proper topology
-if [[ "$THREADS" -gt 1 ]]; then
-  qm create "$VMID" \
-    --name "$VM_NAME" --bios ovmf --machine q35 --ostype "$OSTYPE" --cpu host \
-    --sockets 1 --cores "$CORES" --threads "$THREADS" --memory "$MEMORY" \
-    --balloon 0 --numa 0 --scsihw virtio-scsi-single \
-    --net0 "e1000,bridge=${BRIDGE},firewall=${FIREWALL}" \
-    --vga "$VGA" --localtime 1
-else
-  qm create "$VMID" \
-    --name "$VM_NAME" --bios ovmf --machine q35 --ostype "$OSTYPE" --cpu host \
-    --sockets 1 --cores "$SMP_TOTAL" --memory "$MEMORY" \
-    --balloon 0 --numa 0 --scsihw virtio-scsi-single \
-    --net0 "e1000,bridge=${BRIDGE},firewall=${FIREWALL}" \
-    --vga "$VGA" --localtime 1
-fi
+# qm create (cores = total vCPUs; --threads not accepted by qm create on some PVE builds)
+qm create "$VMID" \
+  --name "$VM_NAME" --bios ovmf --machine q35 --ostype "$OSTYPE" --cpu host \
+  --sockets 1 --cores "$SMP_TOTAL" --memory "$MEMORY" \
+  --balloon 0 --numa 0 --scsihw virtio-scsi-single \
+  --net0 "e1000,bridge=${BRIDGE},firewall=${FIREWALL}" \
+  --vga "$VGA" --localtime 1
 msg_ok "VM ${VMID} created"
+
+# Set proper topology via qm set (--threads always supported here)
+if [[ "$THREADS" -gt 1 ]]; then
+  qm set "$VMID" --sockets 1 --cores "$CORES" --threads "$THREADS"
+  msg_ok "Topology set: ${CORES}c × ${THREADS}t (${SMP_TOTAL} vCPUs)"
+fi
 
 # Arm rollback
 CLEANUP_VMID="$VMID"
