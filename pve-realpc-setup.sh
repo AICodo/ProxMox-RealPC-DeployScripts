@@ -979,7 +979,6 @@ step_done()  { [[ -f "$STATE_FILE" ]] && grep -qxF "$1" "$STATE_FILE"; }
 QEMU_BIN_PATH="/usr/bin/qemu-system-x86_64"
 if [[ "$FORCE" != true ]]; then
     if [[ -f "$QEMU_BIN_PATH" ]]; then
-        local qsz
         qsz=$(stat -c%s "$QEMU_BIN_PATH" 2>/dev/null || echo "0")
         if (( qsz >= 29000000 )) && [[ -f "${BACKUP_DIR}/qemu-system-x86_64.stock" ]]; then
             warn "Patched QEMU appears already installed (binary: $((qsz/1024/1024))MB, backup exists)."
@@ -992,7 +991,6 @@ if [[ "$FORCE" != true ]]; then
     fi
     # Warn about half-installed state from a previous interrupted run
     if [[ -f "$STATE_FILE" ]]; then
-        local done_steps
         done_steps=$(tr '\n' ', ' < "$STATE_FILE" | sed 's/, $//')
         warn "Previous run was interrupted. Completed steps: ${done_steps}."
         warn "Re-running will resume from the beginning. Backups from first run are preserved."

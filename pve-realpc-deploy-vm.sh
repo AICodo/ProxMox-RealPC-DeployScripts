@@ -1021,7 +1021,7 @@ DISK_SERIAL="${DISK_SERIAL:-$(random_serial_20)}"
 MEM_SERIAL="${MEM_SERIAL:-$(random_hex 8)}"
 if [[ -z "$MEM_ASSET" ]]; then
   MEM_ASSET=$(LC_ALL=C tr -dc '0-9' </dev/urandom | head -c 10)
-  local _mt=0
+  _mt=0
   while [[ ${#MEM_ASSET} -lt 10 && _mt -lt 20 ]]; do
     MEM_ASSET="$(LC_ALL=C tr -dc '1-9' </dev/urandom | head -c 1)${MEM_ASSET}"; ((_mt++))
   done
