@@ -283,6 +283,42 @@ if (Test-Path $biosRegPath) {
     }
 }
 
+# Also check the EXACT registry values pafish/al-khaser read directly:
+#   HKLM\HARDWARE\Description\System : SystemBiosVersion, VideoBiosVersion, SystemBiosDate
+#   HKLM\HARDWARE\DEVICEMAP\Scsi\... : Identifier  (pafish greps this for "QEMU")
+# These are repopulated from firmware at every boot, so this is a detection check, not a
+# persistent spoof -- a leak here means the patched QEMU/SMBIOS layer isn't fully active.
+$sysRegPath = "HKLM:\HARDWARE\DESCRIPTION\System"
+if (Test-Path $sysRegPath) {
+    $sysProps = Get-ItemProperty -Path $sysRegPath -ErrorAction SilentlyContinue
+    foreach ($name in 'SystemBiosVersion','VideoBiosVersion','SystemBiosDate') {
+        $val = $sysProps.$name
+        # These can be REG_MULTI_SZ (string[]) -- join for scanning.
+        if ($val) {
+            $joined = ($val -join ' ')
+            foreach ($vmStr in $vmBiosStrings) {
+                if ($joined -match [regex]::Escape($vmStr)) {
+                    Write-Host "[!] $name leak: contains '$vmStr' (pafish/al-khaser read this) - patched firmware may be inactive" -ForegroundColor Red
+                }
+            }
+        }
+    }
+}
+# Scsi DEVICEMAP Identifier scan (pafish qemu.c reads "Scsi Port N\...\Identifier").
+$scsiRoot = "HKLM:\HARDWARE\DEVICEMAP\Scsi"
+if (Test-Path $scsiRoot) {
+    Get-ChildItem -Path $scsiRoot -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        $idv = (Get-ItemProperty -Path $_.PSPath -Name 'Identifier' -ErrorAction SilentlyContinue).Identifier
+        if ($idv) {
+            foreach ($vmStr in @('QEMU','BOCHS','VBOX','VMware','Virtual')) {
+                if (($idv -join ' ') -match [regex]::Escape($vmStr)) {
+                    Write-Host "[!] SCSI Identifier leak under $($_.PSChildName): contains '$vmStr'" -ForegroundColor Red
+                }
+            }
+        }
+    }
+}
+
 # ==================================
 
 

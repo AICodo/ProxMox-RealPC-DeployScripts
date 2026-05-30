@@ -104,7 +104,9 @@ function pve_check() {
     exit 1
   fi
   local ver
-  ver=$(pveversion 2>/dev/null | grep -oP 'pve-manager/\K[0-9]+')
+  # `|| true`: under set -e a non-matching grep (exit 1) would abort here before
+  # the friendly version warning could run.
+  ver=$(pveversion 2>/dev/null | grep -oP 'pve-manager/\K[0-9]+' || true)
   if [[ "$ver" != "8" && "$ver" != "9" ]]; then
     msg_warn "Detected PVE major version ${ver}. This script targets PVE 9."
     msg_warn "Proceed at your own risk."
@@ -169,7 +171,12 @@ function random_hex() {
 
 function random_serial_20() {
   local pool
-  pool=$(dd if=/dev/urandom bs=256 count=1 2>/dev/null | LC_ALL=C tr -dc 'A-Z0-9' | head -c 20)
+  # Bounded read + bash truncation (NOT `... | head -c 20`). `dd count=1` bounds the
+  # source and tr drains it to EOF, so nothing is killed by SIGPIPE when we stop at
+  # 20 chars — `head` would close the pipe early and SIGPIPE tr (exit 141), which
+  # aborts the script under set -e/pipefail (same class as GitHub issue #1). bs=512
+  # yields ~70 A-Z0-9 chars on average, so >=20 is effectively certain.
+  pool=$(dd if=/dev/urandom bs=512 count=1 2>/dev/null | LC_ALL=C tr -dc 'A-Z0-9'); pool="${pool:0:20}"
   local _tries=0
   while [[ ${#pool} -lt 20 && _tries -lt 20 ]]; do
     pool+=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n' | tr '[:lower:]' '[:upper:]' | LC_ALL=C tr -dc 'A-Z0-9')
@@ -486,6 +493,38 @@ function detect_igpu() {
   echo "${vendor}:${igpu_pci}:${audio:-}:${igpu_rom:-}"
 }
 
+# ─── Discrete GPU (NVIDIA / AMD dGPU) detection ───────────────────────────────
+# Unlike detect_igpu (integrated, bus 00, Intel IGD args), this finds a DISCRETE
+# GPU for full PCIe passthrough. Returns "vendor:device_addr" where device_addr is
+# the function-stripped address (domain:bus:device) so PVE passes ALL functions of
+# the card at once (the GPU .0 AND its HDMI-audio .1) — exactly how a real GPU
+# appears. Caller adds pcie=1 / x-vga=1 / romfile.
+function detect_dgpu() {
+  local want="${1:-}" vendor="" addr=""
+  if [[ -n "$want" ]]; then
+    # User-specified address: identify vendor from lspci.
+    local desc; desc=$(lspci -nn -s "$want" 2>/dev/null || true)
+    if   echo "$desc" | grep -qi 'NVIDIA\|\[10de:'; then vendor="nvidia"
+    elif echo "$desc" | grep -qiE 'AMD|ATI|Radeon|\[1002:'; then vendor="amd"
+    else vendor="nvidia"; msg_warn "Could not identify GPU vendor at ${want} — assuming NVIDIA" >&2; fi
+    addr="$want"
+  else
+    # Auto-detect: a VGA/3D/Display controller that is NOT on bus 00 (= discrete).
+    # PCI class 0300 (VGA) and 0302 (3D controller — common for NVIDIA in some modes).
+    local lspci_out
+    lspci_out=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA compatible controller|3D controller|Display controller' || true)
+    addr=$(echo "$lspci_out" | grep -iE 'NVIDIA|\[10de:' | awk '$1 !~ /^0000:00:/ {print $1; exit}')
+    if [[ -n "$addr" ]]; then vendor="nvidia"
+    else
+      addr=$(echo "$lspci_out" | grep -iE 'AMD|ATI|Radeon|\[1002:' | awk '$1 !~ /^0000:00:/ {print $1; exit}')
+      [[ -n "$addr" ]] && vendor="amd"
+    fi
+    [[ -z "$addr" ]] && { msg_error "Could not auto-detect a discrete GPU. Pass --gpu-pci <addr> (see: lspci -Dnn | grep -E 'VGA|3D')." >&2; exit 1; }
+    echo -e "${GPU}${BOLD}${DGN}Auto-detected ${vendor^^} dGPU: ${BGN}${addr}${CL}" >&2
+  fi
+  echo "${vendor}:${addr}"
+}
+
 # ─── Configuration defaults ───────────────────────────────────────────────────
 function default_config() {
   # Use := pattern — preserves values already set by CLI (parse_args runs first)
@@ -501,7 +540,12 @@ function default_config() {
   ISO_FILE="${ISO_FILE:-}"
   ISO_TYPE="${ISO_TYPE:-}"
   BRIDGE="${BRIDGE:-vmbr0}"
-  VGA="${VGA:-vmware}"
+  # Default VGA = std for MAX STEALTH: the Debian release ships a scrubbed
+  # vgabios-stdvga.bin (no "QEMU"/"Bochs" option-ROM strings) and Windows shows the
+  # generic "Standard VGA" adapter rather than a literal "VMware SVGA II" name. The
+  # vmware ROM is NOT scrubbed upstream. Override with --vga vmware if you need its
+  # 3D path (e.g. dGPU mirror mode). Both have patched (non-VM) PCI-IDs.
+  VGA="${VGA:-std}"
   GUEST_OS="${GUEST_OS:-other}"
   ADD_TPM="${ADD_TPM:-false}"
   AFFINITY="${AFFINITY:-}"
@@ -510,6 +554,11 @@ function default_config() {
   IGPU_AUDIO="${IGPU_AUDIO:-}"
   IGPU_GMS="${IGPU_GMS:-0x2}"
   IGPU_ROM="${IGPU_ROM:-}"
+  # Discrete GPU passthrough (NVIDIA / AMD dGPU) — distinct from --igpu (integrated).
+  DGPU_ENABLE="${DGPU_ENABLE:-false}"
+  DGPU_PCI="${DGPU_PCI:-}"
+  DGPU_ROM="${DGPU_ROM:-}"
+  DGPU_PRIMARY="${DGPU_PRIMARY:-false}"
   FIREWALL="${FIREWALL:-1}"
   DISK_SERIAL="${DISK_SERIAL:-}"
   MEM_SERIAL="${MEM_SERIAL:-}"
@@ -532,6 +581,7 @@ function default_config() {
   echo -e "${ID}${BOLD}${DGN}VM ID: ${BGN}${VMID}${CL}"
   echo -e "${NAME}${BOLD}${DGN}Name: ${BGN}${VM_NAME}${CL}"
   echo -e "${CPU}${BOLD}${DGN}Type: ${BGN}${VM_TYPE}${CL}"
+  echo -e "${SEC}${BOLD}${DGN}Profile: ${BGN}MAX STEALTH${CL}${DGN} — display=${VGA} (scrubbed ROM), SMBIOS/CPU/topology scanned from host${CL}"
   echo -e "${CREATING}${BOLD}${DGN}All other settings auto-detected from host${CL}"
 }
 
@@ -570,6 +620,10 @@ function parse_args() {
       --igpu-audio)   IGPU_AUDIO="$2";        shift 2 ;;
       --igpu-gms)     IGPU_GMS="$2";          shift 2 ;;
       --igpu-rom)     IGPU_ROM="$2";          shift 2 ;;
+      --nvidia|--dgpu) DGPU_ENABLE=true;      shift   ;;
+      --gpu-pci)      DGPU_PCI="$2"; DGPU_ENABLE=true; shift 2 ;;
+      --gpu-rom)      DGPU_ROM="$2"; DGPU_ENABLE=true; shift 2 ;;
+      --gpu-primary)  DGPU_PRIMARY=true; DGPU_ENABLE=true; shift ;;
       --board-mfg)    SMBIOS_BOARD_MFG="$2";  shift 2 ;;
       --board-product) SMBIOS_BOARD_PRODUCT="$2"; shift 2 ;;
       --disk-serial)  DISK_SERIAL="$2";       shift 2 ;;
@@ -596,18 +650,34 @@ VM Configuration:
   --iso FILENAME       ISO filename (default: interactive picker)
   --iso-type TYPE      ISO filter: slim|stock
   --bridge NAME        Network bridge (default: vmbr0)
-  --vga TYPE           VGA: std|vmware|none|virtio (default: vmware)
+  --vga TYPE           VGA: std|vmware|none|virtio (default: std = max stealth,
+                       scrubbed ROM + generic adapter name; use vmware for 3D)
   --ostype TYPE        OS type (default: other — preserves S3/S4)
   --tpm                Add TPM 2.0 device
   --affinity RANGE     CPU affinity, e.g. 0-7
   --firewall 0|1       Enable firewall (default: 1)
 
-iGPU Passthrough:
+iGPU Passthrough (Intel/AMD integrated graphics):
   --igpu               Enable iGPU passthrough (auto-detect vendor)
   --igpu-pci ADDR      iGPU PCI address (default: auto)
   --igpu-audio ADDR    Audio PCI address (default: auto)
   --igpu-gms HEX       Intel DVMT pre-alloc: 0x2=64M (default: 0x2)
   --igpu-rom FILE      ROM in /usr/share/kvm/ (default: auto)
+
+Discrete GPU Passthrough (NVIDIA / AMD dGPU — full PCIe passthrough):
+  --nvidia             Enable discrete GPU passthrough (auto-detect NVIDIA, then
+                       AMD). Passes the whole card (GPU + HDMI audio) via pcie=1.
+  --gpu-pci ADDR       dGPU PCI address (default: auto). Function optional — the
+                       whole device is always passed (e.g. 0000:01:00).
+  --gpu-rom FILE       dGPU vBIOS ROM in /usr/share/kvm/ (only if your card needs
+                       one; dump with: cat /sys/bus/pci/devices/<addr>/rom).
+  --gpu-primary        Make the dGPU the VM's primary display (x-vga=1, vga=none).
+                       Default: keep the VMware-compatible display as console and
+                       pass the dGPU as secondary ("mirror display" — upstream's
+                       recommended, anti-detection-friendly mode).
+  Prereq: run  pve-realpc-setup.sh --nvidia  on the host first (IOMMU + vfio bind +
+  driver blacklist + reboot). NVIDIA "Code 43" is handled by hypervisor=off + the
+  patched KVM (driver 465+ needs nothing else); for old Optimus drivers add --type laptop.
 
 Identity Spoofing:
   --type desktop|laptop  Desktop or laptop (virtual battery)
@@ -628,8 +698,11 @@ Examples:
   bash pve-realpc-deploy-vm.sh --vmid 200 --cores 8 --memory 16384
   bash pve-realpc-deploy-vm.sh --iso-type slim --type laptop
   bash pve-realpc-deploy-vm.sh --igpu --igpu-gms 0x4
+  bash pve-realpc-deploy-vm.sh --nvidia                       # dGPU, mirror mode
+  bash pve-realpc-deploy-vm.sh --gpu-pci 0000:01:00 --gpu-primary
+  bash pve-realpc-deploy-vm.sh --nvidia --type laptop         # old Optimus drivers
   bash pve-realpc-deploy-vm.sh --cores 24 --affinity 0-23
-  bash pve-realpc-deploy-vm.sh --dry-run --cores 8 --vga std
+  bash pve-realpc-deploy-vm.sh --dry-run --nvidia --cores 8
 HELPEOF
         exit 0
         ;;
@@ -653,8 +726,8 @@ function start_script() {
   fi
 
   if whiptail --backtitle "PVE RealPC Deploy" --title "Setup Mode" \
-    --yesno "This will create a Windows VM with full anti-VM-detection cloaking.\n\nQEMU 11 · OVMF · SMBIOS spoofing · ACPI · NVRAM injection\n\nUse Default settings?" --yes-button "Default" --no-button "Advanced" 14 70; then
-    echo -e "${DEFAULT}${BOLD}${BL}Using Default Settings${CL}"
+    --yesno "Create a Windows VM with full anti-VM-detection cloaking.\n\nQEMU 11 · OVMF · SMBIOS spoofing · ACPI · NVRAM injection\n\nMax-Stealth (auto) scans this host and picks the stealthiest settings:\n  · std display (scrubbed ROM, generic adapter name)\n  · SMBIOS board/BIOS/CPU profile matched to the host CPU vendor\n  · CPU topology copied from the host\n\nUse Max-Stealth (auto) settings?" --yes-button "Max Stealth" --no-button "Advanced" 17 72; then
+    echo -e "${DEFAULT}${BOLD}${BL}Using Max-Stealth (auto) settings${CL}"
     default_config
   else
     echo -e "${ADVANCED}${BOLD}${MG}Using Advanced Settings${CL}"
@@ -724,13 +797,13 @@ function advanced_config() {
       echo -e "${DISK}${BOLD}${DGN}Disk: ${BGN}${DISK_SIZE}${CL}"
     else exit_script; fi
 
-    # --- VGA ---
-    VGA="${VGA:-vmware}"
+    # --- VGA ---  (std = max stealth: scrubbed ROM + generic adapter name)
+    VGA="${VGA:-std}"
     if VGA=$(whiptail --backtitle "PVE RealPC Deploy" --title "VGA Type" --radiolist \
-      "Display adapter" 12 58 4 \
-      "vmware" "VMware Compatible (recommended)" ON \
-      "std"    "Standard VGA" OFF \
-      "virtio" "VirtIO-GPU" OFF \
+      "Display adapter (std = max stealth: scrubbed ROM)" 12 64 4 \
+      "std"    "Standard VGA (max stealth, scrubbed ROM)" ON \
+      "vmware" "VMware Compatible (best 3D; ROM not scrubbed)" OFF \
+      "virtio" "VirtIO-GPU (ROM not scrubbed)" OFF \
       "none"   "None (GPU passthrough)" OFF \
       3>&1 1>&2 2>&3); then
       echo -e "${GPU}${BOLD}${DGN}VGA: ${BGN}${VGA}${CL}"
@@ -769,6 +842,19 @@ function advanced_config() {
       echo -e "${GPU}${BOLD}${DGN}iGPU: ${BGN}Enabled${CL}"
     else
       echo -e "${GPU}${BOLD}${DGN}iGPU: ${BGN}Disabled${CL}"
+      # --- Discrete GPU (NVIDIA / AMD dGPU) — only offered if iGPU not chosen ---
+      if whiptail --backtitle "PVE RealPC Deploy" --title "Discrete GPU Passthrough" \
+        --yesno "Pass through a discrete NVIDIA / AMD GPU?\n\nAuto-detects the dGPU and passes the whole card (GPU + HDMI audio).\nKeeps the VMware display for console (mirror mode).\n\nRequires: pve-realpc-setup.sh --nvidia run on the host first." --defaultno 12 64; then
+        DGPU_ENABLE=true
+        echo -e "${GPU}${BOLD}${DGN}dGPU: ${BGN}Enabled (secondary/mirror)${CL}"
+        if whiptail --backtitle "PVE RealPC Deploy" --title "Primary Display" \
+          --yesno "Make the dGPU the PRIMARY display (x-vga=1)?\n\nYes = dGPU drives the only display (vga=none; needs a monitor or\n      headless GPU driver).\nNo  = keep VMware display for the PVE console (recommended)." --defaultno 11 64; then
+          DGPU_PRIMARY=true
+          echo -e "${GPU}${BOLD}${DGN}dGPU: ${BGN}primary (x-vga=1)${CL}"
+        fi
+      else
+        echo -e "${GPU}${BOLD}${DGN}dGPU: ${BGN}Disabled${CL}"
+      fi
     fi
 
     # --- OSType ---
@@ -838,10 +924,12 @@ function build_args() {
   smb+=" -smbios type=1,manufacturer=\"$(qemu_escape_commas "${SMBIOS_BOARD_MFG}")\",product=\"$(qemu_escape_commas "${SMBIOS_BOARD_PRODUCT}")\",version=\"$(qemu_escape_commas "${SMBIOS_BOARD_VERSION}")\",serial=\"Default string\",sku=\"Default string\",family=\"Default string\""
   smb+=" -smbios type=2,manufacturer=\"$(qemu_escape_commas "${SMBIOS_BOARD_MFG}")\",product=\"$(qemu_escape_commas "${SMBIOS_BOARD_PRODUCT}")\",version=\"$(qemu_escape_commas "${SMBIOS_BOARD_VERSION}")\",serial=\"Default string\",asset=\"Default string\",location=\"Default string\""
   smb+=" -smbios type=3,manufacturer=\"Default string\",version=\"Default string\",serial=\"Default string\",asset=\"Default string\",sku=\"Default string\""
+  # Comma-escape EVERY user-influenced value (--mem-part/--mem-mfg/--mem-asset and the
+  # generated serial) so a comma in any of them can't break QEMU's QemuOpts parsing.
   if [[ "$MEM_EXPLICIT" == true ]]; then
-    smb+=" -smbios type=17,loc_pfx=\"Controller0-ChannelA-DIMM\",manufacturer=\"$(qemu_escape_commas "${MEM_MFG}")\",speed=${MEM_SPEED},serial=${MEM_SERIAL},part=\"${MEM_PART}\",bank=\"BANK 0\",asset=\"${MEM_ASSET}\""
+    smb+=" -smbios type=17,loc_pfx=\"Controller0-ChannelA-DIMM\",manufacturer=\"$(qemu_escape_commas "${MEM_MFG}")\",speed=${MEM_SPEED},serial=\"$(qemu_escape_commas "${MEM_SERIAL}")\",part=\"$(qemu_escape_commas "${MEM_PART}")\",bank=\"BANK 0\",asset=\"$(qemu_escape_commas "${MEM_ASSET}")\""
   else
-    smb+=" -smbios type=17,serial=${MEM_SERIAL},asset=\"${MEM_ASSET}\""
+    smb+=" -smbios type=17,serial=\"$(qemu_escape_commas "${MEM_SERIAL}")\",asset=\"$(qemu_escape_commas "${MEM_ASSET}")\""
   fi
   smb+=" -smbios type=4,manufacturer=\"$(qemu_escape_commas "${SMBIOS_CPU_MFG}")\",version=\"$(qemu_escape_commas "${SMBIOS_CPU_VERSION}")\""
   smb+=" -smbios type=9"
@@ -875,11 +963,45 @@ function build_args() {
     fi
   fi
 
-  # PCI globals: S3/S4 sleep + hotplug disable
+  # Discrete GPU passthrough (NVIDIA / AMD dGPU) — full PCIe passthrough via qm set
+  # in the create flow (handled below). Here we resolve the device + decide display.
+  if [[ "$DGPU_ENABLE" == true ]]; then
+    # (iGPU+dGPU mutual exclusion is enforced earlier, in the validation phase.)
+    local dgpu_info
+    dgpu_info=$(detect_dgpu "$DGPU_PCI")
+    IFS=: read -r DGPU_VENDOR DGPU_PCI <<< "$dgpu_info"
+    if [[ -n "$DGPU_ROM" && ! -f "/usr/share/kvm/${DGPU_ROM}" ]]; then
+      msg_error "GPU vBIOS ROM not found: /usr/share/kvm/${DGPU_ROM} (place the dumped ROM there)." >&2; exit 1
+    fi
+    if [[ "$DGPU_PRIMARY" == true ]]; then
+      [[ "$VGA" != "none" ]] && msg_warn "--gpu-primary set — overriding --vga '${VGA}' to 'none' (dGPU drives the only display)"
+      VGA="none"
+      echo -e "${GPU}${BOLD}${DGN}${DGPU_VENDOR^^} dGPU as PRIMARY display (x-vga=1, vga=none)${CL}"
+    else
+      # Release-recommended "mirror" mode: keep the VMware-compatible display as the
+      # console/anti-detection adapter; pass the dGPU as a secondary device.
+      echo -e "${GPU}${BOLD}${DGN}${DGPU_VENDOR^^} dGPU passthrough (secondary; ${VGA} display kept for console/mirror)${CL}"
+    fi
+    [[ "$DGPU_VENDOR" == "nvidia" ]] && echo -e "${GPU}${BOLD}${DGN}NVIDIA Code 43: mitigated by hypervisor=off + patched KVM (driver 465+ needs nothing more; use --type laptop for old Optimus drivers)${CL}"
+  fi
+
+  # PCI/ACPI global. Verified against sources (QEMU hw/acpi/ich9.c, PVE QemuServer.pm,
+  # and the upstream qemu-autoGenPatch.patch) to avoid duplicating defaults:
+  #   * acpi-pci-hotplug-with-bridge-support=off — q35 defaults this ON since QEMU
+  #     6.1. Turning it off makes the guest use native PCIe hotplug (what real
+  #     hardware uses) and drops the QEMU-specific ACPI PCI-hotplug objects from the
+  #     DSDT. PVE emits this same global only as a fix-up for pre-6.1 VMs, so there
+  #     is no duplicate/conflict for a freshly-created VM, and QEMU boots fine with
+  #     it (PVE itself uses it). This is a deliberate anti-detection addition (not in
+  #     upstream's args, but non-conflicting and safe).
+  #   * We intentionally DO NOT set ICH9-LPC.disable_s3 / disable_s4: QEMU already
+  #     defaults BOTH to 0 (S3/S4 ENABLED — confirmed `pm->disable_s3 = 0;` in
+  #     hw/acpi/ich9.c), PVE never overrides them, and the patched binary doesn't
+  #     touch them (it only ADDS the FADT sleep registers so sleep works). Setting
+  #     them here would just duplicate the default. Upstream's recommended args omit
+  #     them too. Real PCs support sleep, so the enabled default is exactly right.
   PCI_ARGS=" -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"
-  PCI_ARGS+=" -global ICH9-LPC.disable_s3=0"
-  PCI_ARGS+=" -global ICH9-LPC.disable_s4=0"
-  echo -e "${SEC}${BOLD}${DGN}S3/S4 sleep enabled · ACPI hotplug disabled${CL}"
+  echo -e "${SEC}${BOLD}${DGN}Native PCIe hotplug · S3/S4 at QEMU default (enabled)${CL}"
 
   FULL_ARGS="${ACPI_ARGS} -cpu ${CPU_FLAGS}${smb}${IGPU_ARGS}${PCI_ARGS}"
 }
@@ -908,6 +1030,10 @@ function inject_nvram() {
   [[ -z "$efidisk_path" ]] && { msg_warn "Could not resolve EFI disk path"; return; }
 
   local backup="/root/pve-realpc/efidisk-${vmid}-pristine.qcow2"
+  # Ensure the backup dir exists — deploy may run without setup having created
+  # WORK_DIR; otherwise the pristine backup AND the failure-path restore both
+  # silently no-op (cp ... || true), risking a half-converted efidisk.
+  mkdir -p "$(dirname "$backup")" 2>/dev/null || true
   cp "$efidisk_path" "$backup" 2>/dev/null || true
 
   local work="/tmp/pve-nvram-${vmid}"
@@ -935,7 +1061,9 @@ function inject_nvram() {
       printf '\n    ]\n}\n'
     } > "$json"
 
-    local count; count=$(grep -c '"name"' "$json" 2>/dev/null || echo "0")
+    # NB: `grep -c` prints 0 AND exits 1 on no match; `$(... || echo 0)` would yield
+    # the two-line string "0\n0" and break the numeric test below. Use `|| count=0`.
+    local count; count=$(grep -c '"name"' "$json" 2>/dev/null) || count=0
     if [[ "$count" -ge 2 ]]; then
       virt-fw-vars --input "$orig" --output "$new" --secure-boot --set-json "$json" 2>/dev/null || true
       if [[ -f "$new" ]]; then
@@ -992,6 +1120,18 @@ arch_check
 pve_check
 ssh_check
 parse_args "$@"
+
+# Inspection modes (--dump-args / --dry-run) are meant to be captured, e.g.
+#   args=$(./pve-realpc-deploy-vm.sh --dump-args ...)
+# so their stdout must carry ONLY the requested report. Route all progress/status
+# to stderr now (still visible on a terminal) and restore the original stdout on
+# fd 3 just before printing the report in each block below.
+DUMP_REDIRECT=false
+if [[ "${DUMP_ARGS:-false}" == true || "${DRY_RUN:-false}" == true ]]; then
+  exec 3>&1 1>&2
+  DUMP_REDIRECT=true
+fi
+
 start_script
 
 # --- Validate ---
@@ -999,6 +1139,11 @@ validate_prerequisites
 
 case "$VM_TYPE" in desktop|laptop) ;; *) msg_error "Invalid --type '${VM_TYPE}'. Use: desktop | laptop"; exit 1 ;; esac
 case "$VGA" in std|vmware|none|virtio) ;; *) msg_error "Invalid --vga '${VGA}'."; exit 1 ;; esac
+# iGPU and discrete-GPU passthrough both occupy hostpci0 — pick one.
+if [[ "$IGPU_ENABLE" == true && "$DGPU_ENABLE" == true ]]; then
+  msg_error "Choose either --igpu (integrated) OR --nvidia/--gpu-pci (discrete) — both use hostpci0, not both."
+  exit 1
+fi
 
 ISO_TYPE=$(echo "$ISO_TYPE" | tr '[:upper:]' '[:lower:]')
 
@@ -1042,12 +1187,18 @@ IFS=: read -r CORES THREADS SMP_TOTAL <<< "$TOPOLOGY"
 DISK_SERIAL="${DISK_SERIAL:-$(random_serial_20)}"
 MEM_SERIAL="${MEM_SERIAL:-$(random_hex 8)}"
 if [[ -z "$MEM_ASSET" ]]; then
-  MEM_ASSET=$(LC_ALL=C tr -dc '0-9' </dev/urandom | head -c 10)
-  _mt=0
-  while [[ ${#MEM_ASSET} -lt 10 && _mt -lt 20 ]]; do
-    MEM_ASSET="$(LC_ALL=C tr -dc '1-9' </dev/urandom | head -c 1)${MEM_ASSET}"; _mt=$((_mt + 1))
-  done
-  [[ ${#MEM_ASSET} -lt 10 ]] && MEM_ASSET="${MEM_ASSET}$(printf '%010d' "$((RANDOM * RANDOM))")" && MEM_ASSET="${MEM_ASSET:0:10}"
+  # GitHub issue #1 (ctnhobb): `tr -dc '0-9' </dev/urandom | head -c 10` makes tr read
+  # /dev/urandom forever while head closes the pipe after 10 bytes — tr is killed by
+  # SIGPIPE (exit 141), aborting the script under set -e/pipefail on Debian/PVE.
+  # Fix: BOUNDED read (od -N32, same approach as random_hex) + bash truncation. No
+  # head, no pipe-close, no SIGPIPE. 32 bytes printed as decimals give >=32 digit
+  # chars, so we always have at least 10.
+  MEM_ASSET=$(od -An -tu1 -N32 /dev/urandom 2>/dev/null | tr -dc '0-9')
+  MEM_ASSET="${MEM_ASSET:0:10}"
+  # Defensive fallback (only if /dev/urandom/od were unavailable): pad with $RANDOM,
+  # which needs no external process and cannot SIGPIPE.
+  while [[ ${#MEM_ASSET} -lt 10 ]]; do MEM_ASSET="${MEM_ASSET}${RANDOM}"; done
+  MEM_ASSET="${MEM_ASSET:0:10}"
 fi
 echo -e "${DISK}${BOLD}${DGN}Disk serial: ${BGN}${DISK_SERIAL}${CL}"
 echo -e "${DISK}${BOLD}${DGN}Memory serial: ${BGN}${MEM_SERIAL}${CL}  asset: ${BGN}${MEM_ASSET}${CL}"
@@ -1055,8 +1206,21 @@ echo -e "${DISK}${BOLD}${DGN}Memory serial: ${BGN}${MEM_SERIAL}${CL}  asset: ${B
 # --- Build QEMU args ---
 build_args
 
+# VGA option-ROM advisory (max-stealth note). The Debian release ships scrubbed
+# vgabios-stdvga.bin / vgabios-qxl.bin, but the PVE deb's vgabios-vmware.bin and
+# vgabios-virtio.bin are stock blobs that may still carry "QEMU"/"VMware" strings in
+# the VGA option ROM (setup.sh verification warns about this). The PCI-ID is patched
+# either way, so device-ID detection is covered; this only concerns firmware/option-ROM
+# string scans. For maximum stealth use --vga std (fully scrubbed ROM); vmware is kept
+# as the default for best 3D per upstream's recommendation.
+if [[ "$VGA" == "vmware" || "$VGA" == "virtio" ]]; then
+  msg_warn "VGA '${VGA}': option ROM may contain VM strings (only stdvga/qxl are scrubbed upstream)."
+  msg_warn "  For maximum anti-detection use --vga std; keep ${VGA} only if you need its 3D path."
+fi
+
 # --- Dry-run: show config and exit ---
 if [[ "$DRY_RUN" == true ]]; then
+  [[ "$DUMP_REDIRECT" == true ]] && exec 1>&3 3>&-   # restore stdout for the report
   echo ""
   echo -e "${BOLD}${GN}╔════════════════════ DRY RUN ════════════════════╗${CL}"
   echo -e "${BOLD}${GN}║${CL}  No VM will be created. Config preview:         ${BOLD}${GN}║${CL}"
@@ -1072,6 +1236,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo -e "${BOLD}${GN}║${CL}  ISO:       ${ISO_FILE:-none}"
   [[ "$ADD_TPM" == true ]] && echo -e "${BOLD}${GN}║${CL}  TPM:       enabled"
   [[ "$IGPU_ENABLE" == true ]] && echo -e "${BOLD}${GN}║${CL}  iGPU:      ${IGPU_VENDOR:-?} ${IGPU_PCI:-}"
+  [[ "$DGPU_ENABLE" == true ]] && echo -e "${BOLD}${GN}║${CL}  dGPU:      ${DGPU_VENDOR:-?} ${DGPU_PCI%.*}  ($([[ "$DGPU_PRIMARY" == true ]] && echo primary/x-vga || echo "secondary/${VGA} console")${DGPU_ROM:+, rom=$DGPU_ROM})"
   [[ -n "$AFFINITY" ]] && echo -e "${BOLD}${GN}║${CL}  Affinity:  ${AFFINITY}"
   echo -e "${BOLD}${GN}╠══════════════════════════════════════════════════╣${CL}"
   echo -e "${BOLD}${GN}║${CL}  args:"
@@ -1085,8 +1250,9 @@ if [[ "$DRY_RUN" == true ]]; then
   exit 0
 fi
 
-# --- Dump-args: print args line and exit ---
+# --- Dump-args: print ONLY the args line and exit (clean for capture) ---
 if [[ "$DUMP_ARGS" == true ]]; then
+  [[ "$DUMP_REDIRECT" == true ]] && exec 1>&3 3>&-   # restore stdout; emit args alone
   echo "$FULL_ARGS"
   CLEANUP_VMID=""
   trap - ERR EXIT
@@ -1153,6 +1319,20 @@ if [[ "$IGPU_ENABLE" == true ]]; then
   msg_ok "${IGPU_VENDOR^^} iGPU passthrough configured"
 fi
 
+# Discrete GPU passthrough (NVIDIA / AMD dGPU)
+if [[ "$DGPU_ENABLE" == true ]]; then
+  msg_info "Adding ${DGPU_VENDOR^^} dGPU passthrough"
+  # Pass the WHOLE device (all functions = GPU + HDMI audio) by stripping the
+  # function from the address; pcie=1 (requires q35, which we use). x-vga=1 only
+  # when the dGPU is the primary display.
+  DGPU_DEV="${DGPU_PCI%.*}"
+  DGPU_OPT="${DGPU_DEV},pcie=1"
+  [[ "$DGPU_PRIMARY" == true ]] && DGPU_OPT+=",x-vga=1"
+  [[ -n "$DGPU_ROM" ]] && DGPU_OPT+=",romfile=${DGPU_ROM}"
+  qm set "$VMID" --hostpci0 "$DGPU_OPT"
+  msg_ok "${DGPU_VENDOR^^} dGPU passthrough: hostpci0=${DGPU_OPT}"
+fi
+
 # SATA disk
 msg_info "Adding SATA disk"
 DISK_SIZE_GB=$(parse_disk_size_gb "$DISK_SIZE")
@@ -1212,6 +1392,10 @@ if [[ "$IGPU_ENABLE" == true ]]; then
   printf "${BOLD}${GN}║${CL}    ${GN}✓${CL} %-60s ${BOLD}${GN}║${CL}\n" "${IGPU_VENDOR^^} iGPU passthrough (${IGPU_ROM:-no ROM})"
   [[ "$IGPU_VENDOR" == "intel" ]] && printf "${BOLD}${GN}║${CL}    ${GN}✓${CL} %-60s ${BOLD}${GN}║${CL}\n" "IGD: opregion=on, GMS=${IGPU_GMS}"
 fi
+if [[ "$DGPU_ENABLE" == true ]]; then
+  printf "${BOLD}${GN}║${CL}    ${GN}✓${CL} %-60s ${BOLD}${GN}║${CL}\n" "${DGPU_VENDOR^^} dGPU passthrough ($([[ "$DGPU_PRIMARY" == true ]] && echo "primary x-vga" || echo "secondary/mirror"))"
+  printf "${BOLD}${GN}║${CL}    ${GN}✓${CL} %-60s ${BOLD}${GN}║${CL}\n" "hostpci0: ${DGPU_PCI%.*},pcie=1${DGPU_ROM:+,romfile=$DGPU_ROM}"
+fi
 echo -e "${BOLD}${GN}║${CL}                                                                  ${BOLD}${GN}║${CL}"
 echo -e "${BOLD}${GN}╠══════════════════════════════════════════════════════════════════╣${CL}"
 echo -e "${BOLD}${GN}║${CL}  ${BOLD}Start:${CL}  qm start ${VMID}                                               ${BOLD}${GN}║${CL}"
@@ -1241,6 +1425,7 @@ SUMMARY="/root/vm-${VMID}-deploy-summary.txt"
   echo "ISO:      ${ISO_FILE:-none}"
   [[ -n "$AFFINITY" ]] && echo "Affinity: ${AFFINITY}"
   [[ "$IGPU_ENABLE" == true ]] && echo "iGPU:     ${IGPU_VENDOR^^} ${IGPU_PCI} (ROM: ${IGPU_ROM:-none})"
+  [[ "$DGPU_ENABLE" == true ]] && echo "dGPU:     ${DGPU_VENDOR^^} ${DGPU_PCI%.*},pcie=1 ($([[ "$DGPU_PRIMARY" == true ]] && echo primary || echo secondary/mirror)${DGPU_ROM:+, ROM: $DGPU_ROM})"
   echo ""
   echo "--- Config ---"
   cat "$CONF_FILE"

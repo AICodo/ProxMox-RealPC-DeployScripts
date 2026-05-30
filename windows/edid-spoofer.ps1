@@ -95,6 +95,12 @@ foreach ($wmiMon in $wmiMonitors) {
         }
     }
 
+    # Reconcile the extension-block count (byte 126) with the blocks we actually
+    # fetched and will write below. If an extension fetch failed above, byte 126 would
+    # otherwise still claim more blocks than exist -> a malformed EDID the driver may
+    # reject. (This is part of bytes 0-126, so the checksum recompute below covers it.)
+    $targetBlock[126] = [byte]([Math]::Max(0, $edidBlocks.Count - 1))
+
     # EDID[127]: Checksum recomputed to satisfy (sum of bytes 0-127) % 256 = 0
     $sum = 0
     for ($i = 0; $i -lt 127; $i++) { $sum += $targetBlock[$i] }
@@ -123,14 +129,21 @@ Write-Host "[+] EDID override written for all detected monitors." -ForegroundCol
 # Match AutoVirt's 3 second wait between disable and enable - 500ms is unreliable
 # on slower hosts / multi-monitor setups and the graphics stack can fail to
 # release / reattach cleanly, leaving the EDID override unapplied until reboot.
-Write-Host "[*] Restarting graphics driver to apply EDID changes..." -ForegroundColor Cyan
-Get-PnpDevice -Class Display | Where-Object { $_.Status -eq 'OK' } |
-ForEach-Object {
-    try {
-        Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
-        Start-Sleep -Seconds 3
-        Enable-PnpDevice  -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
-    } catch {
-        Write-Host "[!] Failed to restart display device $($_.InstanceId): $_" -ForegroundColor Yellow
+# Guard the PnpDevice cmdlets: they live in the PnpDevice module, which is absent on
+# some stripped SKUs. The override is already written to the registry above, so if we
+# can't live-restart, it still applies on the next reboot (run-tools.bat reboots).
+if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
+    Write-Host "[*] Restarting graphics driver to apply EDID changes..." -ForegroundColor Cyan
+    Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'OK' } |
+    ForEach-Object {
+        try {
+            Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
+            Start-Sleep -Seconds 3
+            Enable-PnpDevice  -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
+        } catch {
+            Write-Host "[!] Failed to restart display device $($_.InstanceId): $_" -ForegroundColor Yellow
+        }
     }
+} else {
+    Write-Host "[!] Get-PnpDevice unavailable - EDID override will apply on next reboot." -ForegroundColor Yellow
 }

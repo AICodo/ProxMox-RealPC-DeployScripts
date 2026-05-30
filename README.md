@@ -70,6 +70,32 @@ The Windows tools are heavily rewritten from [Scrut1ny/AutoVirt](https://github.
 
 ---
 
+## GPU Passthrough
+
+The display defaults to **`std`** for maximum stealth: the Debian release ships a scrubbed `vgabios-stdvga.bin` (no `QEMU`/`Bochs` option-ROM strings) and Windows shows a generic "Standard VGA" adapter. Both `std` and `vmware` have patched (non-`0x1234`/`0x15ad`) PCI-IDs, but the `vmware`/`virtio` option ROMs are **not** scrubbed upstream — so use `--vga vmware` only if you need its better 3D path (e.g. dGPU *mirror* mode), accepting the option-ROM string trade-off.
+
+**Integrated GPU (Intel/AMD):**
+
+```bash
+./pve-realpc-setup.sh --igpu          # host: IOMMU + blacklist i915/amdgpu + VFIO + Intel ROM
+./pve-realpc-deploy-vm.sh --igpu      # VM:   auto-detect iGPU, Intel IGD opregion/GMS
+```
+
+**Discrete NVIDIA / AMD GPU (full PCIe passthrough):**
+
+```bash
+./pve-realpc-setup.sh --nvidia        # host: IOMMU (GRUB + systemd-boot), blacklist
+                                      #       nouveau/nvidia, bind the card's functions
+                                      #       (GPU + HDMI audio) to vfio-pci by ID, then REBOOT
+./pve-realpc-deploy-vm.sh --nvidia    # VM:   pass whole card via pcie=1; keeps the VMware
+                                      #       display for console ("mirror"). --gpu-primary
+                                      #       makes the dGPU the only display (x-vga=1).
+```
+
+NVIDIA **Code 43** is handled by `hypervisor=off` + the patched KVM (driver 465+ needs nothing more). For old Optimus/laptop drivers, add `--type laptop` (virtual battery). Pass an explicit card with `--gpu-pci 0000:01:00`, and a dumped vBIOS with `--gpu-rom card.rom` (placed in `/usr/share/kvm/`). `--igpu` and `--nvidia` are mutually exclusive (both use `hostpci0`).
+
+---
+
 ## Source Repositories
 
 ### Primary upstream

@@ -14,6 +14,7 @@
 #   8. Installation of patched KVM kernel module (Intel or AMD)
 #   9. Placement of ACPI table files (/root/)
 #  10. iGPU passthrough setup — Intel or AMD (optional, --igpu)
+#  10b. Discrete NVIDIA/AMD GPU passthrough host prep (optional, --nvidia)
 #  11. Package pinning (prevent apt from overwriting patched QEMU/OVMF)
 #  12. Verification of installation
 #
@@ -23,7 +24,7 @@
 #          bash pve-realpc-setup.sh --help             # full flag reference
 #
 # Common overrides:
-#   --no-strong / --skip-pin / --skip-kernel-downgrade / --skip-download / --igpu
+#   --no-strong / --skip-pin / --skip-kernel-downgrade / --skip-download / --igpu / --nvidia
 #   --release-tag TAG / --strong-tag TAG / --debian-tag TAG
 #
 # Requires: root on a Proxmox VE 9 host, internet access (for downloads & API resolver)
@@ -104,6 +105,7 @@ SKIP_DOWNLOAD=false
 SKIP_PIN=false
 SKIP_KERNEL_DOWNGRADE=false
 ENABLE_IGPU=false
+ENABLE_NVIDIA=false               # discrete NVIDIA/AMD GPU passthrough host prep
 ENABLE_STRONG=true
 NEEDS_REBOOT=false
 INTERACTIVE_MODE=auto             # auto = run interactive when stdin is a tty
@@ -126,6 +128,7 @@ while (( $# > 0 )); do
         --skip-pin)               SKIP_PIN=true ;;
         --skip-kernel-downgrade)  SKIP_KERNEL_DOWNGRADE=true ;;
         --igpu)                   ENABLE_IGPU=true ;;
+        --nvidia|--dgpu)          ENABLE_NVIDIA=true ;;
         --no-strong)              ENABLE_STRONG=false ;;
         --interactive)            INTERACTIVE_MODE=force ;;
         --non-interactive)        INTERACTIVE_MODE=off ;;
@@ -170,7 +173,11 @@ Advanced / unattended use (flags only needed when not running interactively)
     --skip-resolve          Don't query GitHub API; use static fallback tags
 
   Override the install behaviour (all also available as prompts)
-    --igpu                  Enable iGPU passthrough host config
+    --igpu                  Enable iGPU (integrated Intel/AMD) passthrough host config
+    --nvidia                Prep host for discrete NVIDIA/AMD GPU passthrough:
+                            IOMMU (GRUB + systemd-boot), blacklist nouveau/nvidia,
+                            bind the dGPU's functions to vfio-pci by ID, VFIO modules,
+                            initramfs rebuild. Reboot after. Then deploy with --nvidia.
     --no-strong             Skip Strong overlay (no sensor passthrough, no
                             kernel pin to 6.17.13-2)
     --skip-pin              Skip APT package pinning
@@ -224,7 +231,7 @@ cleanup_on_interrupt() {
     [[ ${#CLEANUP_FILES[@]} -gt 0 ]] && rm -f "${CLEANUP_FILES[@]}" 2>/dev/null || true
     if [[ -f "$STATE_FILE" ]]; then
         local done_steps
-        done_steps=$(tr '\n' ', ' < "$STATE_FILE" | sed 's/, $//')
+        done_steps=$(tr '\n' ',' < "$STATE_FILE" | sed 's/,$//; s/,/, /g')
         warn "Completed steps before interrupt: ${done_steps}"
     fi
     warn "Download cache preserved in ${WORK_DIR}. Re-run to resume."
@@ -257,7 +264,9 @@ check_disk_space() {
     local path="$1" min_mb="${2:-250}"
     local avail_kb avail_mb
     mkdir -p "$path" 2>/dev/null || true
-    avail_kb=$(df -k "$path" 2>/dev/null | awk 'NR==2 {print $4}')
+    # -P (POSIX): guarantees one physical line per filesystem, so NR==2/$4 is the
+    # available-KB field even when the device name is long (plain `df -k` wraps it).
+    avail_kb=$(df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}')
     if [[ -z "$avail_kb" || "$avail_kb" -lt $((min_mb * 1024)) ]]; then
         fail "Low disk space: ${path} has ${avail_kb:-?}KB free (need >= ${min_mb}MB). Free up space and retry."
     fi
@@ -274,7 +283,8 @@ check_pve9() {
         fail "pveversion not found — this script requires Proxmox VE."
     fi
     local pve_ver
-    pve_ver=$(pveversion 2>/dev/null | grep -oP 'pve-manager/\K[0-9]+')
+    # `|| true`: under set -euo pipefail a non-matching grep (exit 1) would abort here.
+    pve_ver=$(pveversion 2>/dev/null | grep -oP 'pve-manager/\K[0-9]+' || true)
     if [[ "$pve_ver" != "8" && "$pve_ver" != "9" ]]; then
         warn "Detected PVE major version ${pve_ver}. This release targets PVE 9. Proceed with caution."
     fi
@@ -292,6 +302,144 @@ detect_cpu_vendor() {
     else
         fail "Could not detect CPU vendor from /proc/cpuinfo."
     fi
+}
+
+# Enable IOMMU (intel_iommu/amd_iommu + iommu=pt) on the host kernel cmdline.
+# Idempotent; sets NEEDS_REBOOT when it changes anything. Handles BOTH boot stacks
+# PVE uses: GRUB (/etc/default/grub) and systemd-boot (/etc/kernel/cmdline via
+# proxmox-boot-tool). The IOMMU flavour follows the host CPU, not the GPU.
+enable_iommu_in_grub() {
+    local iommu_param changed=false found_bootcfg=false
+    [[ "$(detect_cpu_vendor)" == "intel" ]] && iommu_param="intel_iommu=on" || iommu_param="amd_iommu=on"
+
+    # GRUB
+    local grub_file="/etc/default/grub"
+    if [[ -f "$grub_file" ]]; then
+        found_bootcfg=true
+        cp "$grub_file" "${BACKUP_DIR}/grub.default.gpu.bak" 2>/dev/null || true
+        local p
+        for p in "$iommu_param" "iommu=pt"; do
+            if ! grep -q "$p" <(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file" 2>/dev/null) 2>/dev/null; then
+                if dry_guard "add '${p}' to GRUB_CMDLINE_LINUX_DEFAULT"; then
+                    sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"\([^\"]*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\\1 ${p}\"/" "$grub_file"
+                    validate_config_line "$grub_file" "$p" "${p} in GRUB"
+                    changed=true
+                fi
+            fi
+        done
+        # `|| warn` (not a bare pipeline): under set -e/pipefail a non-zero update-grub
+        # would otherwise abort the whole setup here.
+        if [[ "$changed" == true ]] && command -v update-grub &>/dev/null && dry_guard "update-grub"; then
+            update-grub 2>&1 | tail -3 || warn "update-grub returned non-zero — review boot config before reboot"
+        fi
+    fi
+
+    # systemd-boot (ZFS / UEFI PVE installs): single-line kernel cmdline
+    local sd_cmdline="/etc/kernel/cmdline"
+    if [[ -f "$sd_cmdline" ]]; then
+        found_bootcfg=true
+        cp "$sd_cmdline" "${BACKUP_DIR}/kernel-cmdline.gpu.bak" 2>/dev/null || true
+        local p
+        for p in "$iommu_param" "iommu=pt"; do
+            if ! grep -qw -- "$p" "$sd_cmdline" 2>/dev/null; then
+                if dry_guard "append '${p}' to ${sd_cmdline}"; then
+                    # `1 s` — /etc/kernel/cmdline is a single-line file; only ever
+                    # touch line 1 so a stray trailing line can't get a param appended.
+                    sed -i "1 s|\$| ${p}|" "$sd_cmdline"
+                    validate_config_line "$sd_cmdline" "$p" "${p} in kernel cmdline"
+                    changed=true
+                fi
+            fi
+        done
+        if [[ "$changed" == true ]] && command -v proxmox-boot-tool &>/dev/null && dry_guard "proxmox-boot-tool refresh"; then
+            proxmox-boot-tool refresh 2>&1 | tail -3 || warn "proxmox-boot-tool refresh returned non-zero — review boot config before reboot"
+        fi
+    fi
+
+    if [[ "$found_bootcfg" != true ]]; then
+        warn "No /etc/default/grub or /etc/kernel/cmdline found — add '${iommu_param} iommu=pt' to your kernel cmdline manually."
+    elif [[ "$changed" == true ]]; then
+        NEEDS_REBOOT=true
+        ok "IOMMU enabled on host kernel cmdline (${iommu_param} iommu=pt) — reboot required"
+    else
+        ok "IOMMU already enabled (${iommu_param} iommu=pt)"
+    fi
+}
+
+# Configure the host for discrete NVIDIA/AMD GPU passthrough:
+#   IOMMU on, host GPU driver blacklisted, GPU + its functions (HDMI audio, etc.)
+#   bound to vfio-pci by vendor:device ID, VFIO modules at boot, initramfs rebuilt.
+configure_nvidia_passthrough() {
+    info "Detecting discrete GPU on the host ..."
+    enable_iommu_in_grub
+
+    # Find a discrete GPU (NVIDIA preferred, then AMD) that is NOT on bus 00.
+    local gpu_line vname
+    gpu_line=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA compatible controller|3D controller|Display controller' \
+               | grep -iE 'NVIDIA|\[10de:' | awk '$1 !~ /^0000:00:/{print; exit}' || true)
+    vname="NVIDIA"
+    if [[ -z "$gpu_line" ]]; then
+        gpu_line=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA compatible controller|3D controller|Display controller' \
+                   | grep -iE 'AMD|ATI|Radeon|\[1002:' | awk '$1 !~ /^0000:00:/{print; exit}' || true)
+        vname="AMD"
+    fi
+
+    local ids="" gpu_dev=""
+    if [[ -n "$gpu_line" ]]; then
+        local gpu_addr; gpu_addr=$(awk '{print $1}' <<<"$gpu_line")   # 0000:01:00.0
+        gpu_dev="${gpu_addr%.*}"                                       # 0000:01:00
+        info "Found ${vname} dGPU at ${gpu_dev} — binding all its functions (GPU + audio) to vfio-pci"
+        # Collect the [vendor:device] of every function of this device.
+        ids=$(lspci -Dnn -s "$gpu_dev" 2>/dev/null | grep -oE '\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]' | tr -d '[]' | sort -u | paste -sd, -)
+        [[ -n "$ids" ]] && info "vfio-pci ids = ${ids}"
+    else
+        warn "No discrete GPU auto-detected. Applying IOMMU + driver blacklist + VFIO modules"
+        warn "anyway; after reboot, bind your GPU manually by adding its IDs to:"
+        warn "  /etc/modprobe.d/pve-realpc-vfio.conf  (options vfio-pci ids=VENDOR:DEVICE,...)"
+    fi
+
+    # Blacklist host GPU drivers + bind to vfio-pci early.
+    local vfio_conf="/etc/modprobe.d/pve-realpc-vfio.conf"
+    if dry_guard "create ${vfio_conf} (blacklist host GPU drivers + vfio-pci ids)"; then
+        {
+            echo "# Discrete GPU passthrough — created by pve-realpc-setup.sh --nvidia"
+            echo "# NVIDIA host drivers (and nouveau) must not claim the card:"
+            echo "blacklist nouveau"
+            echo "blacklist nvidia"
+            echo "blacklist nvidiafb"
+            echo "blacklist nvidia_drm"
+            echo "blacklist nvidia_modeset"
+            echo "# AMD discrete (harmless if you have an NVIDIA card):"
+            echo "blacklist amdgpu"
+            echo "blacklist radeon"
+            echo "# Make vfio-pci win the bind race over the GPU drivers:"
+            echo "softdep nouveau pre: vfio-pci"
+            echo "softdep nvidia  pre: vfio-pci"
+            echo "softdep amdgpu  pre: vfio-pci"
+            echo "softdep radeon  pre: vfio-pci"
+            echo "softdep snd_hda_intel pre: vfio-pci"
+            [[ -n "$ids" ]] && echo "options vfio-pci ids=${ids} disable_vga=1"
+            echo "options vfio_iommu_type1 allow_unsafe_interrupts=1"
+        } > "$vfio_conf"
+        ok "Wrote ${vfio_conf}"
+    fi
+
+    # Ensure VFIO modules load at boot.
+    local vfio_modules="/etc/modules-load.d/pve-realpc-vfio.conf"
+    if [[ ! -f "$vfio_modules" ]] && dry_guard "create ${vfio_modules}"; then
+        printf '%s\n' "# VFIO modules for GPU passthrough (pve-realpc-setup.sh --nvidia)" \
+            "vfio" "vfio_iommu_type1" "vfio_pci" > "$vfio_modules"
+        ok "Wrote ${vfio_modules} (vfio, vfio_iommu_type1, vfio_pci)"
+    fi
+
+    # Rebuild initramfs so the blacklist + vfio bind take effect at next boot.
+    info "Rebuilding initramfs for VFIO changes ..."
+    if dry_guard "update-initramfs -u -k all"; then
+        if update-initramfs -u -k all; then ok "Initramfs updated"
+        else warn "Initramfs rebuild failed — check /boot space and kernel consistency"; fi
+    fi
+    NEEDS_REBOOT=true
+    ok "${vname} GPU passthrough host prep complete — REBOOT, then deploy with: pve-realpc-deploy-vm.sh --nvidia"
 }
 
 ###############################################################################
@@ -821,44 +969,59 @@ install_target_kernel() {
         apt-get install -y "$pkg_header" 2>&1 | tail -5 || warn "Headers install skipped (non-critical)"
     fi
 
-    # ── Pin the target kernel as the default GRUB boot entry ──
+    # ── Pin the target kernel as the default boot entry ──
     info "Pinning kernel ${target_kernel} as default boot entry ..."
+    local pinned=false
 
-    # Method 1: proxmox-boot-tool (preferred on PVE with systemd-boot / ZFS boot)
+    # Method 1: proxmox-boot-tool — the correct, bootloader-agnostic way on PVE. It
+    # pins the SPECIFIC version (works for systemd-boot AND GRUB, and for a genuine
+    # downgrade where the target is NOT the newest kernel). Authoritative when it works.
     if command -v proxmox-boot-tool &>/dev/null; then
-        # Check if 'kernel pin' subcommand is supported (added in recent PVE releases)
         if proxmox-boot-tool kernel pin --help &>/dev/null 2>&1; then
             info "Pinning ${target_kernel} via proxmox-boot-tool kernel pin ..."
-            proxmox-boot-tool kernel pin "$target_kernel" 2>&1 | tail -3 || \
-                warn "proxmox-boot-tool kernel pin returned non-zero — GRUB fallback still in effect."
+            if proxmox-boot-tool kernel pin "$target_kernel" 2>&1 | tail -3; then
+                pinned=true
+                ok "Pinned ${target_kernel} via proxmox-boot-tool (authoritative)"
+            else
+                warn "proxmox-boot-tool kernel pin returned non-zero — falling back to GRUB."
+            fi
         else
-            info "proxmox-boot-tool present but 'kernel pin' subcommand not available — using GRUB fallback."
+            info "proxmox-boot-tool present but 'kernel pin' unavailable — refresh + GRUB fallback."
             proxmox-boot-tool refresh 2>&1 | tail -3 || true
         fi
     fi
 
-    # Method 2: GRUB pinning (works on all setups)
-    local grub_default="/etc/default/grub"
-    if [[ -f "$grub_default" ]]; then
-        # Backup current GRUB config
-        cp "$grub_default" "${BACKUP_DIR}/grub.default.bak" 2>/dev/null || true
-
-        # Set GRUB to boot the default (first) entry — PVE sorts by version, newest first
-        if grep -q "^GRUB_DEFAULT=" "$grub_default"; then
-            sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=0/' "$grub_default"
-        else
-            echo 'GRUB_DEFAULT=0' >> "$grub_default"
-        fi
-        validate_config_line "$grub_default" "^GRUB_DEFAULT=0" "GRUB default boot entry"
-
-        # Rebuild GRUB config
-        if command -v update-grub &>/dev/null; then
-            info "Updating GRUB configuration ..."
-            if dry_guard "update-grub"; then
-                update-grub || warn "update-grub returned non-zero — boot config may need manual review"
+    # Method 2: GRUB fallback — ONLY if proxmox-boot-tool didn't authoritatively pin.
+    # GRUB_DEFAULT=0 boots the NEWEST menu entry: correct when the target is the newest
+    # installed kernel (the usual Strong-build case), but WRONG for a real downgrade —
+    # so we detect that and warn instead of silently booting the wrong kernel.
+    if [[ "$pinned" != true ]]; then
+        local grub_default="/etc/default/grub"
+        if [[ -f "$grub_default" ]]; then
+            cp "$grub_default" "${BACKUP_DIR}/grub.default.bak" 2>/dev/null || true
+            if grep -q "^GRUB_DEFAULT=" "$grub_default"; then
+                sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=0/' "$grub_default"
+            else
+                echo 'GRUB_DEFAULT=0' >> "$grub_default"
             fi
+            validate_config_line "$grub_default" "^GRUB_DEFAULT=0" "GRUB default boot entry"
+
+            # If the target is NOT the newest installed kernel, GRUB_DEFAULT=0 can't pin it.
+            local newest_kernel
+            newest_kernel=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's#.*/vmlinuz-##' | sort -V | tail -1 || true)
+            if [[ -n "$newest_kernel" && "$newest_kernel" != "$target_kernel" ]]; then
+                warn "GRUB fallback boots the NEWEST kernel (${newest_kernel}), but the Strong kvm.ko"
+                warn "needs ${target_kernel}. At the GRUB menu choose 'Advanced options' → ${target_kernel},"
+                warn "or install proxmox-boot-tool so it can pin the exact version."
+            fi
+            if command -v update-grub &>/dev/null; then
+                info "Updating GRUB configuration ..."
+                if dry_guard "update-grub"; then
+                    update-grub || warn "update-grub returned non-zero — boot config may need manual review"
+                fi
+            fi
+            ok "GRUB updated (GRUB_DEFAULT=0)"
         fi
-        ok "GRUB configured to boot kernel ${target_kernel}"
     fi
 
     # ── Install the patched kvm.ko into the TARGET kernel's module tree ──
@@ -961,6 +1124,14 @@ download_asset() {
         rm -f "$part"
         fail "Downloaded ${name} is too small (${fsize} bytes) — likely a download error"
     fi
+    # Reject HTML error/interstitial pages for ALL asset types. wget catches 4xx/5xx
+    # by exit code, but a 200-OK HTML page (proxy/CDN/SSO interstitial) would otherwise
+    # be saved as e.g. ssdt.aml or bootsplash.jpg — and .aml/.rom/.bin/.jpg/.patch have
+    # no format integrity check below. No real asset begins with an HTML marker.
+    if head -c 512 "$part" 2>/dev/null | grep -qiE '<!DOCTYPE|<html|<head|<title'; then
+        rm -f "$part"
+        fail "Downloaded ${name} looks like an HTML page, not a binary asset — check the URL/proxy/rate-limit"
+    fi
     # Integrity check for known formats
     if [[ "$name" == *.deb ]]; then
         if ! dpkg-deb --info "$part" &>/dev/null; then
@@ -1029,7 +1200,7 @@ if [[ "$FORCE" != true ]]; then
     fi
     # Warn about half-installed state from a previous interrupted run
     if [[ -f "$STATE_FILE" ]]; then
-        done_steps=$(tr '\n' ', ' < "$STATE_FILE" | sed 's/, $//')
+        done_steps=$(tr '\n' ',' < "$STATE_FILE" | sed 's/,$//; s/,/, /g')
         warn "Previous run was interrupted. Completed steps: ${done_steps}."
         warn "Re-running will resume from the beginning. Backups from first run are preserved."
         warn "Delete ${STATE_FILE} to silence this warning."
@@ -1763,6 +1934,24 @@ VFIOEOF
 else
     info "═══ Step 10/12: iGPU Passthrough Setup ═══"
     info "Skipped (use --igpu to enable iGPU passthrough — supports Intel and AMD)"
+fi
+
+###############################################################################
+# STEP 10b: Discrete NVIDIA / AMD GPU Passthrough host prep (optional, --nvidia)
+###############################################################################
+echo ""
+if [[ "$ENABLE_NVIDIA" == true ]]; then
+    info "═══ Step 10b/12: Discrete GPU Passthrough Setup (--nvidia) ═══"
+    record_step "step_10b"
+    if [[ "$ENABLE_IGPU" == true ]]; then
+        warn "Both --igpu and --nvidia given. iGPU blacklists i915/amdgpu; the discrete"
+        warn "config additionally blacklists nouveau/nvidia and binds the dGPU to vfio-pci."
+        warn "Make sure these don't target the GPU you actually want the HOST to keep."
+    fi
+    configure_nvidia_passthrough
+else
+    info "═══ Step 10b/12: Discrete GPU Passthrough ═══"
+    info "Skipped (use --nvidia to prep host for NVIDIA/AMD dGPU passthrough)"
 fi
 
 ###############################################################################
