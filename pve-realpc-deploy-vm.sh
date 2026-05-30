@@ -173,7 +173,7 @@ function random_serial_20() {
   local _tries=0
   while [[ ${#pool} -lt 20 && _tries -lt 20 ]]; do
     pool+=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n' | tr '[:lower:]' '[:upper:]' | LC_ALL=C tr -dc 'A-Z0-9')
-    pool="${pool:0:20}"; ((_tries++))
+    pool="${pool:0:20}"; _tries=$((_tries + 1))
   done
   while [[ ${#pool} -lt 20 ]]; do pool+='X'; done
   echo "$pool"
@@ -215,9 +215,12 @@ function pick_storage() {
   if ! storage_supports "$storage" "$content"; then
     storage=$(pvesm status -content "$content" 2>/dev/null | awk 'NR>1 && $3 == "active" { print $1; exit }')
     if [[ -n "$storage" ]]; then
-      msg_warn "Default ${label} storage '${default}' unavailable — using '${storage}'"
+      # UI must go to stderr: this function's stdout is captured by the caller
+      # ($(pick_storage ...)). Anything on stdout other than the final value
+      # corrupts the returned storage name.
+      msg_warn "Default ${label} storage '${default}' unavailable — using '${storage}'" >&2
     else
-      msg_error "No active storage with '${content}' content found. Pass --${label,,}-storage explicitly."
+      msg_error "No active storage with '${content}' content found. Pass --${label,,}-storage explicitly." >&2
       exit 1
     fi
   fi
@@ -239,13 +242,18 @@ function resolve_iso_path() {
 }
 
 function pick_iso() {
+  # IMPORTANT: this function's stdout IS its return value (captured via
+  # `ISO_FILE=$(pick_iso ...)`). Every human-facing line — menus, prompts,
+  # msg_* — MUST go to stderr (>&2), or it gets concatenated into the returned
+  # ISO filename and breaks the later `qm set --ide2 ...:iso/<garbage>` call.
+  # Only the bare `echo "<filename>"` / `echo ""` lines write to stdout.
   local iso_dir="$1" iso_file="$2" iso_type="$3" vmid="$4" iso_storage="$5"
 
   mapfile -t ALL_ISOS < <(find "$iso_dir" -maxdepth 1 -name "*.iso" -printf '%f\n' 2>/dev/null | sort)
 
   if [[ ${#ALL_ISOS[@]} -eq 0 ]]; then
-    msg_warn "No ISO files found in ${iso_dir}."
-    msg_warn "Attach later: qm set ${vmid} -ide2 ${iso_storage}:iso/YOUR_ISO.iso,media=cdrom"
+    msg_warn "No ISO files found in ${iso_dir}." >&2
+    msg_warn "Attach later: qm set ${vmid} -ide2 ${iso_storage}:iso/YOUR_ISO.iso,media=cdrom" >&2
     echo ""
     return
   fi
@@ -257,7 +265,7 @@ function pick_iso() {
 
   # Only one ISO — use it
   if [[ ${#ALL_ISOS[@]} -eq 1 && -z "$iso_type" ]]; then
-    msg_ok "Auto-selected ISO: ${ALL_ISOS[0]}"
+    msg_ok "Auto-selected ISO: ${ALL_ISOS[0]}" >&2
     echo "${ALL_ISOS[0]}"; return
   fi
 
@@ -274,38 +282,38 @@ function pick_iso() {
         ;;
     esac
     if [[ ${#FILTERED[@]} -eq 1 ]]; then
-      msg_ok "Auto-selected ${iso_type} ISO: ${FILTERED[0]}"
+      msg_ok "Auto-selected ${iso_type} ISO: ${FILTERED[0]}" >&2
       echo "${FILTERED[0]}"; return
     elif [[ ${#FILTERED[@]} -gt 1 ]]; then
       # Multiple matches — present interactive picker of filtered ISOs
-      echo ""
-      msg_info "${iso_type^^} ISO Selection — ${#FILTERED[@]} matches"
+      echo "" >&2
+      msg_info "${iso_type^^} ISO Selection — ${#FILTERED[@]} matches" >&2
       for i in "${!FILTERED[@]}"; do
-        echo -e "   $((i+1))) ${FILTERED[$i]}"
+        echo -e "   $((i+1))) ${FILTERED[$i]}" >&2
       done
-      echo -e "   0)  Skip — no ISO"
+      echo -e "   0)  Skip — no ISO" >&2
       while true; do
         read -rp "Select [0-${#FILTERED[@]}, Enter=skip]: " choice
         [[ -z "$choice" ]] && choice=0
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice <= ${#FILTERED[@]} )); then
           if (( choice == 0 )); then
-            msg_warn "No ISO selected. Attach later: qm set ${vmid} -ide2 ${iso_storage}:iso/YOUR_ISO.iso,media=cdrom"
+            msg_warn "No ISO selected. Attach later: qm set ${vmid} -ide2 ${iso_storage}:iso/YOUR_ISO.iso,media=cdrom" >&2
             echo ""
           else
-            msg_ok "Selected: ${FILTERED[$((choice-1))]}"
+            msg_ok "Selected: ${FILTERED[$((choice-1))]}" >&2
             echo "${FILTERED[$((choice-1))]}"
           fi
           return
         fi
-        msg_warn "Enter 0..${#FILTERED[@]} (0 or Enter to skip)."
+        msg_warn "Enter 0..${#FILTERED[@]} (0 or Enter to skip)." >&2
       done
     fi
-    msg_error "No ${iso_type} ISOs matched. Use --iso FILENAME or remove --iso-type."; exit 1
+    msg_error "No ${iso_type} ISOs matched. Use --iso FILENAME or remove --iso-type." >&2; exit 1
   fi
 
   # Interactive picker
-  echo ""
-  msg_info "ISO Selection — found ${#ALL_ISOS[@]} files"
+  echo "" >&2
+  msg_info "ISO Selection — found ${#ALL_ISOS[@]} files" >&2
   for i in "${!ALL_ISOS[@]}"; do
     local tag=""
     if echo "${ALL_ISOS[$i]}" | grep -iqE "$SLIM_PATTERNS"; then
@@ -313,23 +321,23 @@ function pick_iso() {
     elif echo "${ALL_ISOS[$i]}" | grep -iqE "$STOCK_PATTERNS"; then
       tag="[STOCK]"
     fi
-    echo -e "   $((i+1))) ${YW}${tag}${CL}${ALL_ISOS[$i]}"
+    echo -e "   $((i+1))) ${YW}${tag}${CL}${ALL_ISOS[$i]}" >&2
   done
-  echo -e "   0)  Skip — no ISO"
+  echo -e "   0)  Skip — no ISO" >&2
   while true; do
     read -rp "Select ISO [0-${#ALL_ISOS[@]}, Enter=skip]: " choice
     [[ -z "$choice" ]] && choice=0
     if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 0 && choice <= ${#ALL_ISOS[@]} )); then
       if (( choice == 0 )); then
-        msg_warn "No ISO selected. Attach later: qm set ${vmid} -ide2 ${iso_storage}:iso/YOUR_ISO.iso,media=cdrom"
+        msg_warn "No ISO selected. Attach later: qm set ${vmid} -ide2 ${iso_storage}:iso/YOUR_ISO.iso,media=cdrom" >&2
         echo ""
       else
-        msg_ok "Selected: ${ALL_ISOS[$((choice-1))]}"
+        msg_ok "Selected: ${ALL_ISOS[$((choice-1))]}" >&2
         echo "${ALL_ISOS[$((choice-1))]}"
       fi
       return
     fi
-    msg_warn "Enter 0..${#ALL_ISOS[@]} (0 or Enter to skip)."
+    msg_warn "Enter 0..${#ALL_ISOS[@]} (0 or Enter to skip)." >&2
   done
 }
 
@@ -452,13 +460,13 @@ function detect_igpu() {
       [[ -n "$igpu_pci" ]] && vendor="amd"
     fi
     [[ -z "$igpu_pci" ]] && { igpu_pci=$(echo "$lspci_out" | grep -i Intel | awk 'NR==1 {print $1; exit}'); [[ -n "$igpu_pci" ]] && vendor="intel"; }
-    [[ -z "$igpu_pci" ]] && { msg_error "Could not auto-detect iGPU. Use --igpu-pci to specify."; exit 1; }
+    [[ -z "$igpu_pci" ]] && { msg_error "Could not auto-detect iGPU. Use --igpu-pci to specify." >&2; exit 1; }
     echo -e "${GPU}${BOLD}${DGN}Auto-detected ${vendor^^} iGPU: ${BGN}${igpu_pci}${CL}" >&2
   else
     local desc; desc=$(lspci -s "${igpu_pci}" 2>/dev/null || true)
     if echo "$desc" | grep -qi Intel; then vendor="intel"
     elif echo "$desc" | grep -qiE 'AMD|ATI|Radeon'; then vendor="amd"
-    else vendor="amd"; msg_warn "Unknown GPU vendor — assuming AMD"
+    else vendor="amd"; msg_warn "Unknown GPU vendor — assuming AMD" >&2
     fi
   fi
 
@@ -527,6 +535,12 @@ function default_config() {
 
 # ─── Arg parsing ──────────────────────────────────────────────────────────────
 function parse_args() {
+  # Record how many CLI tokens were supplied *before* the loop consumes them.
+  # start_script uses this to decide interactive-vs-unattended: any flag at all
+  # means the user wants non-interactive operation. (Counting specific flags was
+  # fragile — it silently missed --igpu/--type/--tpm/--affinity and dropped those
+  # invocations into the whiptail menu.)
+  ARG_COUNT=$#
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --vmid)         VMID="$2";              shift 2 ;;
@@ -563,7 +577,8 @@ function parse_args() {
 Usage: pve-realpc-deploy-vm.sh [OPTIONS]
 
 Deploys a fully cloaked Windows VM with patched QEMU 11/OVMF/KVM
-anti-detection — matching upstream AICodo/pve-emu-realpc exactly.
+anti-detection — built on upstream AICodo/pve-emu-realpc (same -cpu/-smbios
+profile, plus S3/S4 globals and a legacy-PIT SSDT added on top).
 
 VM Configuration:
   --vmid NUM           VM ID (default: next available)
@@ -623,15 +638,11 @@ HELPEOF
 
 # ─── Interactive flow ─────────────────────────────────────────────────────────
 function start_script() {
-  # Skip interactive if any meaningful CLI flags were passed (non-interactive mode)
-  local cli_flags=0
-  [[ "${CORES:-0}" != "0" ]] && ((cli_flags++))
-  [[ "${MEMORY:-0}" != "0" && "${MEMORY:-0}" != "16384" ]] && ((cli_flags++))
-  [[ -n "${ISO_FILE:-}" || -n "${ISO_TYPE:-}" ]] && ((cli_flags++))
-  [[ -n "${VGA:-}" && "${VGA:-}" != "vmware" ]] && ((cli_flags++))
-  [[ -n "${VM_NAME:-}" && "${VM_NAME:-}" != "win10" ]] && ((cli_flags++))
-  [[ -n "${DISK_SIZE:-}" && "${DISK_SIZE:-}" != "256G" ]] && ((cli_flags++))
-  if (( cli_flags >= 1 )); then
+  # Any CLI argument at all → unattended mode (use defaults + the supplied flags),
+  # skip the whiptail wizard. ARG_COUNT is captured in parse_args before it
+  # consumes argv. (--help exits earlier; --dry-run/--dump-args also imply
+  # non-interactive, which this handles correctly.)
+  if (( ${ARG_COUNT:-0} >= 1 )); then
     echo -e "${DEFAULT}${BOLD}${BL}Using CLI-supplied settings${CL}"
     default_config
     return
@@ -1028,7 +1039,7 @@ if [[ -z "$MEM_ASSET" ]]; then
   MEM_ASSET=$(LC_ALL=C tr -dc '0-9' </dev/urandom | head -c 10)
   _mt=0
   while [[ ${#MEM_ASSET} -lt 10 && _mt -lt 20 ]]; do
-    MEM_ASSET="$(LC_ALL=C tr -dc '1-9' </dev/urandom | head -c 1)${MEM_ASSET}"; ((_mt++))
+    MEM_ASSET="$(LC_ALL=C tr -dc '1-9' </dev/urandom | head -c 1)${MEM_ASSET}"; _mt=$((_mt + 1))
   done
   [[ ${#MEM_ASSET} -lt 10 ]] && MEM_ASSET="${MEM_ASSET}$(printf '%010d' "$((RANDOM * RANDOM))")" && MEM_ASSET="${MEM_ASSET:0:10}"
 fi
@@ -1182,7 +1193,7 @@ echo -e "${BOLD}${GN}║${CL}    ${GN}✓${CL} SMBIOS spoofing (types 0,1,2,3,4,
 echo -e "${BOLD}${GN}║${CL}    ${GN}✓${CL} ACPI: ssdt + ssdt-ec + hpet + pit                             ${BOLD}${GN}║${CL}"
 echo -e "${BOLD}${GN}║${CL}    ${GN}✓${CL} CPU: host,hypervisor=off (binary hides KVM)                    ${BOLD}${GN}║${CL}"
 printf "${BOLD}${GN}║${CL}    ${GN}✓${CL} %-60s ${BOLD}${GN}║${CL}\n" "Topology: ${SMP_TOTAL} vCPUs (${CORES}c × ${THREADS}t)"
-echo -e "${BOLD}${GN}║${CL}    ${GN}✓${CL} S3/S4 sleep + PIT SSDT (POWER + CLOCK 45pts each)             ${BOLD}${GN}║${CL}"
+printf "${BOLD}${GN}║${CL}    ${GN}✓${CL} %-60s ${BOLD}${GN}║${CL}\n" "S3/S4 sleep states enabled + legacy ISA PIT (PNP0100) exposed"
 if [[ "$NVRAM_INJECTED" == true ]]; then
   echo -e "${BOLD}${GN}║${CL}    ${GN}✓${CL} EFI NVRAM: host Secure Boot certs injected                     ${BOLD}${GN}║${CL}"
 fi

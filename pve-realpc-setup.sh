@@ -1328,8 +1328,9 @@ else
 fi
 
 # Install iasl (ACPI compiler) for PIT SSDT generation
-# The deploy script loads a custom PIT SSDT to defeat VMAware's SYSTEM_TIMERS /
-# CLOCK check (45pts). iasl compiles ASL source into the binary AML format.
+# The deploy script loads a custom PIT SSDT so the guest exposes the legacy ISA
+# 8254 Programmable Interval Timer (hardware ID PNP0100) that real PCs advertise
+# in ACPI but QEMU's q35 generated DSDT omits. iasl compiles the ASL into AML.
 if ! command -v iasl &>/dev/null; then
     info "Installing acpica-tools (needed for PIT SSDT compilation) ..."
     apt-get install -y acpica-tools 2>&1 | tail -5 \
@@ -1532,8 +1533,11 @@ else
             if modprobe kvm 2>/dev/null; then
                 ok "Patched KVM module loaded successfully"
             else
-                # Check vermagic to determine if failure is permanent or transient
-                local mod_vermagic
+                # Check vermagic to determine if failure is permanent or transient.
+                # NOTE: this block runs at top-level script scope (Step 8 is not a
+                # function), so `local` is illegal here — under `set -e` it would
+                # abort the script with "local: can only be used in a function"
+                # right when we're trying to print the diagnostic. Use a plain var.
                 mod_vermagic=$(modinfo -F vermagic "$KVM_DEST" 2>/dev/null || echo "")
                 if [[ -n "$mod_vermagic" ]] && ! echo "$mod_vermagic" | grep -qF "$KERNEL_VER"; then
                     warn "KVM module FAILED to load: version magic mismatch."
@@ -1581,14 +1585,16 @@ for aml in "${ACPI_FILES[@]}"; do
     fi
 done
 
-# Generate PIT SSDT (defeats VMAware VM::CLOCK / SYSTEM_TIMERS detection)
+# Generate PIT SSDT — expose the legacy ISA Programmable Interval Timer (PNP0100)
 #
-# VMAware's CLOCK check (45pts) enumerates all Windows devices via SetupDi
-# searching for hardware ID "PNP0100" (the ISA 8254 Programmable Interval Timer).
-# Real PCs expose PIT in their ACPI DSDT, but QEMU's generated DSDT omits it.
+# Real PCs advertise the 8254 PIT (hardware ID PNP0100) in their ACPI tables and
+# Windows enumerates it as a system device. QEMU's q35 generated DSDT omits it,
+# leaving a device-tree anomaly that hardware-enumeration fingerprinting can flag.
 # We compile a minimal SSDT that defines PNP0100 at the standard PIT I/O ports
-# (0x40–0x43, IRQ 0) so Windows enumerates it normally.
-info "Generating PIT SSDT (anti-SYSTEM_TIMERS detection) ..."
+# (0x40–0x43, IRQ 0) so the guest device tree matches a physical machine.
+# NOTE: this addresses *device enumeration*, not timing-based "clock" probes
+# (RDTSC/QPC skew) — those are handled by the patched KVM/QEMU build, not ACPI.
+info "Generating PIT SSDT (exposes legacy ISA PIT / PNP0100) ..."
 PIT_ASL="${WORK_DIR}/pit.asl"
 PIT_AML="${ACPI_DIR}/pit.aml"
 
@@ -1614,7 +1620,10 @@ DefinitionBlock ("pit.aml", "SSDT", 2, "REALPC", "PIT     ", 0x00000001)
     }
 }
 PITEOF
-    iasl -p "${WORK_DIR}/pit" "$PIT_ASL" &>/dev/null
+    # Non-fatal: a non-zero iasl exit (tool quirk, odd locale, etc.) must not abort
+    # the whole setup at Step 9 — the [[ -f pit.aml ]] check below handles a missing
+    # output gracefully and warns. Without `|| true`, set -e would kill the script.
+    iasl -p "${WORK_DIR}/pit" "$PIT_ASL" &>/dev/null || true
     if [[ -f "${WORK_DIR}/pit.aml" ]]; then
         cp "${WORK_DIR}/pit.aml" "$PIT_AML"
         chmod 644 "$PIT_AML"
@@ -1625,7 +1634,7 @@ PITEOF
 else
     warn "iasl (acpica-tools) not found — cannot generate PIT SSDT."
     warn "  Install with: apt-get install -y acpica-tools"
-    warn "  VMAware CLOCK/SYSTEM_TIMERS (45pts) will trigger without it."
+    warn "  Without it the guest won't expose the legacy ISA PIT (PNP0100)."
 fi
 
 ###############################################################################
@@ -1918,11 +1927,11 @@ else
     warn "Install with: apt install python3-virt-firmware"
 fi
 
-# Check PIT SSDT (SYSTEM_TIMERS anti-detection)
+# Check PIT SSDT (legacy ISA PIT / PNP0100 exposure)
 if [[ -f "${ACPI_DIR}/pit.aml" ]]; then
     ok "PIT SSDT: pit.aml present ($(stat -c%s "${ACPI_DIR}/pit.aml") bytes)"
 else
-    warn "PIT SSDT: pit.aml missing — VMAware CLOCK/SYSTEM_TIMERS (45pts) will trigger"
+    warn "PIT SSDT: pit.aml missing — guest won't expose the legacy ISA PIT (PNP0100)"
     if ! command -v iasl &>/dev/null; then
         warn "Install iasl: apt install acpica-tools, then re-run this script"
     fi
@@ -1972,7 +1981,7 @@ if [[ -f "$BOOTSPLASH_DEST" ]]; then
 _bx "$GREEN" "Boot splash installed (defeats BOOT_LOGO CRC32 detection)"
 fi
 if [[ -f "${ACPI_DIR}/pit.aml" ]]; then
-_bx "$GREEN" "PIT SSDT compiled (defeats SYSTEM_TIMERS detection)"
+_bx "$GREEN" "PIT SSDT compiled (exposes legacy ISA PIT / PNP0100)"
 fi
 if [[ "$ENABLE_IGPU" == true ]]; then
 igpu_v=$(detect_cpu_vendor)
