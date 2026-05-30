@@ -29,7 +29,8 @@ Then deploy a VM:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/Diobyte/ProxMox-RealPC-DeployScripts/main/pve-realpc-deploy-vm.sh
-bash pve-realpc-deploy-vm.sh
+chmod +x pve-realpc-deploy-vm.sh
+./pve-realpc-deploy-vm.sh
 qm start <VMID>
 ```
 
@@ -38,16 +39,18 @@ qm start <VMID>
 ```bash
 git clone https://github.com/Diobyte/ProxMox-RealPC-DeployScripts.git
 cd ProxMox-RealPC-DeployScripts
-bash pve-realpc-setup.sh
-bash pve-realpc-deploy-vm.sh
+chmod +x pve-realpc-setup.sh pve-realpc-deploy-vm.sh
+./pve-realpc-setup.sh
+./pve-realpc-deploy-vm.sh
 ```
 
 **Unattended / headless?**
 
 ```bash
-bash pve-realpc-setup.sh --non-interactive           # auto-pick latest + Strong
-bash pve-realpc-setup.sh --non-interactive --no-strong  # base only, no kernel pin
-bash pve-realpc-setup.sh --list-releases             # preview what's available
+chmod +x pve-realpc-setup.sh
+./pve-realpc-setup.sh --non-interactive           # auto-pick latest + Strong
+./pve-realpc-setup.sh --non-interactive --no-strong  # base only, no kernel pin
+./pve-realpc-setup.sh --list-releases             # preview what's available
 ```
 
 ---
