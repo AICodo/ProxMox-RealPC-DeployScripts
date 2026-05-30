@@ -586,7 +586,9 @@ VM Configuration:
   --vmid NUM           VM ID (default: next available)
   --name NAME          VM name (default: win10)
   --cores NUM          CPU cores (default: auto-detect from host)
-  --threads NUM        Threads per core (default: auto-detect)
+  --threads NUM        vCPU multiplier 1|2 (default: auto). Total vCPUs = cores x
+                       threads, presented to the guest as cores on one socket.
+                       (PVE has no SMT/threads option, so true HT can't be set.)
   --memory MB          Memory: 4096|8192|16384 (default: 16384)
   --disk-size SIZE     Disk size, e.g. 256G (default: 256G)
   --disk-storage NAME  Storage pool for disks (default: local-lvm)

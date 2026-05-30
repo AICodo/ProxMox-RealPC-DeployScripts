@@ -6,7 +6,7 @@
 #   * BUILTIN\Administrators has FullControl on the HKLM keys touched here
 #     (incl. HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid), so an elevated
 #     write succeeds without needing SYSTEM.
-#   * The HKCU AdvertisingInfo write below MUST run as the logged-in user — under
+#   * The HKCU AdvertisingInfo write below MUST run as the logged-in user -- under
 #     SYSTEM (PsExec -s) HKCU would resolve to SYSTEM's hive, silently missing the
 #     real user's per-user ID. So SYSTEM would be a regression, not an upgrade.
 # (qemu-cleanup.ps1 uses SYSTEM because it edits Enum/Services keys that even an
