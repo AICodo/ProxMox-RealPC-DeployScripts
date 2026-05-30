@@ -540,12 +540,13 @@ function default_config() {
   ISO_FILE="${ISO_FILE:-}"
   ISO_TYPE="${ISO_TYPE:-}"
   BRIDGE="${BRIDGE:-vmbr0}"
-  # Default VGA = std for MAX STEALTH: the Debian release ships a scrubbed
-  # vgabios-stdvga.bin (no "QEMU"/"Bochs" option-ROM strings) and Windows shows the
-  # generic "Standard VGA" adapter rather than a literal "VMware SVGA II" name. The
-  # vmware ROM is NOT scrubbed upstream. Override with --vga vmware if you need its
-  # 3D path (e.g. dGPU mirror mode). Both have patched (non-VM) PCI-IDs.
-  VGA="${VGA:-std}"
+  # Default VGA = vmware: upstream's recommended display. Its job is FUNCTIONAL, not
+  # stealth — the patched VMware-compatible adapter gives a working screen in the
+  # Proxmox noVNC console, has the best 3D path, and can MIRROR a passed-through dGPU's
+  # output into the console (so you can see the guest while the real GPU does the work).
+  # The patched binary changes its PCI-ID (so it isn't detected by device-ID and Windows
+  # shows a generic display adapter). Use --vga none for a dGPU-primary passthrough VM.
+  VGA="${VGA:-vmware}"
   GUEST_OS="${GUEST_OS:-other}"
   ADD_TPM="${ADD_TPM:-false}"
   AFFINITY="${AFFINITY:-}"
@@ -581,7 +582,7 @@ function default_config() {
   echo -e "${ID}${BOLD}${DGN}VM ID: ${BGN}${VMID}${CL}"
   echo -e "${NAME}${BOLD}${DGN}Name: ${BGN}${VM_NAME}${CL}"
   echo -e "${CPU}${BOLD}${DGN}Type: ${BGN}${VM_TYPE}${CL}"
-  echo -e "${SEC}${BOLD}${DGN}Profile: ${BGN}MAX STEALTH${CL}${DGN} — display=${VGA} (scrubbed ROM), SMBIOS/CPU/topology scanned from host${CL}"
+  echo -e "${SEC}${BOLD}${DGN}Profile: ${BGN}MAX STEALTH${CL}${DGN} — SMBIOS/CPU/ACPI/topology/NVRAM scanned & spoofed from host; display=${VGA} (PVE console)${CL}"
   echo -e "${CREATING}${BOLD}${DGN}All other settings auto-detected from host${CL}"
 }
 
@@ -650,8 +651,10 @@ VM Configuration:
   --iso FILENAME       ISO filename (default: interactive picker)
   --iso-type TYPE      ISO filter: slim|stock
   --bridge NAME        Network bridge (default: vmbr0)
-  --vga TYPE           VGA: std|vmware|none|virtio (default: std = max stealth,
-                       scrubbed ROM + generic adapter name; use vmware for 3D)
+  --vga TYPE           VGA: std|vmware|none|virtio (default: vmware). vmware is the
+                       upstream-recommended display: working screen in the Proxmox
+                       noVNC console, best 3D, and mirrors a passed-through dGPU's
+                       output into the console. Use 'none' for a dGPU-primary VM.
   --ostype TYPE        OS type (default: other — preserves S3/S4)
   --tpm                Add TPM 2.0 device
   --affinity RANGE     CPU affinity, e.g. 0-7
@@ -726,7 +729,7 @@ function start_script() {
   fi
 
   if whiptail --backtitle "PVE RealPC Deploy" --title "Setup Mode" \
-    --yesno "Create a Windows VM with full anti-VM-detection cloaking.\n\nQEMU 11 · OVMF · SMBIOS spoofing · ACPI · NVRAM injection\n\nMax-Stealth (auto) scans this host and picks the stealthiest settings:\n  · std display (scrubbed ROM, generic adapter name)\n  · SMBIOS board/BIOS/CPU profile matched to the host CPU vendor\n  · CPU topology copied from the host\n\nUse Max-Stealth (auto) settings?" --yes-button "Max Stealth" --no-button "Advanced" 17 72; then
+    --yesno "Create a Windows VM with full anti-VM-detection cloaking.\n\nQEMU 11 · OVMF · SMBIOS spoofing · ACPI · NVRAM injection\n\nMax-Stealth (auto) scans this host and spoofs the stealthiest settings:\n  · SMBIOS board/BIOS/CPU profile matched to the host CPU vendor\n  · CPU topology copied from the host\n  · vmware display (upstream rec) for a working PVE console + dGPU mirror\n\nUse Max-Stealth (auto) settings?" --yes-button "Max Stealth" --no-button "Advanced" 17 72; then
     echo -e "${DEFAULT}${BOLD}${BL}Using Max-Stealth (auto) settings${CL}"
     default_config
   else
@@ -797,14 +800,15 @@ function advanced_config() {
       echo -e "${DISK}${BOLD}${DGN}Disk: ${BGN}${DISK_SIZE}${CL}"
     else exit_script; fi
 
-    # --- VGA ---  (std = max stealth: scrubbed ROM + generic adapter name)
-    VGA="${VGA:-std}"
+    # --- VGA ---  vmware = upstream-recommended console display (PVE noVNC + dGPU
+    #               mirror + best 3D). 'none' = dGPU-primary passthrough.
+    VGA="${VGA:-vmware}"
     if VGA=$(whiptail --backtitle "PVE RealPC Deploy" --title "VGA Type" --radiolist \
-      "Display adapter (std = max stealth: scrubbed ROM)" 12 64 4 \
-      "std"    "Standard VGA (max stealth, scrubbed ROM)" ON \
-      "vmware" "VMware Compatible (best 3D; ROM not scrubbed)" OFF \
-      "virtio" "VirtIO-GPU (ROM not scrubbed)" OFF \
-      "none"   "None (GPU passthrough)" OFF \
+      "Display adapter (vmware = working PVE console + dGPU mirror, recommended)" 12 70 4 \
+      "vmware" "VMware Compatible (recommended: PVE console + 3D + dGPU mirror)" ON \
+      "std"    "Standard VGA (use if vmware 3D doesn't work)" OFF \
+      "virtio" "VirtIO-GPU (OVMF only)" OFF \
+      "none"   "None (dGPU-primary passthrough)" OFF \
       3>&1 1>&2 2>&3); then
       echo -e "${GPU}${BOLD}${DGN}VGA: ${BGN}${VGA}${CL}"
     else exit_script; fi
@@ -1205,18 +1209,6 @@ echo -e "${DISK}${BOLD}${DGN}Memory serial: ${BGN}${MEM_SERIAL}${CL}  asset: ${B
 
 # --- Build QEMU args ---
 build_args
-
-# VGA option-ROM advisory (max-stealth note). The Debian release ships scrubbed
-# vgabios-stdvga.bin / vgabios-qxl.bin, but the PVE deb's vgabios-vmware.bin and
-# vgabios-virtio.bin are stock blobs that may still carry "QEMU"/"VMware" strings in
-# the VGA option ROM (setup.sh verification warns about this). The PCI-ID is patched
-# either way, so device-ID detection is covered; this only concerns firmware/option-ROM
-# string scans. For maximum stealth use --vga std (fully scrubbed ROM); vmware is kept
-# as the default for best 3D per upstream's recommendation.
-if [[ "$VGA" == "vmware" || "$VGA" == "virtio" ]]; then
-  msg_warn "VGA '${VGA}': option ROM may contain VM strings (only stdvga/qxl are scrubbed upstream)."
-  msg_warn "  For maximum anti-detection use --vga std; keep ${VGA} only if you need its 3D path."
-fi
 
 # --- Dry-run: show config and exit ---
 if [[ "$DRY_RUN" == true ]]; then

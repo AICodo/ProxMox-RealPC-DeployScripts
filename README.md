@@ -72,7 +72,7 @@ The Windows tools are heavily rewritten from [Scrut1ny/AutoVirt](https://github.
 
 ## GPU Passthrough
 
-The display defaults to **`std`** for maximum stealth: the Debian release ships a scrubbed `vgabios-stdvga.bin` (no `QEMU`/`Bochs` option-ROM strings) and Windows shows a generic "Standard VGA" adapter. Both `std` and `vmware` have patched (non-`0x1234`/`0x15ad`) PCI-IDs, but the `vmware`/`virtio` option ROMs are **not** scrubbed upstream — so use `--vga vmware` only if you need its better 3D path (e.g. dGPU *mirror* mode), accepting the option-ROM string trade-off.
+The display defaults to **`vmware`** — the upstream-recommended adapter. Its role is **functional, not stealth**: it gives a working screen in the Proxmox **noVNC console**, has the best 3D path, and can **mirror a passed-through dGPU's output** into the console so you can see the guest while the real GPU does the work. The patched binary changes its PCI-ID (off `0x15ad`), so it isn't detected by device-ID and Windows shows a generic display adapter. For a **dGPU-primary** VM (the GPU is the only display), use `--vga none` with `--nvidia`/`--igpu`.
 
 **Integrated GPU (Intel/AMD):**
 

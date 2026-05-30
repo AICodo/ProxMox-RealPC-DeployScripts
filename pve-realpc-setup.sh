@@ -2056,44 +2056,46 @@ else
     warn "${ROM_MISSING} of $((ROM_OK + ROM_MISSING)) ROM files missing"
 fi
 
-# Spot-check: verify a patched BIOS doesn't contain "QEMU" or "Bochs" strings
-for check_rom in "bios-256k.bin" "vgabios-stdvga.bin"; do
+# Spot-check the SeaBIOS scrub: bios-256k.bin SHOULD be free of QEMU/Bochs/SeaBIOS
+# (the Debian overlay genuinely scrubs the SeaBIOS). A hit here is a real failure.
+if command -v strings &>/dev/null; then
     for rom_dir in "$QEMU_ROM_DIR" "$QEMU_ROM_DIR_ALT"; do
-        if [[ -f "${rom_dir}/${check_rom}" ]]; then
-            if command -v strings &>/dev/null; then
-                if strings "${rom_dir}/${check_rom}" 2>/dev/null | grep -qi "QEMU\|Bochs\|SeaBIOS"; then
-                    warn "UNPATCHED: ${rom_dir}/${check_rom} still contains VM strings!"
-                else
-                    ok "Verified: ${check_rom} is clean (no VM strings)"
-                fi
+        if [[ -f "${rom_dir}/bios-256k.bin" ]]; then
+            if strings "${rom_dir}/bios-256k.bin" 2>/dev/null | grep -qi "QEMU\|Bochs\|SeaBIOS"; then
+                warn "bios-256k.bin still contains VM strings — SeaBIOS overlay may have failed"
             else
-                warn "Cannot verify ROM strings — 'strings' command not found (install binutils)"
+                ok "Verified: bios-256k.bin is clean (no VM strings)"
             fi
             break
         fi
     done
-done
 
-# Verify VMware/VirtIO VGA ROMs (v10.2.1+ / v11 recommend VMware display, but
-# the Debian release only provides stdvga + qxl ROMs. vgabios-vmware.bin and
-# vgabios-virtio.bin come from the PVE deb and may still contain VM strings
-# since PVE ships pre-built ROM blobs that bypass the sedPatch process.)
-if command -v strings &>/dev/null; then
-    for extra_rom in "vgabios-vmware.bin" "vgabios-virtio.bin"; do
+    # Emulated VGA option ROMs: vgabios-stdvga.bin IS the Bochs VGABIOS ("Bochs"),
+    # and vgabios-vmware/virtio carry VM strings too. Verified on a real PVE 9 host:
+    # the upstream overlay does NOT scrub these (it can't remove a Bochs VGABIOS's own
+    # name without breaking it). The patched PCI-IDs hide the DEVICE ID, but a raw
+    # option-ROM string scan can still see "Bochs"/"VMware". This is inherent to
+    # emulated displays — NOT a bug or a failed overlay.
+    vga_dirty=false
+    for vrom in vgabios-stdvga.bin vgabios-vmware.bin vgabios-virtio.bin; do
         for rom_dir in "$QEMU_ROM_DIR" "$QEMU_ROM_DIR_ALT"; do
-            if [[ -f "${rom_dir}/${extra_rom}" ]]; then
-                if strings "${rom_dir}/${extra_rom}" 2>/dev/null | grep -qi "QEMU\|Bochs\|SeaBIOS"; then
-                    warn "${extra_rom} contains VM strings (not overlaid from Debian release)"
-                    warn "  → The Debian build doesn't produce ${extra_rom}. If using --vga vmware or"
-                    warn "    --vga virtio, firmware string scans may still detect VM signatures."
-                    warn "  → Mitigation: use --vga std (overlaid) or GPU passthrough (--vga none)."
+            if [[ -f "${rom_dir}/${vrom}" ]]; then
+                if strings "${rom_dir}/${vrom}" 2>/dev/null | grep -qi "QEMU\|Bochs\|VMware\|SeaBIOS"; then
+                    vga_dirty=true
                 else
-                    ok "Verified: ${extra_rom} is clean (no VM strings)"
+                    ok "Verified: ${vrom} is clean"
                 fi
                 break
             fi
         done
     done
+    if [[ "$vga_dirty" == true ]]; then
+        warn "Emulated VGA option ROMs carry VM strings (e.g. 'Bochs' in the stdvga VGABIOS) —"
+        warn "  inherent to emulated displays, NOT a failed overlay. PCI-IDs are patched regardless."
+        warn "  For a FULLY clean display, use GPU passthrough: deploy with --vga none + --nvidia/--igpu."
+    fi
+else
+    warn "Cannot verify ROM strings — 'strings' command not found (install binutils)"
 fi
 
 # Check ACPI files
