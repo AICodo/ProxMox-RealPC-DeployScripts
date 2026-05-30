@@ -33,9 +33,10 @@ IFS=$'\n\t'
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
 # Upstream intentionally splits releases:
-#   - The latest PVE9 tag (v11.0.0-2, v20260516-211490-pve9) ships only the
-#     base .deb + ACPI + patch. NO Strong .tgz, NO matching kvm.ko.
-#   - The previous "enhanced" tag (v11.0.0-1, v20260506-222829-pve9) ships
+#   - The newest PVE9 tag (resolved live from GitHub API; v20260523-122746-pve9 /
+#     v11.0.0-3 as of this writing) ships only the base .deb + ACPI + patch.
+#     NO Strong .tgz, NO matching kvm.ko.
+#   - The previous "enhanced" tag (v20260506-222829-pve9 / v11.0.0-1) ships
 #     the same base files PLUS the Strong .tgz (sensor passthrough +
 #     kvm.ko built against kernel 6.17.13-2).
 # The qemu-autoGenPatch.patch is byte-for-byte identical between the two —
@@ -44,7 +45,7 @@ IFS=$'\n\t'
 # but you also avoid the kernel-version pin to 6.17.13-2).
 # Upstream repo (used by both the help heredoc below and the GitHub-API resolver).
 UPSTREAM_REPO="AICodo/pve-emu-realpc"
-RELEASE_TAG="v20260516-211490-pve9"   # latest PVE9 release (base .deb / ACPI / patch)
+RELEASE_TAG="v20260516-211490-pve9"   # static fallback — resolver auto-picks newest at runtime
 STRONG_TAG="v20260506-222829-pve9"    # last release shipping the Strong .tgz
 BASE_URL="https://github.com/${UPSTREAM_REPO}/releases/download/${RELEASE_TAG}"
 STRONG_URL="https://github.com/${UPSTREAM_REPO}/releases/download/${STRONG_TAG}"
@@ -70,8 +71,9 @@ DEBIAN_VGA_ROMS=("vgabios-qxl.bin" "vgabios-stdvga.bin")
 DEBIAN_ALL_ROMS=("${DEBIAN_BIOS_FILES[@]}" "${DEBIAN_EFI_ROMS[@]}" "${DEBIAN_VGA_ROMS[@]}")
 SEABIOS_PATCH="seabios-autoGenPatch.patch"
 
-# PVE release asset filenames
-# Base files come from ${RELEASE_TAG} (latest); Strong .tgz from ${STRONG_TAG}.
+# PVE release asset filenames  (static fallbacks — resolver updates these live)
+# Base files come from ${RELEASE_TAG} (fallback); Strong .tgz from ${STRONG_TAG}.
+# When the resolver runs, these are recomputed from the actual upstream release.
 QEMU_BASE_DEB="pve-qemu-kvm_11.0.0-2_amd64.deb"
 OVMF_BASE_DEB="pve-edk2-firmware-ovmf_4.2025.05-2_all.deb"
 STRONG_TGZ="pve-qemu-kvm_11.0.0-1_amd64_Strong_intel_amd_6.17.13-2.tgz"
@@ -819,7 +821,10 @@ download_asset() {
     fi
     info "Downloading ${name} ..."
     rm -f "$part"
-    if ! wget -q --show-progress -O "$part" "${url_base}/${name}"; then
+    # --show-progress only when stdout is a TTY (avoids carriage-return garbled CI logs)
+    local wget_opts=(-q -O "$part")
+    [[ -t 1 ]] && wget_opts=(-q --show-progress -O "$part")
+    if ! wget "${wget_opts[@]}" "${url_base}/${name}"; then
         rm -f "$part"
         fail "Failed to download ${name}"
     fi
@@ -995,7 +1000,9 @@ download_debian_asset() {
     fi
     info "Downloading ${name} (debian release) ..."
     rm -f "$part"
-    if ! wget -q --show-progress -O "$part" "${DEBIAN_URL}/${name}"; then
+    local wget_opts=(-q -O "$part")
+    [[ -t 1 ]] && wget_opts=(-q --show-progress -O "$part")
+    if ! wget "${wget_opts[@]}" "${DEBIAN_URL}/${name}"; then
         rm -f "$part"
         fail "Failed to download ${name} from Debian release"
     fi
@@ -1251,7 +1258,9 @@ ok "Debian release ROM/BIOS overlay complete (PVE/Strong QEMU binary preserved)"
 if [[ ! -f "$BOOTSPLASH_DEST" ]]; then
     if [[ "$SKIP_DOWNLOAD" != true ]]; then
         info "Downloading bootsplash.jpg (anti-BOOT_LOGO detection) ..."
-        wget -q --show-progress -O "$BOOTSPLASH_DEST" "$BOOTSPLASH_URL" \
+        local wget_bs_opts=(-q -O "$BOOTSPLASH_DEST")
+        [[ -t 1 ]] && wget_bs_opts=(-q --show-progress -O "$BOOTSPLASH_DEST")
+        wget "${wget_bs_opts[@]}" "$BOOTSPLASH_URL" \
             || warn "Failed to download bootsplash.jpg — BOOT_LOGO detection may trigger"
         if [[ -f "$BOOTSPLASH_DEST" ]]; then
             chmod 644 "$BOOTSPLASH_DEST"
@@ -1457,7 +1466,9 @@ if [[ "$ENABLE_IGPU" == true ]]; then
                 ok "iGPU ROM already installed: ${ROM_DEST}"
             else
                 info "Downloading Intel iGPU ROM: ${IGPU_ROM_FILE} ..."
-                wget -q --show-progress -O "$ROM_DEST" "${IGPU_ROM_URL}/${IGPU_ROM_FILE}" \
+                local wget_rom_opts=(-q -O "$ROM_DEST")
+                [[ -t 1 ]] && wget_rom_opts=(-q --show-progress -O "$ROM_DEST")
+                wget "${wget_rom_opts[@]}" "${IGPU_ROM_URL}/${IGPU_ROM_FILE}" \
                     || fail "Failed to download iGPU ROM"
                 ok "iGPU ROM installed: ${ROM_DEST} ($(stat -c%s "$ROM_DEST") bytes)"
             fi
@@ -1481,7 +1492,7 @@ if [[ "$ENABLE_IGPU" == true ]]; then
             IOMMU_PARAM="amd_iommu=on"
         fi
         GRUB_CHANGED=false
-        if ! grep -q "${IOMMU_PARAM}" "$GRUB_FILE"; then
+        if ! grep -q "${IOMMU_PARAM}" <(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" 2>/dev/null) 2>/dev/null; then
             info "Enabling ${IGPU_VENDOR^^} IOMMU in GRUB (${IOMMU_PARAM}) ..."
             cp "$GRUB_FILE" "${BACKUP_DIR}/grub.default.igpu.bak" 2>/dev/null || true
             sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"\([^\"]*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 ${IOMMU_PARAM}\"/" "$GRUB_FILE"
@@ -1489,7 +1500,7 @@ if [[ "$ENABLE_IGPU" == true ]]; then
         fi
         # Add IOMMU passthrough mode — only passes assigned devices through IOMMU
         # (reduces overhead for non-passthrough devices vs translating all DMA)
-        if ! grep -q "iommu=pt" "$GRUB_FILE"; then
+        if ! grep -q "iommu=pt" <(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" 2>/dev/null) 2>/dev/null; then
             sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"\([^\"]*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 iommu=pt\"/" "$GRUB_FILE"
             GRUB_CHANGED=true
         fi

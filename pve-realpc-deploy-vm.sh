@@ -228,11 +228,17 @@ random_serial_20() {
     # Read extra bytes to guarantee enough alphanumeric chars survive tr -dc.
     local pool
     pool=$(dd if=/dev/urandom bs=256 count=1 2>/dev/null | LC_ALL=C tr -dc 'A-Z0-9' | head -c 20)
-    # Fallback: if pool is still short, pad with hex from /dev/urandom
-    while [[ ${#pool} -lt 20 ]]; do
+    # Safety loop: pad with hex if the initial dd didn't yield 20 alphanumeric
+    # chars (astronomically unlikely; max 20 iterations as a guard).
+    local _tries=0
+    while [[ ${#pool} -lt 20 && _tries -lt 20 ]]; do
         pool+=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n' | tr '[:lower:]' '[:upper:]' | LC_ALL=C tr -dc 'A-Z0-9')
         pool="${pool:0:20}"
+        ((_tries++))
     done
+    # Final fallback: if we still have fewer than 20 chars (pathological kernel),
+    # pad with 'X' — ugly but never loops forever.
+    while [[ ${#pool} -lt 20 ]]; do pool+='X'; done
     echo "$pool"
 }
 
@@ -625,11 +631,20 @@ if [[ -z "$MEM_ASSET" ]]; then
     # the previous bug where trailing-zero padding produced a fingerprint-able
     # pattern (e.g. "1234567800") when the digit pool was short.
     MEM_ASSET=$(LC_ALL=C tr -dc '0-9' </dev/urandom | head -c 10)
-    # Left-pad with a random non-zero digit if for some reason we got fewer
-    # than 10 chars (shouldn't happen — /dev/urandom is unbounded).
-    while [[ ${#MEM_ASSET} -lt 10 ]]; do
+    # Safety loop: prepend random non-zero digits if the initial tr produced
+    # fewer than 10 digit characters (astronomically unlikely but theoretically
+    # possible with /dev/urandom on a pathological kernel). Max 20 iterations.
+    # NOTE: no `local` here — this block lives at script top level under set -e.
+    _mem_tries=0
+    while [[ ${#MEM_ASSET} -lt 10 && _mem_tries -lt 20 ]]; do
         MEM_ASSET="$(LC_ALL=C tr -dc '1-9' </dev/urandom | head -c 1)${MEM_ASSET}"
+        ((_mem_tries++))
     done
+    # Last resort: pad with a predictable-but-random-looking digit sequence
+    if [[ ${#MEM_ASSET} -lt 10 ]]; then
+        MEM_ASSET="${MEM_ASSET}$(printf '%010d' "$((RANDOM * RANDOM))")"
+        MEM_ASSET="${MEM_ASSET:0:10}"
+    fi
     info "Generated memory asset: ${MEM_ASSET}"
 fi
 
@@ -651,7 +666,7 @@ fi
 ###############################################################################
 
 # Auto-detect threads per core
-if [[ "$THREADS_PER_CORE" -eq 0 ]] 2>/dev/null || [[ -z "$THREADS_PER_CORE" ]]; then
+if [[ -z "$THREADS_PER_CORE" || "$THREADS_PER_CORE" == "0" ]]; then
     # Intel Core Ultra (Arrow Lake / Lunar Lake) has NO Hyper-Threading on any
     # core type, but lscpu can still report "Thread(s) per core: 2" on systems
     # where the kernel detected SMT-capable silicon (mismatched between
@@ -673,7 +688,7 @@ if [[ "$THREADS_PER_CORE" -eq 0 ]] 2>/dev/null || [[ -z "$THREADS_PER_CORE" ]]; 
 fi
 
 # Auto-detect core count from host CPUID topology
-if [[ "$CORES" -eq 0 ]] 2>/dev/null || [[ -z "$CORES" ]]; then
+if [[ -z "$CORES" || "$CORES" == "0" ]]; then
     HOST_TOTAL_CPUS=$(nproc 2>/dev/null)
     if [[ -z "$HOST_TOTAL_CPUS" ]]; then
         HOST_TOTAL_CPUS=$(lscpu 2>/dev/null | grep -i '^CPU(s):' | awk '{print $NF}')
@@ -1259,17 +1274,12 @@ ok "Boot order configured"
 CONF_FILE="/etc/pve/qemu-server/${VMID}.conf"
 info "Patching ${CONF_FILE} with anti-detection config ..."
 
-# Remove any existing args/smbios1/affinity lines (shouldn't exist for a new VM,
-# but clean up just in case of re-runs or leftover state)
-sed -i '/^args:/d'     "$CONF_FILE" 2>/dev/null || true
-sed -i '/^smbios1:/d'  "$CONF_FILE" 2>/dev/null || true
-sed -i '/^vmgenid:/d'  "$CONF_FILE" 2>/dev/null || true
-sed -i '/^affinity:/d' "$CONF_FILE" 2>/dev/null || true
-
 # Write args + smbios1 directly to the conf file.
 # This bypasses qm set's strict regex validation for smbios1 string fields.
 # PVE reads the conf file on VM start and generates the correct QEMU command line.
-# /etc/pve is a FUSE filesystem (pmxcfs) — write to /tmp first, then copy.
+# /etc/pve is a FUSE filesystem (pmxcfs) — do NOT use sed -i directly on it.
+# Use a tmpfile + atomic copy, filtering out any pre-existing args/smbios1/
+# vmgenid/affinity lines from the existing conf (in case of re-runs).
 TMP_CONF=$(mktemp /tmp/pve-vm-XXXXXX.conf)
 {
     echo "args: ${FULL_ARGS}"
@@ -1279,7 +1289,8 @@ TMP_CONF=$(mktemp /tmp/pve-vm-XXXXXX.conf)
     if [[ -n "$AFFINITY" ]]; then
         echo "affinity: ${AFFINITY}"
     fi
-    cat "$CONF_FILE"
+    # Append existing config, filtering out stale copies of the lines we just wrote
+    grep -vE '^(args|smbios1|vmgenid|affinity):' "$CONF_FILE" 2>/dev/null || true
 } > "$TMP_CONF"
 cp "$TMP_CONF" "$CONF_FILE"
 rm -f "$TMP_CONF"
