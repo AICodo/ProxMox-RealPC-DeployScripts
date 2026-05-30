@@ -1015,6 +1015,16 @@ function build_args() {
 }
 
 # ─── NVRAM injection ──────────────────────────────────────────────────────────
+# Defeats VMAware's nvram() check (100pts), which (verified in src/vmaware.hpp) reads the
+# Windows UEFI variable "PKDefault" and flags the VM if that Platform Key certificate
+# contains "red hat" — stock OVMF/edk2 (incl. Proxmox's, AND AICodo's patched OVMF) ships
+# a Red Hat default PK. VERIFIED: the AICodo patched QEMU+OVMF does NOT touch this (their
+# OVMF patch only renames .inf module names; their own "checks we can't pass" notes omit
+# nvram()). So this injection does NOT overlap/duplicate the patched binary — it closes a
+# gap the binary leaves open. We replace the VM's varstore PK/KEK/db + the *Default vars
+# with the HOST's real firmware keys (a real OEM PK has no "red hat"). NOTE: this only
+# works when the host firmware exposes Secure Boot keys; the only host-independent guarantee
+# is a patched OVMF with a non-RedHat compiled PK (out of scope here).
 function inject_nvram() {
   local vmid="$1"
   NVRAM_INJECTED=false
@@ -1047,6 +1057,7 @@ function inject_nvram() {
   local work="/tmp/pve-nvram-${vmid}"
   mkdir -p "$work"
   local json="${work}/efivars.json" orig="${work}/OVMF_VARS.fd" new="${work}/OVMF_VARS_injected.fd"
+  local stripped="${work}/OVMF_VARS_stripped.fd" finalraw="${work}/OVMF_VARS_final.fd"
 
   local fmt; fmt=$(qemu-img info --output=json "$efidisk_path" 2>/dev/null | grep -oP '"format":\s*"\K[^"]+' || echo "qcow2")
   qemu-img convert -f "$fmt" -O raw "$efidisk_path" "$orig" 2>/dev/null || cp "$efidisk_path" "$orig" 2>/dev/null || true
@@ -1072,24 +1083,59 @@ function inject_nvram() {
     # NB: `grep -c` prints 0 AND exits 1 on no match; `$(... || echo 0)` would yield
     # the two-line string "0\n0" and break the numeric test below. Use `|| count=0`.
     local count; count=$(grep -c '"name"' "$json" 2>/dev/null) || count=0
+    local staged="$orig" sb_enrolled=false action=""
+
+    # ── Stage 1: enroll the host's real Secure Boot keys (gives the VM realistic SB AND
+    # a clean OEM PKDefault) when the host firmware exposes them. ────────────────────────
     if [[ "$count" -ge 2 ]]; then
-      virt-fw-vars --input "$orig" --output "$new" --secure-boot --set-json "$json" 2>/dev/null || true
-      if [[ -f "$new" ]]; then
-        local nsz osz; nsz=$(stat -c%s "$new" 2>/dev/null || echo "0"); osz=$(stat -c%s "$orig" 2>/dev/null || echo "0")
-        if [[ "$nsz" -ge 131072 ]] && [[ "$nsz" -le $((osz + 4096)) ]] && [[ "$nsz" -ge $((osz - 4096)) ]] \
-           && virt-fw-vars --input "$new" --print >/dev/null 2>&1; then
-          if qemu-img convert -f raw -O "$fmt" "$new" "${efidisk_path}.new" 2>/dev/null; then
-            mv -f "${efidisk_path}.new" "$efidisk_path"
-            NVRAM_INJECTED=true
-            msg_ok "Host EFI variables injected (${count} keys: PK, KEK, db, dbx, defaults)"
-          else rm -f "${efidisk_path}.new"; fi
-        else
-          msg_warn "NVRAM injection failed validation — keeping pristine image"
-          cp "$backup" "$efidisk_path" 2>/dev/null || true
-        fi
+      if virt-fw-vars --input "$orig" --output "$new" --secure-boot --set-json "$json" 2>/dev/null \
+         && [[ -s "$new" ]] && virt-fw-vars --input "$new" --print >/dev/null 2>&1; then
+        staged="$new"; sb_enrolled=true; action="enrolled ${count} host SB keys"
+      else
+        msg_warn "virt-fw-vars key enrollment failed — proceeding to PKDefault scrub only"
       fi
     else
-      msg_warn "Only ${count} EFI variables extracted — host Secure Boot may be off"
+      msg_info "Host exposes no Secure Boot keys (count=${count}); SB stays in setup mode"
+    fi
+
+    # ── Stage 2: DETERMINISTIC VMAware nvram() guarantee (host-independent). ──────────────
+    # nvram() (100pts) only flags a PKDefault whose cert contains "red hat". If the staged
+    # varstore has one (from the host OR the OVMF template), DELETE PKDefault. This is safe:
+    # *Default is only the factory-default key OFFERING — the active PK/KEK/db drive Secure
+    # Boot — and PVE's OVMF has no SecureBootDefaultKeysDxe, so nothing re-creates it at boot
+    # (verified against edk2/PVE source). grep -a scans the raw varstore (cert subject is
+    # plain ASCII in the DER), so it's a real pass/fail signal.
+    if grep -aqi 'red hat' "$staged" 2>/dev/null; then
+      if virt-fw-vars --input "$staged" --output "$stripped" --delete PKDefault 2>/dev/null \
+         && [[ -s "$stripped" ]] && virt-fw-vars --input "$stripped" --print >/dev/null 2>&1; then
+        staged="$stripped"; action="${action:+${action} + }deleted Red Hat PKDefault"
+      else
+        msg_warn "Could not delete Red Hat PKDefault via virt-fw-vars — nvram() (100pts) may still trigger"
+      fi
+    fi
+
+    # ── Commit once, with size validation; restore pristine on any problem. ──────────────
+    if [[ "$staged" != "$orig" ]]; then
+      local nsz osz; nsz=$(stat -c%s "$staged" 2>/dev/null || echo 0); osz=$(stat -c%s "$orig" 2>/dev/null || echo 0)
+      if [[ "$nsz" -ge 131072 && "$nsz" -le $((osz + 8192)) && "$nsz" -ge $((osz - 8192)) ]] \
+         && qemu-img convert -f raw -O "$fmt" "$staged" "${efidisk_path}.new" 2>/dev/null; then
+        mv -f "${efidisk_path}.new" "$efidisk_path"
+        NVRAM_INJECTED=$sb_enrolled
+        msg_ok "NVRAM updated: ${action}"
+      else
+        rm -f "${efidisk_path}.new"
+        msg_warn "NVRAM update failed size validation — restoring pristine image"
+        cp "$backup" "$efidisk_path" 2>/dev/null || true
+      fi
+    fi
+
+    # ── Final pass/fail signal: re-read the ACTUAL efidisk and check for "red hat". ──────
+    if qemu-img convert -f "$fmt" -O raw "$efidisk_path" "$finalraw" 2>/dev/null; then
+      if grep -aqi 'red hat' "$finalraw" 2>/dev/null; then
+        msg_warn "VMAware nvram() (100pts): PKDefault STILL contains 'Red Hat' — NOT defeated."
+      else
+        msg_ok "VMAware nvram() (100pts): PKDefault clean of 'Red Hat' — defeated"
+      fi
     fi
   fi
   rm -rf "$work"
@@ -1097,26 +1143,41 @@ function inject_nvram() {
     msg_ok "Pristine OVMF_VARS preserved at ${backup} (delete after first boot)"
   fi
 
+  # NVRAM_INJECTED tracks only whether host SB KEYS were enrolled (for the summary line).
+  # The VMAware nvram() pass/fail is reported separately above (the PKDefault check), which
+  # is deterministic — so "no host keys" is a Secure-Boot REALISM gap, not an nvram() failure.
   if [[ "$NVRAM_INJECTED" != true ]]; then
-    msg_warn "NVRAM injection skipped — VM may fail VMAware NVRAM check (100pts)"
+    msg_warn "No host Secure Boot keys enrolled — guest SB stays in setup mode (a real Win11 PC"
+    msg_warn "  ships with MS keys + SB on). nvram() is still handled by the PKDefault check above."
+    msg_warn "  To also get realistic SB, run on a Secure-Boot-capable host (keys in /sys/.../efivars)."
   fi
 }
 
 # ─── Disk size parser ─────────────────────────────────────────────────────────
 function parse_disk_size_gb() {
-  local input="${1,,}"
+  local input="${1,,}" stem="" unit="g"
   case "$input" in
-    *tib) echo $(( ${input%tib} * 1024 )) ;;
-    *tb)  echo $(( ${input%tb}  * 1024 )) ;;
-    *t)   echo $(( ${input%t}   * 1024 )) ;;
-    *gib) echo "${input%gib}" ;;
-    *gb)  echo "${input%gb}"  ;;
-    *g)   echo "${input%g}"   ;;
-    *mib) echo $(( ${input%mib} / 1024 )) ;;
-    *mb)  echo $(( ${input%mb}  / 1024 )) ;;
-    *m)   echo $(( ${input%m}   / 1024 )) ;;
-    *[0-9]) echo "$input" ;;
-    *) echo "0" ;;
+    *tib) stem="${input%tib}"; unit="t" ;;
+    *tb)  stem="${input%tb}";  unit="t" ;;
+    *t)   stem="${input%t}";   unit="t" ;;
+    *gib) stem="${input%gib}"; unit="g" ;;
+    *gb)  stem="${input%gb}";  unit="g" ;;
+    *g)   stem="${input%g}";   unit="g" ;;
+    *mib) stem="${input%mib}"; unit="m" ;;
+    *mb)  stem="${input%mb}";  unit="m" ;;
+    *m)   stem="${input%m}";   unit="m" ;;
+    *)    stem="$input";       unit="g" ;;
+  esac
+  # Reject any non-integer stem (fractional "1.5T", garbage "abc", empty) BEFORE the
+  # arithmetic. Without this, `$(( 1.5 * 1024 ))` raises "invalid arithmetic operator"
+  # and — because this runs AFTER qm create (CLEANUP_VMID is armed) — set -e would
+  # abort and destroy the half-built VM with a cryptic error. Returning 0 instead lets
+  # the caller emit a clean "could not parse / too small" message and exit gracefully.
+  [[ "$stem" =~ ^[0-9]+$ ]] || { echo "0"; return; }
+  case "$unit" in
+    t) echo $(( stem * 1024 )) ;;
+    g) echo "$stem" ;;
+    m) echo $(( stem / 1024 )) ;;
   esac
 }
 

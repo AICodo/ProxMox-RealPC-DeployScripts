@@ -1,2 +1,9 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts MUST stay LF. They run on Debian/Proxmox, where a CRLF shebang or
+# line ending breaks execution ("bad interpreter: /usr/bin/env bash^M", $'\r' in
+# every comparison). This repo is frequently edited on Windows (core.autocrlf=true);
+# this rule guarantees the committed *.sh blobs can never regress to CRLF regardless
+# of the committer's platform/config.
+*.sh text eol=lf

@@ -639,7 +639,7 @@ wt_menu() {
     echo "${title} — ${prompt}"
     local i=1; local -a tags=()
     while (( $# )); do
-        tags+=("$1"); echo "  ${i}) $2 [$1]"; shift 2; (( i++ ))
+        tags+=("$1"); echo "  ${i}) $2 [$1]"; shift 2; i=$((i+1))   # not (( i++ )): pre-0 value would exit 1 under set -e
     done
     local reply
     read -rp "Choose [1-$((i-1))]: " reply
