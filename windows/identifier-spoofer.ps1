@@ -1,3 +1,26 @@
+# identifier-spoofer.ps1 - randomise machine identity (MachineGuid, ProductId,
+# MAC, hostname, network profiles, telemetry IDs, etc.).
+#
+# Runs in the ELEVATED USER context (launched by run-tools.bat), NOT as SYSTEM.
+# That is deliberate and verified correct:
+#   * BUILTIN\Administrators has FullControl on the HKLM keys touched here
+#     (incl. HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid), so an elevated
+#     write succeeds without needing SYSTEM.
+#   * The HKCU AdvertisingInfo write below MUST run as the logged-in user — under
+#     SYSTEM (PsExec -s) HKCU would resolve to SYSTEM's hive, silently missing the
+#     real user's per-user ID. So SYSTEM would be a regression, not an upgrade.
+# (qemu-cleanup.ps1 uses SYSTEM because it edits Enum/Services keys that even an
+#  elevated admin can't touch; that rationale does not apply to this script.)
+
+# Defensive self-check: the spoofer is a no-op (and noisy) without elevation, and
+# may be double-clicked directly rather than via run-tools.bat. Match edid-spoofer.ps1.
+$identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]$identity
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "[!] identifier-spoofer must be run as Administrator (use run-tools.bat)." -ForegroundColor Red
+    exit 1
+}
+
 # ========== Cryptography ==========
 
 function Get-RandomGuid {
@@ -78,7 +101,7 @@ if (Get-Command Get-NetAdapter -ErrorAction SilentlyContinue) {
             Write-Host "[+] MAC randomized to $newMac on $($adapter.Name)" -ForegroundColor Green
         } catch {
             Write-Host "[!] Adapter '$($adapter.Name)' driver refused MAC change: $_" -ForegroundColor Yellow
-            Write-Host "    (Common with e1000/virtio emulated NICs — not fatal; continuing.)" -ForegroundColor Yellow
+            Write-Host "    (Common with e1000/virtio emulated NICs - not fatal; continuing.)" -ForegroundColor Yellow
         }
     } else {
         Write-Host "[!] No active network adapter found - skipping MAC change" -ForegroundColor Yellow
@@ -237,7 +260,7 @@ if (Test-Path $nlSignatures) {
 # ========== SMBIOS Registry Validation ==========
 
 # Verify HKLM:\HARDWARE\DESCRIPTION\System\BIOS doesn't contain VM strings.
-# These values are populated at boot from SMBIOS tables — if the patched QEMU
+# These values are populated at boot from SMBIOS tables - if the patched QEMU
 # provides correct SMBIOS, they should be clean. Detection tools (VMAware,
 # pafish, al-khaser) scan this path directly.
 $biosRegPath = "HKLM:\HARDWARE\DESCRIPTION\System\BIOS"

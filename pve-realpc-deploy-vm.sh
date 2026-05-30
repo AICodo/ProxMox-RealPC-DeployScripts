@@ -439,7 +439,9 @@ function detect_topology() {
   fi
 
   local smp_total=$((cores * threads))
-  echo -e "${CPU}${BOLD}${DGN}Topology: ${BGN}${smp_total} vCPUs (${cores}c × ${threads}t, 1 socket)${CL}" >&2
+  # PVE has no SMT/threads option, so the guest is presented as a single socket
+  # with smp_total cores (host detected as ${cores}c × ${threads}t).
+  echo -e "${CPU}${BOLD}${DGN}Topology: ${BGN}${smp_total} vCPUs (1 socket × ${smp_total} cores)${CL}" >&2
   echo "${cores}:${threads}:${smp_total}"
 }
 
@@ -692,14 +694,16 @@ function advanced_config() {
     echo -e "${CPU}${BOLD}${DGN}Cores: ${BGN}${CORES}${CL}"
 
     # --- Threads ---
+    # PVE has no SMT/threads knob, so this is just a vCPU multiplier:
+    # total vCPUs (= cores presented to the guest) = cores × this value.
     while true; do
       if THREADS=$(whiptail --backtitle "PVE RealPC Deploy" --title "Threads per Core" \
-        --inputbox "Threads per core (1 or 2)" 8 58 "2" --cancel-button Exit-Script 3>&1 1>&2 2>&3); then
+        --inputbox "vCPU multiplier (1 or 2). Total vCPUs = cores x this.\n(PVE can't expose true SMT; vCPUs are presented as cores.)" 9 64 "2" --cancel-button Exit-Script 3>&1 1>&2 2>&3); then
         if [[ "$THREADS" == "1" || "$THREADS" == "2" ]]; then break; fi
-        whiptail --title "Invalid" --msgbox "Threads must be 1 or 2." 8 40
+        whiptail --title "Invalid" --msgbox "Value must be 1 or 2." 8 40
       else exit_script; fi
     done
-    echo -e "${CPU}${BOLD}${DGN}Threads per core: ${BGN}${THREADS}${CL}"
+    echo -e "${CPU}${BOLD}${DGN}vCPU multiplier: ${BGN}${THREADS}${CL} (total vCPUs = $((CORES * THREADS)))"
 
     # --- Memory ---
     while true; do
@@ -803,7 +807,7 @@ function advanced_config() {
 
     # --- Confirm ---
     if whiptail --backtitle "PVE RealPC Deploy" --title "Ready" \
-      --yesno "Create VM ${VMID} (${VM_NAME}) with these settings?\n\n  ${CORES} cores × ${THREADS} threads  ·  ${MEMORY}MB RAM  ·  ${DISK_SIZE} disk\n  VGA: ${VGA}  ·  Type: ${VM_TYPE}  ·  Bridge: ${BRIDGE}  ·  Firewall: $([ "$FIREWALL" = 1 ] && echo On || echo Off)\n  iGPU: $(${IGPU_ENABLE} && echo Enabled || echo Disabled)  ·  TPM: $(${ADD_TPM} && echo Yes || echo No)  ·  OS: ${GUEST_OS}" \
+      --yesno "Create VM ${VMID} (${VM_NAME}) with these settings?\n\n  $((CORES * THREADS)) vCPUs (1 socket)  ·  ${MEMORY}MB RAM  ·  ${DISK_SIZE} disk\n  VGA: ${VGA}  ·  Type: ${VM_TYPE}  ·  Bridge: ${BRIDGE}  ·  Firewall: $([ "$FIREWALL" = 1 ] && echo On || echo Off)\n  iGPU: $(${IGPU_ENABLE} && echo Enabled || echo Disabled)  ·  TPM: $(${ADD_TPM} && echo Yes || echo No)  ·  OS: ${GUEST_OS}" \
       --yes-button "Create" --no-button "Redo" 16 70; then
       break
     fi
@@ -1057,7 +1061,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo -e "${BOLD}${GN}╠══════════════════════════════════════════════════╣${CL}"
   echo -e "${BOLD}${GN}║${CL}  VMID:      ${VMID}"
   echo -e "${BOLD}${GN}║${CL}  Name:      ${VM_NAME}"
-  echo -e "${BOLD}${GN}║${CL}  Topology:  ${SMP_TOTAL} vCPUs (${CORES}c × ${THREADS}t)"
+  echo -e "${BOLD}${GN}║${CL}  Topology:  ${SMP_TOTAL} vCPUs (1 socket × ${SMP_TOTAL} cores)"
   echo -e "${BOLD}${GN}║${CL}  Memory:    ${MEMORY}MB  ·  Disk: ${DISK_SIZE} on ${DISK_STORAGE}"
   echo -e "${BOLD}${GN}║${CL}  VGA:       ${VGA}  ·  NIC: e1000 on ${BRIDGE}"
   echo -e "${BOLD}${GN}║${CL}  Type:      ${VM_TYPE}  ·  OS: ${GUEST_OS}"
@@ -1095,20 +1099,21 @@ echo -e "${ID}${BOLD}VM ${VMID} · ${VM_NAME} · ${VM_TYPE} · VGA: ${VGA}${CL}"
 
 msg_info "Creating VM ${VMID}"
 
-# qm create (cores = total vCPUs; --threads not accepted by qm create on some PVE builds)
+# CPU topology: Proxmox exposes ONLY --sockets and --cores. There is NO --threads
+# option on any PVE version — `qm set --threads` fails with "Unknown option: threads"
+# (maxcpus is always sockets×cores, and PVE's generated -smp never emits threads).
+# SMT/HT topology therefore cannot be set natively, and injecting a second -smp via
+# the args line collides with the one PVE always emits. We present all logical CPUs
+# as cores on a single socket: SMP_TOTAL = detected cores × threads. This is what a
+# non-SMT consumer CPU looks like and matches how upstream's PVE VMs are configured;
+# VM-detection suites (pafish/al-khaser/VMAware) do not flag core/thread ratios.
 qm create "$VMID" \
   --name "$VM_NAME" --bios ovmf --machine q35 --ostype "$GUEST_OS" --cpu host \
   --sockets 1 --cores "$SMP_TOTAL" --memory "$MEMORY" \
   --balloon 0 --numa 0 --scsihw virtio-scsi-single \
   --net0 "e1000,bridge=${BRIDGE},firewall=${FIREWALL}" \
   --vga "$VGA" --localtime 1
-msg_ok "VM ${VMID} created"
-
-# Set proper topology via qm set (--threads always supported here)
-if [[ "$THREADS" -gt 1 ]]; then
-  qm set "$VMID" --sockets 1 --cores "$CORES" --threads "$THREADS"
-  msg_ok "Topology set: ${CORES}c × ${THREADS}t (${SMP_TOTAL} vCPUs)"
-fi
+msg_ok "VM ${VMID} created (${SMP_TOTAL} vCPUs · 1 socket × ${SMP_TOTAL} cores)"
 
 # Arm rollback
 CLEANUP_VMID="$VMID"
@@ -1192,7 +1197,7 @@ echo -e "${BOLD}${GN}║${CL}    ${GN}✓${CL} OVMF + Q35 (patched Strong firmwa
 echo -e "${BOLD}${GN}║${CL}    ${GN}✓${CL} SMBIOS spoofing (types 0,1,2,3,4,8,9,17 + auto 7,20,26,27)  ${BOLD}${GN}║${CL}"
 echo -e "${BOLD}${GN}║${CL}    ${GN}✓${CL} ACPI: ssdt + ssdt-ec + hpet + pit                             ${BOLD}${GN}║${CL}"
 echo -e "${BOLD}${GN}║${CL}    ${GN}✓${CL} CPU: host,hypervisor=off (binary hides KVM)                    ${BOLD}${GN}║${CL}"
-printf "${BOLD}${GN}║${CL}    ${GN}✓${CL} %-60s ${BOLD}${GN}║${CL}\n" "Topology: ${SMP_TOTAL} vCPUs (${CORES}c × ${THREADS}t)"
+printf "${BOLD}${GN}║${CL}    ${GN}✓${CL} %-60s ${BOLD}${GN}║${CL}\n" "Topology: ${SMP_TOTAL} vCPUs (1 socket x ${SMP_TOTAL} cores)"
 printf "${BOLD}${GN}║${CL}    ${GN}✓${CL} %-60s ${BOLD}${GN}║${CL}\n" "S3/S4 sleep states enabled + legacy ISA PIT (PNP0100) exposed"
 if [[ "$NVRAM_INJECTED" == true ]]; then
   echo -e "${BOLD}${GN}║${CL}    ${GN}✓${CL} EFI NVRAM: host Secure Boot certs injected                     ${BOLD}${GN}║${CL}"
@@ -1228,7 +1233,7 @@ SUMMARY="/root/vm-${VMID}-deploy-summary.txt"
   echo "Mem:   ${MEM_MFG} ${MEM_SPEED}MT/s ${MEM_PART} S/N:${MEM_SERIAL} A/T:${MEM_ASSET}"
   echo ""
   echo "--- Hardware ---"
-  echo "Topology: ${SMP_TOTAL} vCPUs (${CORES}c × ${THREADS}t, 1 socket)"
+  echo "Topology: ${SMP_TOTAL} vCPUs (1 socket × ${SMP_TOTAL} cores)"
   echo "Memory:   ${MEMORY}MB  ·  Disk: ${DISK_SIZE} on ${DISK_STORAGE}"
   echo "VGA:      ${VGA}  ·  NIC: e1000 on ${BRIDGE}"
   echo "ISO:      ${ISO_FILE:-none}"

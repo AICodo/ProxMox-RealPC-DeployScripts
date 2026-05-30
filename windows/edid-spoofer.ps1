@@ -1,4 +1,4 @@
-# edid-spoofer.ps1 — Randomise monitor EDID serial fields
+# edid-spoofer.ps1 - Randomise monitor EDID serial fields
 #
 # Structure mirrors Scrut1ny/AutoVirt's EDID_OVERRIDE.ps1 (WMI raw EDID fetch ->
 # in-memory mutation -> EDID_OVERRIDE registry write -> driver disable/enable).
@@ -11,7 +11,7 @@
 #     them to 0x00 (treated as a dummy descriptor). We write a realistic
 #     7-char A-Z0-9 string + 0x0A terminator + 0x20 padding, matching how real
 #     monitors encode this descriptor.
-#   * Driver-restart sleep is 3 s (matches AutoVirt — 500 ms is too short on
+#   * Driver-restart sleep is 3 s (matches AutoVirt - 500 ms is too short on
 #     multi-monitor / slower hosts and leaves the override unapplied).
 
 $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -25,7 +25,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 Write-Host "[*] EDID Spoofer: Randomizing monitor serial numbers..." -ForegroundColor Cyan
 
 # Get monitors via WMI for full EDID data. Some debloated ISOs (tiny11/ghost)
-# strip the WmiMonitorDescriptorMethods provider — handle that gracefully
+# strip the WmiMonitorDescriptorMethods provider - handle that gracefully
 # rather than crashing with a "term not recognized" terminating error.
 $wmiMonitors = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorDescriptorMethods -ErrorAction SilentlyContinue
 if (-not $wmiMonitors) {
@@ -62,7 +62,7 @@ foreach ($wmiMon in $wmiMonitors) {
     $targetBlock = $edidBlocks[0]
     if ($null -eq $targetBlock -or $targetBlock.Length -lt 128) { continue }
 
-    # EDID[12–15]: Manufacturer-assigned ID Serial Number randomized
+    # EDID[12-15]: Manufacturer-assigned ID Serial Number randomized
     # Non-zero random serial is more realistic than zeroed (zero = "no serial assigned")
     $targetBlock[12] = Get-Random -Maximum 256
     $targetBlock[13] = Get-Random -Maximum 256
@@ -71,7 +71,7 @@ foreach ($wmiMon in $wmiMonitors) {
     # Ensure not all zero (zero = "no serial" which is suspicious for named monitors)
     if (($targetBlock[12] -bor $targetBlock[13] -bor $targetBlock[14] -bor $targetBlock[15]) -eq 0) { $targetBlock[12] = 1 }
 
-    # EDID[54–125]: Display Descriptor Type 0xFF (Monitor Serial Number) zeroed (18-byte descriptors)
+    # EDID[54-125]: Display Descriptor Type 0xFF (Monitor Serial Number) zeroed (18-byte descriptors)
     foreach ($off in 54, 72, 90, 108) {
         if (
             $targetBlock[$off]     -eq 0x00 -and
@@ -80,7 +80,7 @@ foreach ($wmiMon in $wmiMonitors) {
             $targetBlock[$off + 3] -eq 0xFF
         ) {
             # Randomize serial string in the 0xFF descriptor instead of blanking to 0x10 (dummy).
-            # A blank/dummy descriptor says "no serial" — suspicious for real monitors.
+            # A blank/dummy descriptor says "no serial" - suspicious for real monitors.
             # Random 7-char alphanumeric serial is realistic and defeats cross-session fingerprinting.
             $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
             $serial = -join ($chars.ToCharArray() | Get-Random -Count 7)
@@ -95,7 +95,7 @@ foreach ($wmiMon in $wmiMonitors) {
         }
     }
 
-    # EDID[127]: Checksum recomputed to satisfy (sum of bytes 0–127) % 256 = 0
+    # EDID[127]: Checksum recomputed to satisfy (sum of bytes 0-127) % 256 = 0
     $sum = 0
     for ($i = 0; $i -lt 127; $i++) { $sum += $targetBlock[$i] }
     $targetBlock[127] = (-$sum) -band 0xFF
@@ -120,7 +120,7 @@ foreach ($wmiMon in $wmiMonitors) {
 Write-Host "[+] EDID override written for all detected monitors." -ForegroundColor Green
 
 # --- 4. Restart Graphics Driver ---
-# Match AutoVirt's 3 second wait between disable and enable — 500ms is unreliable
+# Match AutoVirt's 3 second wait between disable and enable - 500ms is unreliable
 # on slower hosts / multi-monitor setups and the graphics stack can fail to
 # release / reattach cleanly, leaving the EDID override unapplied until reboot.
 Write-Host "[*] Restarting graphics driver to apply EDID changes..." -ForegroundColor Cyan

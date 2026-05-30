@@ -1,7 +1,7 @@
 @echo off
 :: Run all anti-detection scripts with admin privileges.
 ::
-:: Originally based on https://github.com/Scrut1ny/AutoVirt — substantially
+:: Originally based on https://github.com/Scrut1ny/AutoVirt - substantially
 :: rewritten: broader pattern coverage, safe Enum\SCSI filtering, DriverStore/
 :: PnP/log cleanup, realistic EDID serial generation, and the identifier
 :: spoofer is net-new. See README "Windows Guest Tools" for details and the
