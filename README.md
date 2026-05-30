@@ -1,81 +1,116 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/QEMU-11.0.0-FF6600?style=for-the-badge&logo=qemu&logoColor=white" alt="QEMU 11">
-  <img src="https://img.shields.io/badge/Proxmox-VE_9-E57000?style=for-the-badge&logo=proxmox&logoColor=white" alt="Proxmox VE 9">
-  <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT">
-  <img src="https://img.shields.io/badge/platform-Linux_|_Windows-blue?style=for-the-badge" alt="Platform">
+  <img src="https://img.shields.io/badge/QEMU-11.0.0-FF6600?style=for-the-badge&logo=qemu&logoColor=white">
+  <img src="https://img.shields.io/badge/Proxmox-VE_9-E57000?style=for-the-badge&logo=proxmox&logoColor=white">
+  <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge">
+  <img src="https://img.shields.io/badge/shell-|_powershell-blue?style=for-the-badge">
 </p>
 
-<h1 align="center">
-  ⚡ ProxMox RealPC DeployScripts ⚡
-</h1>
+<h1 align="center">ProxMox RealPC DeployScripts</h1>
 
 <p align="center">
-  <i>Cloak your VMs. Defeat detection. Own your hardware.</i>
-</p>
-
-<p align="center">
-  <sub>Deployment automation and Windows guest hardening for the <a href="https://github.com/AICodo/pve-emu-realpc">pve-emu-realpc</a> anti‑detection stack.</sub>
+  <i>Deployment automation and Windows guest hardening for the <a href="https://github.com/AICodo/pve-emu-realpc">pve-emu-realpc</a> anti‑detection stack.</i>
 </p>
 
 <p align="center">
-  <sub><i>For security research, sandboxing, and malware analysis only. You are responsible for how you use this.</i></sub>
+  <sub>For security research, sandboxing, and malware analysis only. You are responsible for how you use this.</sub>
 </p>
 
-<br>
+---
+
+## Quick Start
+
+SSH into your Proxmox host as root and paste:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/Diobyte/ProxMox-RealPC-DeployScripts/main/pve-realpc-setup.sh)"
+```
+
+Then deploy a VM:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/Diobyte/ProxMox-RealPC-DeployScripts/main/pve-realpc-deploy-vm.sh
+bash pve-realpc-deploy-vm.sh
+qm start <VMID>
+```
+
+**Prefer git clone?**
+
+```bash
+git clone https://github.com/Diobyte/ProxMox-RealPC-DeployScripts.git
+cd ProxMox-RealPC-DeployScripts
+bash pve-realpc-setup.sh
+bash pve-realpc-deploy-vm.sh
+```
+
+**Unattended / headless?**
+
+```bash
+bash pve-realpc-setup.sh --non-interactive           # auto-pick latest + Strong
+bash pve-realpc-setup.sh --non-interactive --no-strong  # base only, no kernel pin
+bash pve-realpc-setup.sh --list-releases             # preview what's available
+```
 
 ---
 
-## 📦 What's Inside
+## What's Inside
 
-<pre align="center">
-<b>pve-realpc-setup.sh</b>       →  One-shot host prep — patched QEMU · OVMF · KVM
-<b>pve-realpc-deploy-vm.sh</b>   →  Per‑VM cloaking — SMBIOS · ACPI · NVRAM · timing
-<b>windows/run-tools.bat</b>     →  Guest cleanup launcher (auto‑elevate)
-<b>windows/qemu-cleanup.ps1</b> →  Registry & driver artefact removal (30+ sigs)
-<b>windows/identifier-spoofer.ps1</b> →  Machine identity randomiser (16 fields)
-<b>windows/edid-spoofer.ps1</b> →  Monitor serial spoofing (realistic non‑zero)
-</pre>
+| File | Purpose |
+|---|---|
+| `pve-realpc-setup.sh` | One-shot host preparation — downloads & installs patched QEMU, OVMF, KVM, ACPI tables, ROMs |
+| `pve-realpc-deploy-vm.sh` | Per-VM cloaking — SMBIOS spoofing, ACPI injection, NVRAM hardening, timing fixes |
+| `windows/run-tools.bat` | Guest cleanup launcher (auto-elevates to Administrator) |
+| `windows/qemu-cleanup.ps1` | Registry & driver artefact removal — 30+ VM signature patterns, DriverStore, hidden PnP devices, event logs |
+| `windows/identifier-spoofer.ps1` | Machine identity randomiser — 16 Windows identifiers (MachineGuid, MAC, hostname, network profiles, etc.) |
+| `windows/edid-spoofer.ps1` | Monitor EDID serial spoofing with realistic non-zero serials + checksum correction |
 
-> The Windows tools are heavily rewritten from [Scrut1ny/AutoVirt](https://github.com/Scrut1ny/AutoVirt) — broader pattern coverage, safe SCSI filtering, realistic EDID serials, and the identifier spoofer is entirely new.
-
----
-
-## 🔗 Source Repos
-
-| Repository | Stars | Role |
-|:---|:---:|:---|
-| [**AICodo/pve-emu-realpc**](https://github.com/AICodo/pve-emu-realpc) | `473` | **Primary upstream** — patched QEMU · OVMF · KVM for PVE 9 |
-| [zhaodice/qemu-anti-detection](https://github.com/zhaodice/qemu-anti-detection) | `1.5k` | **Original source** — patches for QEMU 6.2 → 10.2.2 |
-| [Scrut1ny/AutoVirt](https://github.com/Scrut1ny/AutoVirt) | `684` | **Guest scripts origin** — libvirt · VFIO · OVMF (GPL‑3.0) |
-| [lixiaoliu666/pve-anti-detection](https://deepwiki.com/lixiaoliu666/pve-anti-detection) | — | **DeepWiki docs** — repo ↪ AICodo/pve-emu-realpc |
-| [AICodo/qemu-emu-realpc](https://github.com/AICodo/qemu-emu-realpc) | — | Standalone `.patch` files (non‑PVE / libvirt) |
-| [AICodo/pve-emu-realpc_edk2-firmware-ovmf](https://github.com/AICodo/pve-emu-realpc_edk2-firmware-ovmf) | — | Patched EDK2 / OVMF firmware |
-| [AICodo/intel-ultra-rom](https://github.com/AICodo/intel-ultra-rom) | — | Intel iGPU passthrough ROMs (Ultra desktop & notebook) |
-
-### 🧪 Detection Validation
-
-| Tool | | Tool | |
-|:---|:---:|:---|:---:|
-| [pafish](https://github.com/a0rtega/pafish) | — | [al‑khaser](https://github.com/LordNoteworthy/al-khaser) | — |
-| [VMAware](https://github.com/kernelwernel/VMAware) | — | | |
-
-### 🌐 Related Projects
-
-| Repository | Stars | Description |
-|:---|:---:|:---|
-| [Justsenger/ExHyperV](https://github.com/Justsenger/ExHyperV) | `4k+` | Hyper‑V GPU‑PV · CPU pinning · PCIe passthrough |
-| [t4bby/smbios-patcher](https://github.com/t4bby/smbios-patcher) | — | CLI SMBIOS binary patcher (C / Meson) |
-| [t4bby/smbios-parser](https://github.com/t4bby/smbios-parser) | — | C99 / C++98 SMBIOS table parser |
-| [Ape‑xCV/Nika‑Read‑Only](https://github.com/Ape-xCV/Nika-Read-Only) | — | QEMU / KVM anti‑detection walkthrough |
+The Windows tools are heavily rewritten from [Scrut1ny/AutoVirt](https://github.com/Scrut1ny/AutoVirt) — broader pattern coverage, safe SCSI filtering, realistic EDID serial generation, and the identifier spoofer is entirely new.
 
 ---
 
-## 🙏 Credits
+## Source Repositories
 
-Anti‑detection by **Li Xiaoliu** (李晓流) & **DadaShuai666** (大大帅666). Strong build by [AICodo](https://github.com/AICodo). Windows tools derived from [Scrut1ny/AutoVirt](https://github.com/Scrut1ny/AutoVirt).
+### Primary upstream
+
+| Repository | ★ | Role |
+|---|---|---|
+| [AICodo/pve-emu-realpc](https://github.com/AICodo/pve-emu-realpc) | 473 | Patched QEMU, OVMF, and KVM packages for PVE 9. Forked from zhaodice/qemu-anti-detection. Latest: v11.0.0-4. |
+| [zhaodice/qemu-anti-detection](https://github.com/zhaodice/qemu-anti-detection) | 1.5k | Original anti-detection source. Patches for QEMU 6.2 through 10.2.2. |
+| [Scrut1ny/AutoVirt](https://github.com/Scrut1ny/AutoVirt) | 684 | Origin of the Windows guest cleanup scripts. QEMU/KVM/libvirt automation, VFIO, OVMF patching. GPL-3.0. |
+| [lixiaoliu666/pve-anti-detection](https://deepwiki.com/lixiaoliu666/pve-anti-detection) | — | Technical documentation on DeepWiki. Repo now redirects to AICodo/pve-emu-realpc. |
+
+### Supplementary
+
+| Repository | ★ | Contents |
+|---|---|---|
+| [AICodo/qemu-emu-realpc](https://github.com/AICodo/qemu-emu-realpc) | 3 | Standalone `.patch` files for QEMU 6.2–11.0.0 (non-PVE, libvirt-compatible). |
+| [AICodo/pve-emu-realpc_edk2-firmware-ovmf](https://github.com/AICodo/pve-emu-realpc_edk2-firmware-ovmf) | — | Patched EDK2 / OVMF firmware packages. |
+| [AICodo/intel-ultra-rom](https://github.com/AICodo/intel-ultra-rom) | — | Intel iGPU passthrough ROMs — desktop & notebook Core Ultra variants. |
+
+### Detection validation tools
+
+| Repository | ★ | Notes |
+|---|---|---|
+| [a0rtega/pafish](https://github.com/a0rtega/pafish) | 3.9k | Comprehensive VM detection suite. Archived Aug 2025. |
+| [ayoubfaouzi/al-khaser](https://github.com/ayoubfaouzi/al-khaser) | 7k | Advanced anti-analysis detection (formerly LordNoteworthy/al-khaser). |
+| [kernelwernel/VMAware](https://github.com/kernelwernel/VMAware) | 1.2k | Cross-platform VM detection library. Actively maintained. |
+
+### Related projects
+
+| Repository | ★ | Description |
+|---|---|---|
+| [Justsenger/ExHyperV](https://github.com/Justsenger/ExHyperV) | 4k+ | Hyper-V GPU-PV, CPU pinning, PCIe passthrough. Windows-on-Windows alternative. |
+| [t4bby/smbios-patcher](https://github.com/t4bby/smbios-patcher) | — | CLI SMBIOS binary patcher (C / Meson). |
+| [t4bby/smbios-parser](https://github.com/t4bby/smbios-parser) | — | C99 / C++98 SMBIOS / DMI table parser. |
+| [Ape-xCV/Nika-Read-Only](https://github.com/Ape-xCV/Nika-Read-Only) | — | QEMU / KVM anti-detection walkthrough for Fedora/Debian + libvirt. |
+
+---
+
+## Credits
+
+Anti‑detection by **Li Xiaoliu** (李晓流) & **DadaShuai666** (大大帅666). Strong build enhancements by [AICodo](https://github.com/AICodo). Windows guest tools derived from [Scrut1ny/AutoVirt](https://github.com/Scrut1ny/AutoVirt).
 
 ---
 
 <p align="center">
-  <sub>MIT © <a href="LICENSE">Diobyte</a> — scripts & docs only. Upstream QEMU binaries are GPL‑2.0.</sub>
+  <sub>MIT © <a href="LICENSE">Diobyte</a> — applies to scripts & docs only. Downloaded QEMU/OVMF/KVM binaries are GPL-2.0.</sub>
 </p>
