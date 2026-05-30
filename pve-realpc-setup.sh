@@ -1038,7 +1038,7 @@ install_target_kernel() {
         chmod 644 "${target_kvm_dir}/kvm.ko"
 
         # Verify vermagic compatibility between the module and the target kernel
-        local module_vermagic kernel_vermagic
+        local module_vermagic="" kernel_vermagic=""
         module_vermagic=$(modinfo -F vermagic "${target_kvm_dir}/kvm.ko" 2>/dev/null || echo "")
         if [[ -f "${target_modules}/build/include/generated/utsrelease.h" ]]; then
             kernel_vermagic=$(grep -oP 'UTS_RELEASE "\K[^"]+' "${target_modules}/build/include/generated/utsrelease.h" 2>/dev/null || echo "")
