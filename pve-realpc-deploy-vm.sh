@@ -492,7 +492,7 @@ function default_config() {
   ISO_TYPE="${ISO_TYPE:-}"
   BRIDGE="${BRIDGE:-vmbr0}"
   VGA="${VGA:-vmware}"
-  OSTYPE="${OSTYPE:-other}"
+  GUEST_OS="${GUEST_OS:-other}"
   ADD_TPM="${ADD_TPM:-false}"
   AFFINITY="${AFFINITY:-}"
   IGPU_ENABLE="${IGPU_ENABLE:-false}"
@@ -542,7 +542,7 @@ function parse_args() {
       --bridge)       BRIDGE="$2";            shift 2 ;;
       --type)         VM_TYPE="$2";           shift 2 ;;
       --vga)          VGA="$2";               shift 2 ;;
-      --ostype)       OSTYPE="$2";            shift 2 ;;
+      --ostype)       GUEST_OS="$2";            shift 2 ;;
       --mem-mfg)      MEM_MFG="$2"; MEM_EXPLICIT=true;  shift 2 ;;
       --mem-speed)    MEM_SPEED="$2"; MEM_EXPLICIT=true; shift 2 ;;
       --mem-part)     MEM_PART="$2"; MEM_EXPLICIT=true;  shift 2 ;;
@@ -755,15 +755,15 @@ function advanced_config() {
     fi
 
     # --- OSType ---
-    OSTYPE="${OSTYPE:-other}"
-    if OSTYPE=$(whiptail --backtitle "PVE RealPC Deploy" --title "OS Type" --radiolist \
+    GUEST_OS="${GUEST_OS:-other}"
+    if GUEST_OS=$(whiptail --backtitle "PVE RealPC Deploy" --title "OS Type" --radiolist \
       "Guest OS type (recommended: other — preserves S3/S4 sleep)" 14 58 4 \
       "other"  "Other (default — no S3/S4 injection)" ON \
       "win11"  "Windows 11" OFF \
       "win10"  "Windows 10" OFF \
       "l26"    "Linux 2.6 (upstream uses this)" OFF \
       3>&1 1>&2 2>&3); then
-      echo -e "${BOOT}${BOLD}${DGN}OS Type: ${BGN}${OSTYPE}${CL}"
+      echo -e "${BOOT}${BOLD}${DGN}OS Type: ${BGN}${GUEST_OS}${CL}"
     else exit_script; fi
 
     # --- Disk storage ---
@@ -792,7 +792,7 @@ function advanced_config() {
 
     # --- Confirm ---
     if whiptail --backtitle "PVE RealPC Deploy" --title "Ready" \
-      --yesno "Create VM ${VMID} (${VM_NAME}) with these settings?\n\n  ${CORES} cores × ${THREADS} threads  ·  ${MEMORY}MB RAM  ·  ${DISK_SIZE} disk\n  VGA: ${VGA}  ·  Type: ${VM_TYPE}  ·  Bridge: ${BRIDGE}  ·  Firewall: $([ "$FIREWALL" = 1 ] && echo On || echo Off)\n  iGPU: $(${IGPU_ENABLE} && echo Enabled || echo Disabled)  ·  TPM: $(${ADD_TPM} && echo Yes || echo No)  ·  OS: ${OSTYPE}" \
+      --yesno "Create VM ${VMID} (${VM_NAME}) with these settings?\n\n  ${CORES} cores × ${THREADS} threads  ·  ${MEMORY}MB RAM  ·  ${DISK_SIZE} disk\n  VGA: ${VGA}  ·  Type: ${VM_TYPE}  ·  Bridge: ${BRIDGE}  ·  Firewall: $([ "$FIREWALL" = 1 ] && echo On || echo Off)\n  iGPU: $(${IGPU_ENABLE} && echo Enabled || echo Disabled)  ·  TPM: $(${ADD_TPM} && echo Yes || echo No)  ·  OS: ${GUEST_OS}" \
       --yes-button "Create" --no-button "Redo" 16 70; then
       break
     fi
@@ -990,8 +990,8 @@ if [[ "$MEMORY" != "4096" && "$MEMORY" != "8192" && "$MEMORY" != "16384" ]]; the
 fi
 
 # Ostype — warn if l26/win10/win11 (PVE injects disable_s3/s4 but our -global overrides)
-if [[ "$OSTYPE" != "other" ]]; then
-  msg_warn "OSTYPE '${OSTYPE}' may cause PVE to inject disable_s3/s4 globals."
+if [[ "$GUEST_OS" != "other" ]]; then
+  msg_warn "GUEST_OS '${GUEST_OS}' may cause PVE to inject disable_s3/s4 globals."
   msg_warn "Our args line overrides these — S3/S4 should still work."
   msg_warn "Recommended: --ostype other (default)."
 fi
@@ -1049,7 +1049,7 @@ if [[ "$DRY_RUN" == true ]]; then
   echo -e "${BOLD}${GN}║${CL}  Topology:  ${SMP_TOTAL} vCPUs (${CORES}c × ${THREADS}t)"
   echo -e "${BOLD}${GN}║${CL}  Memory:    ${MEMORY}MB  ·  Disk: ${DISK_SIZE} on ${DISK_STORAGE}"
   echo -e "${BOLD}${GN}║${CL}  VGA:       ${VGA}  ·  NIC: e1000 on ${BRIDGE}"
-  echo -e "${BOLD}${GN}║${CL}  Type:      ${VM_TYPE}  ·  OS: ${OSTYPE}"
+  echo -e "${BOLD}${GN}║${CL}  Type:      ${VM_TYPE}  ·  OS: ${GUEST_OS}"
   echo -e "${BOLD}${GN}║${CL}  Board:     ${SMBIOS_BOARD_MFG} ${SMBIOS_BOARD_PRODUCT}"
   echo -e "${BOLD}${GN}║${CL}  CPU:       ${SMBIOS_CPU_VERSION}"
   echo -e "${BOLD}${GN}║${CL}  ISO:       ${ISO_FILE:-none}"
@@ -1086,7 +1086,7 @@ msg_info "Creating VM ${VMID}"
 
 # qm create (cores = total vCPUs; --threads not accepted by qm create on some PVE builds)
 qm create "$VMID" \
-  --name "$VM_NAME" --bios ovmf --machine q35 --ostype "$OSTYPE" --cpu host \
+  --name "$VM_NAME" --bios ovmf --machine q35 --ostype "$GUEST_OS" --cpu host \
   --sockets 1 --cores "$SMP_TOTAL" --memory "$MEMORY" \
   --balloon 0 --numa 0 --scsihw virtio-scsi-single \
   --net0 "e1000,bridge=${BRIDGE},firewall=${FIREWALL}" \

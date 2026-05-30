@@ -56,12 +56,13 @@ DATACENTER_CFG="/etc/pve/datacenter.cfg"
 BACKUP_DIR="/root/pve-realpc/backup"
 
 # Debian release — patched ROM/BIOS files with VM strings removed
-# The PVE deb and Debian release are built from the SAME sedPatch source patches,
-# but only the Debian release includes separately compiled SeaBIOS/VGA/EFI ROMs
-# with "QEMU", "Bochs", "SeaBIOS" strings scrubbed (the PVE deb ships stock ROMs).
+# The PVE deb and Debian release share the same core sedPatch anti-detection
+# transformations, but only the Debian release includes separately compiled
+# SeaBIOS/VGA/EFI ROMs with "QEMU", "Bochs", "SeaBIOS" strings scrubbed
+# (the PVE deb ships stock ROMs). The PVE qemu-autoGenPatch.patch is ~836 bytes
+# larger — it adds bootsplash overrides and build-system integration.
 # The QEMU binary from the PVE deb is PREFERRED over the Debian one because it
-# includes PVE management integration + Strong build CPU sensor passthrough
-# (the PVE qemu-autoGenPatch.patch is also ~836 bytes larger with extra patches).
+# includes PVE management integration + Strong build CPU sensor passthrough.
 # We only use the Debian release for ROM overlay, NOT the binary.
 DEBIAN_TAG="v20260507-200382-debian"
 DEBIAN_URL="https://github.com/AICodo/pve-emu-realpc/releases/download/${DEBIAN_TAG}"
@@ -273,7 +274,7 @@ check_pve9() {
         fail "pveversion not found — this script requires Proxmox VE."
     fi
     local pve_ver
-    pve_ver=$(pveversion 2>/dev/null | grep -oP 'pve-manager/\\K[0-9]+')
+    pve_ver=$(pveversion 2>/dev/null | grep -oP 'pve-manager/\K[0-9]+')
     if [[ "$pve_ver" != "8" && "$pve_ver" != "9" ]]; then
         warn "Detected PVE major version ${pve_ver}. This release targets PVE 9. Proceed with caution."
     fi
@@ -762,8 +763,7 @@ install_target_kernel() {
         # Broader search: list all available kernels and find a match
         warn "Exact package not found. Searching for kernels containing '${target_ver_fragment}' ..."
         local found
-        # apt-cache search uses POSIX ERE — `\|` is a literal pipe, not alternation.
-        # Run two searches and concatenate so both proxmox-kernel-* and pve-kernel-* match.
+        # apt-cache search uses POSIX ERE — run two searches for both prefix schemes.
         # Sanitize version fragment (escape dots) so `.` doesn't wildcard-match.
         local frag_re="${target_ver_fragment//./\\.}"
         found=$( { apt-cache search "proxmox-kernel.*${frag_re}" 2>/dev/null; \
@@ -776,13 +776,34 @@ install_target_kernel() {
             pkg_name=$(awk 'NR==1 {print $1; exit}' <<<"$found")
             info "Selecting: ${pkg_name}"
         else
-            warn "No kernel package found for version '${target_ver_fragment}' in APT repositories."
-            warn "You may need to add the correct Proxmox repository or download the kernel manually."
-            warn ""
-            warn "Manual fix options:"
-            warn "  1. Check available kernels: apt-cache search proxmox-kernel | grep ${target_ver_fragment}"
-            warn "  2. Check your APT sources:  cat /etc/apt/sources.list.d/*.list"
-            warn "  3. Install manually if you have the .deb: dpkg -i proxmox-kernel-${target_kernel}_*.deb"
+            warn "╔══════════════════════════════════════════════════════════════════╗"
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "KERNEL NOT AVAILABLE"
+            printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "No kernel package matching '${target_ver_fragment}' found in APT."
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "The patched kvm.ko was built for this specific kernel version."
+            printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "Options:"
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "  1. Skip Strong (--no-strong) — base anti-detection still works,"
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "     you only lose sensor passthrough (temperature/MHz/power)."
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "  2. Check for a newer Strong .tgz built for your kernel."
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "  3. Install the kvm.ko anyway — it will NOT load on your"
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "     current kernel (version magic mismatch)."
+            printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "Available kernels:"
+            if command -v apt-cache &>/dev/null; then
+                local avail_kernels
+                avail_kernels=$( { apt-cache search '^proxmox-kernel-[0-9]' 2>/dev/null; \
+                                   apt-cache search '^pve-kernel-[0-9]' 2>/dev/null; } \
+                                 | grep -Ev 'headers|dbg|signed' | awk '{print $1}' | sort -V | tail -10 || true)
+                if [[ -n "$avail_kernels" ]]; then
+                    while IFS= read -r k; do
+                        printf "${YELLOW}[WARN]${NC}  ║    %-62s║\\n" "$k"
+                    done <<<"$avail_kernels"
+                else
+                    printf "${YELLOW}[WARN]${NC}  ║    %-62s║\\n" "(none found — check APT sources: /etc/apt/sources.list.d/)"
+                fi
+            fi
+            warn "╚══════════════════════════════════════════════════════════════════╝"
             return 1
         fi
     fi
@@ -805,16 +826,20 @@ install_target_kernel() {
 
     # Method 1: proxmox-boot-tool (preferred on PVE with systemd-boot / ZFS boot)
     if command -v proxmox-boot-tool &>/dev/null; then
-        info "Refreshing boot configuration via proxmox-boot-tool ..."
-        proxmox-boot-tool refresh 2>&1 | tail -3 || true
+        # Check if 'kernel pin' subcommand is supported (added in recent PVE releases)
+        if proxmox-boot-tool kernel pin --help &>/dev/null 2>&1; then
+            info "Pinning ${target_kernel} via proxmox-boot-tool kernel pin ..."
+            proxmox-boot-tool kernel pin "$target_kernel" 2>&1 | tail -3 || \
+                warn "proxmox-boot-tool kernel pin returned non-zero — GRUB fallback still in effect."
+        else
+            info "proxmox-boot-tool present but 'kernel pin' subcommand not available — using GRUB fallback."
+            proxmox-boot-tool refresh 2>&1 | tail -3 || true
+        fi
     fi
 
     # Method 2: GRUB pinning (works on all setups)
     local grub_default="/etc/default/grub"
     if [[ -f "$grub_default" ]]; then
-        # Find the GRUB menu entry for the target kernel
-        # PVE GRUB entries look like: "proxmox-ve-kernel-X.Y.Z-N-pve" in advanced options
-        # We use GRUB_DEFAULT=0 with pin so the newest installed kernel (our target) boots first
         # Backup current GRUB config
         cp "$grub_default" "${BACKUP_DIR}/grub.default.bak" 2>/dev/null || true
 
@@ -836,17 +861,10 @@ install_target_kernel() {
         ok "GRUB configured to boot kernel ${target_kernel}"
     fi
 
-    # PVE 8+ uses proxmox-boot-tool with systemd-boot / GRUB; it has a real
-    # kernel-pin mechanism. Prefer that over GRUB_DEFAULT alone where available.
-    if command -v proxmox-boot-tool &>/dev/null; then
-        info "Pinning ${target_kernel} via proxmox-boot-tool ..."
-        proxmox-boot-tool kernel pin "$target_kernel" 2>&1 | tail -3 || \
-            warn "proxmox-boot-tool kernel pin returned non-zero — GRUB_DEFAULT fallback still in effect."
-    fi
-
     # ── Install the patched kvm.ko into the TARGET kernel's module tree ──
-    local target_kvm_dir="/lib/modules/${target_kernel}/kernel/arch/x86/kvm"
-    if [[ -d "/lib/modules/${target_kernel}" ]]; then
+    local target_modules="/lib/modules/${target_kernel}"
+    local target_kvm_dir="${target_modules}/kernel/arch/x86/kvm"
+    if [[ -d "$target_modules" ]]; then
         mkdir -p "$target_kvm_dir"
 
         # Remove any compressed stock module
@@ -855,6 +873,26 @@ install_target_kernel() {
         info "Installing patched kvm.ko into /lib/modules/${target_kernel}/ ..."
         cp "$kvm_module_src" "${target_kvm_dir}/kvm.ko"
         chmod 644 "${target_kvm_dir}/kvm.ko"
+
+        # Verify vermagic compatibility between the module and the target kernel
+        local module_vermagic kernel_vermagic
+        module_vermagic=$(modinfo -F vermagic "${target_kvm_dir}/kvm.ko" 2>/dev/null || echo "")
+        if [[ -f "${target_modules}/build/include/generated/utsrelease.h" ]]; then
+            kernel_vermagic=$(grep -oP 'UTS_RELEASE "\K[^"]+' "${target_modules}/build/include/generated/utsrelease.h" 2>/dev/null || echo "")
+        fi
+        if [[ -z "$kernel_vermagic" && -f "/lib/modules/${target_kernel}/modules.builtin" ]]; then
+            # Fallback: the target kernel version IS the vermagic base
+            kernel_vermagic="$target_kernel"
+        fi
+        if [[ -n "$module_vermagic" && -n "$kernel_vermagic" ]]; then
+            # vermagic format: "6.17.13-2-pve SMP preempt mod_unload modversions "
+            if echo "$module_vermagic" | grep -qF "$kernel_vermagic"; then
+                ok "Module vermagic verified: compatible with kernel ${target_kernel}"
+            else
+                warn "Module vermagic MISMATCH: module=${module_vermagic}, kernel=${kernel_vermagic}"
+                warn "The kvm.ko will NOT load. Skip Strong (--no-strong) or find a matching build."
+            fi
+        fi
 
         # Rebuild depmod for the target kernel
         depmod -a "$target_kernel" 2>/dev/null || depmod -a
@@ -869,15 +907,15 @@ install_target_kernel() {
     NEEDS_REBOOT=true
     echo ""
     warn "╔══════════════════════════════════════════════════════════════════╗"
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "REBOOT REQUIRED"
-    printf "${YELLOW}[WARN]${NC}  ║%-66s║\n" ""
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "A different kernel (${target_kernel}) has been installed"
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "and pinned as the default boot entry."
-    printf "${YELLOW}[WARN]${NC}  ║%-66s║\n" ""
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "Please reboot now:  reboot"
-    printf "${YELLOW}[WARN]${NC}  ║%-66s║\n" ""
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "After reboot, verify with:  uname -r"
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "Expected: ${target_kernel}"
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "REBOOT REQUIRED"
+    printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "A different kernel (${target_kernel}) has been installed"
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "and pinned as the default boot entry."
+    printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "Please reboot now:  reboot"
+    printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "After reboot, verify with:  uname -r"
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "Expected: ${target_kernel}"
     warn "╚══════════════════════════════════════════════════════════════════╝"
 
     return 0
@@ -1491,7 +1529,25 @@ else
             warn "stopping all VMs and running: rmmod kvm_intel kvm && modprobe kvm"
         else
             info "Loading patched KVM module ..."
-            modprobe kvm && ok "Patched KVM module loaded" || warn "Failed to load — will work after reboot"
+            if modprobe kvm 2>/dev/null; then
+                ok "Patched KVM module loaded successfully"
+            else
+                # Check vermagic to determine if failure is permanent or transient
+                local mod_vermagic
+                mod_vermagic=$(modinfo -F vermagic "$KVM_DEST" 2>/dev/null || echo "")
+                if [[ -n "$mod_vermagic" ]] && ! echo "$mod_vermagic" | grep -qF "$KERNEL_VER"; then
+                    warn "KVM module FAILED to load: version magic mismatch."
+                    warn "  Module built for: $(echo "$mod_vermagic" | awk '{print $1}')"
+                    warn "  Running kernel:   ${KERNEL_VER}"
+                    warn "  This will NOT fix itself after reboot. Options:"
+                    warn "  1. Re-run with --no-strong to skip sensor passthrough"
+                    warn "  2. Install the matching kernel: proxmox-kernel-${KERNEL_VER}"
+                    warn "  3. Check upstream for a Strong build against your kernel"
+                else
+                    warn "Failed to load KVM module — may be a transient issue."
+                    warn "After reboot, verify with: lsmod | grep kvm"
+                fi
+            fi
         fi
         fi  # dry_guard
 
