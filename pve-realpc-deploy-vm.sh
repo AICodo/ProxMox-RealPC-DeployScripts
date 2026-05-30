@@ -190,11 +190,48 @@ done
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+BLD='\033[1m'; DIM='\033[2m'; MAG='\033[0;35m'; BLU='\033[0;34m'
 
 info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
 ok()    { echo -e "${GREEN}[ OK ]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
+
+# ─── Visual banner ───────────────────────────────────────────────────────────
+show_banner() {
+    clear 2>/dev/null || true
+    echo -e "
+  ${BLD}${MAG}╔══════════════════════════════════════════════════════════════════════╗${NC}
+  ${BLD}${MAG}║${NC}                                                                      ${BLD}${MAG}║${NC}
+  ${BLD}${MAG}║${NC}  ${BLD}${RED}██████╗ ██╗   ██╗███████╗    ${GREEN}██████╗ ███████╗ █████╗ ██╗     ${BLD}${MAG}║${NC}
+  ${BLD}${MAG}║${NC}  ${BLD}${RED}██╔══██╗██║   ██║██╔════╝    ${GREEN}██╔══██╗██╔════╝██╔══██╗██║     ${BLD}${MAG}║${NC}
+  ${BLD}${MAG}║${NC}  ${BLD}${RED}██████╔╝██║   ██║█████╗      ${GREEN}██████╔╝█████╗  ███████║██║     ${BLD}${MAG}║${NC}
+  ${BLD}${MAG}║${NC}  ${BLD}${RED}██╔═══╝ ╚██╗ ██╔╝██╔══╝      ${GREEN}██╔══██╗██╔══╝  ██╔══██║██║     ${BLD}${MAG}║${NC}
+  ${BLD}${MAG}║${NC}  ${BLD}${RED}██║      ╚████╔╝ ███████╗    ${GREEN}██║  ██║███████╗██║  ██║███████╗${BLD}${MAG}║${NC}
+  ${BLD}${MAG}║${NC}  ${BLD}${RED}╚═╝       ╚═══╝  ╚══════╝    ${GREEN}╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝${BLD}${MAG}║${NC}
+  ${BLD}${MAG}║${NC}                                                                      ${BLD}${MAG}║${NC}
+  ${BLD}${MAG}║${NC}   ${BLD}Anti-VM-Detection Deployment${NC}   │   ${DIM}QEMU 11  ·  OVMF  ·  AICodo/pve-emu-realpc${NC}   ${BLD}${MAG}║${NC}
+  ${BLD}${MAG}╚══════════════════════════════════════════════════════════════════════╝${NC}
+"
+}
+
+# ─── System info display ────────────────────────────────────────────────────
+show_system_info() {
+    local cpu_model cpu_cores total_ram storage_info
+    cpu_model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs 2>/dev/null || echo "Unknown")
+    cpu_cores=$(nproc 2>/dev/null || echo "?")
+    total_ram=$(free -h 2>/dev/null | awk '/^Mem:/{print $2}' || echo "?")
+    storage_info=$(pvesm status 2>/dev/null | awk 'NR>1 && $3=="active"{printf "%s(%s) ",$1,$2}' || echo "?")
+
+    echo -e "  ${BLD}${BLU}┌── Host System ──────────────────────────────────────────────┐${NC}"
+    printf  "  ${BLD}${BLU}│${NC}  %-56s ${BLD}${BLU}│${NC}\n"  "CPU: ${cpu_model}"
+    printf  "  ${BLD}${BLU}│${NC}  %-56s ${BLD}${BLU}│${NC}\n"  "Cores: ${cpu_cores} logical  ·  RAM: ${total_ram}"
+    printf  "  ${BLD}${BLU}│${NC}  %-56s ${BLD}${BLU}│${NC}\n"  "Storage: ${storage_info}"
+    printf  "  ${BLD}${BLU}│${NC}  %-56s ${BLD}${BLU}│${NC}\n"  "Profile: ${HOST_CPU_VENDOR^^}  ·  Board: ${SMBIOS_BOARD_MFG}"
+    echo -e "  ${BLD}${BLU}└────────────────────────────────────────────────────────────┘${NC}"
+    echo ""
+}
+
 
 require_root() {
     [[ $EUID -eq 0 ]] || fail "This script must be run as root."
@@ -990,6 +1027,9 @@ FULL_ARGS="${ACPI_ARGS} -cpu ${CPU_FLAGS}${SMBIOS_ARGS}${IGPU_ARGS}${PCI_ARGS}"
 ###############################################################################
 # Create the VM via qm
 ###############################################################################
+show_banner
+info "VMID: ${VMID}  ·  Name: ${VM_NAME}  ·  Type: ${CPU_TYPE}  ·  VGA: ${VGA}"
+show_system_info
 echo ""
 info "═══ Creating VM ${VMID} (${VM_NAME}) ═══"
 
@@ -1307,51 +1347,47 @@ cat "$CONF_FILE"
 echo "────────────────────────────────────────────────────────────────"
 
 echo ""
-echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║   VM ${VMID} (${VM_NAME}) deployed successfully!                     ║${NC}"
-echo -e "${GREEN}╠═══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${GREEN}║                                                               ║${NC}"
-echo -e "${GREEN}║  Anti-Detection Features (upstream-compatible):               ║${NC}"
-echo -e "${GREEN}║    ✓ OVMF + Q35 (patched Strong OVMF firmware)               ║${NC}"
-echo -e "${GREEN}║    ✓ SMBIOS spoofing (types 0,1,2,3,4,8,9,17)              ║${NC}"
-echo -e "${GREEN}║    ✓ ACPI custom tables (ssdt, ssdt-ec, hpet, pit)            ║${NC}"
-echo -e "${GREEN}║    ✓ CPU: host, hypervisor=off (binary hides KVM)          ║${NC}"
-echo -e "${GREEN}║    ✓ Cores: ${SMP_TOTAL} vCPUs (${SMP_CORES}c × ${SMP_THREADS}t, matches host topology)  ║${NC}"
-echo -e "${GREEN}║    ✓ Timers handled by binary (TSC/HPET/PIT/RTC)             ║${NC}"
-echo -e "${GREEN}║    ✓ EFI NVRAM: host variables injected (real Secure Boot certs)║${NC}"
-echo -e "${GREEN}║    ✓ ACPI PCI hotplug disabled (no hotplug fingerprint)       ║${NC}"
-echo -e "${GREEN}║    ✓ S3/S4 sleep states enabled (defeats POWER_CAPABILITIES) ║${NC}"
-echo -e "${GREEN}║    ✓ PIT SSDT loaded (defeats SYSTEM_TIMERS / CLOCK)          ║${NC}"
-echo -e "${GREEN}║    ✓ e1000 NIC with realistic MAC (Intel 82540EM)            ║${NC}"
-echo -e "${GREEN}║    ✓ SATA disk with custom serial (no virtio)                ║${NC}"
-echo -e "${GREEN}║    ✓ Balloon disabled                                        ║${NC}"
+echo -e "${BLD}${GREEN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BLD}${GREEN}║${NC}  ${BLD}VM ${VMID} (${VM_NAME}) deployed successfully!${NC}                               ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}╠══════════════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BLD}${GREEN}║${NC}                                                                  ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}║${NC}  ${BLD}Anti-Detection Layers Active:${NC}                                    ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} OVMF + Q35 (patched Strong firmware)                           ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} SMBIOS spoofing (types 0,1,2,3,4,8,9,17 + auto 7,20,26,27)  ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} ACPI: ssdt + ssdt-ec + hpet + pit                             ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} CPU: host,hypervisor=off (binary hides KVM)                    ${BLD}${GREEN}║${NC}"
+printf "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} %-60s ${BLD}${GREEN}║${NC}\n" "Topology: ${SMP_TOTAL} vCPUs (${SMP_CORES}c × ${SMP_THREADS}t)"
+echo -e "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} S3/S4 sleep + PIT SSDT (POWER + CLOCK 45pts each)             ${BLD}${GREEN}║${NC}"
+if [[ "$NVRAM_INJECTED" == true ]]; then
+echo -e "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} EFI NVRAM: host Secure Boot certs injected                     ${BLD}${GREEN}║${NC}"
+fi
+echo -e "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} e1000 NIC (Intel 82540EM) + SATA disk (custom serial)          ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} Balloon disabled · ACPI hotplug off · Timers: binary-handled   ${BLD}${GREEN}║${NC}"
 if [[ -n "$AFFINITY" ]]; then
-echo -e "${GREEN}║    ✓ CPU affinity: ${AFFINITY}                                      ║${NC}"
+printf "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} %-60s ${BLD}${GREEN}║${NC}\n" "CPU affinity: ${AFFINITY}"
 fi
 if [[ "$ADD_TPM" == "true" ]]; then
-echo -e "${GREEN}║    ✓ TPM 2.0 emulation                                       ║${NC}"
+echo -e "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} TPM 2.0 emulation                                              ${BLD}${GREEN}║${NC}"
 fi
 if [[ "$IGPU_PASSTHROUGH" == true ]]; then
-echo -e "${GREEN}║    ✓ ${IGPU_VENDOR^^} iGPU passthrough (${IGPU_ROM:-no ROM})   ║${NC}"
+printf "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} %-60s ${BLD}${GREEN}║${NC}\n" "${IGPU_VENDOR^^} iGPU passthrough (${IGPU_ROM:-no ROM})"
 if [[ "$IGPU_VENDOR" == "intel" ]]; then
-echo -e "${GREEN}║    ✓ IGD: opregion=on, GMS=${IGPU_GMS}, legacy-mode=on          ║${NC}"
+printf "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} %-60s ${BLD}${GREEN}║${NC}\n" "IGD: opregion=on, GMS=${IGPU_GMS}"
 fi
 if [[ -n "$IGPU_AUDIO_PCI" ]]; then
-echo -e "${GREEN}║    ✓ Audio passthrough (${IGPU_AUDIO_PCI})                     ║${NC}"
+printf "${BLD}${GREEN}║${NC}    ${GREEN}✓${NC} %-60s ${BLD}${GREEN}║${NC}\n" "Audio passthrough (${IGPU_AUDIO_PCI})"
 fi
 fi
-echo -e "${GREEN}║                                                               ║${NC}"
-echo -e "${GREEN}║  Start VM:  qm start ${VMID}                                       ║${NC}"
-echo -e "${GREEN}║                                                               ║${NC}"
-echo -e "${GREEN}║  Post-Install Tips:                                           ║${NC}"
-echo -e "${GREEN}║    • Install Windows normally                                 ║${NC}"
-echo -e "${GREEN}║    • Do NOT install VirtIO/QEMU guest tools                  ║${NC}"
-echo -e "${GREEN}║    • Run windows\\run-tools.bat to clean VM fingerprints      ║${NC}"
-echo -e "${GREEN}║    • For GPU passthrough: use --igpu or --vga none + hostpci ║${NC}"
-echo -e "${GREEN}║    • Do NOT enable Hyper-V in the guest                      ║${NC}"
-echo -e "${GREEN}║    • Test with: pafish64.exe, al-khaser, VMAware             ║${NC}"
-echo -e "${GREEN}║                                                               ║${NC}"
-echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+echo -e "${BLD}${GREEN}║${NC}                                                                  ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}╠══════════════════════════════════════════════════════════════════╣${NC}"
+echo -e "${BLD}${GREEN}║${NC}  ${BLD}Start:${NC}  qm start ${VMID}                                               ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}║${NC}  ${BLD}Config:${NC} cat /etc/pve/qemu-server/${VMID}.conf                          ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}║${NC}  ${BLD}Summary:${NC} cat /root/vm-${VMID}-deploy-summary.txt                       ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}║${NC}                                                                  ${BLD}${GREEN}║${NC}"
+printf "${BLD}${GREEN}║${NC}  ${DIM}%-56s${NC} ${BLD}${GREEN}║${NC}\n" "Post-Install: run windows\
+un-tools.bat in guest"
+echo -e "${BLD}${GREEN}║${NC}  ${DIM}Test: pafish64.exe · al-khaser · VMAware${NC}                           ${BLD}${GREEN}║${NC}"
+echo -e "${BLD}${GREEN}╚══════════════════════════════════════════════════════════════════╝${NC}"
 
 ###############################################################################
 # Generate deployment summary file
