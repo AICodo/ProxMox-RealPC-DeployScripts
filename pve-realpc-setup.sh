@@ -1148,6 +1148,26 @@ download_asset() {
     ok "Downloaded: ${label} (${fsize} bytes)"
 }
 
+# Install a local .deb with dependency resolution, robust to a PREVIOUS run having
+# already pinned/held these packages (Step 11). Without this, re-runs fail with:
+#   "E: Held packages were changed and -y was used without --allow-change-held-packages"
+# and the Strong build (lower version, e.g. 11.0.0-1) over the base (11.0.0-4) needs
+# --allow-downgrades. We also temporarily lift our own Pin-Priority:-1 file (which would
+# otherwise refuse to install ANY version of these packages); Step 11 re-applies it.
+install_local_deb() {
+    local deb="$1"
+    local pin_file="/etc/apt/preferences.d/pve-realpc-hold" pin_bak=""
+    if [[ -f "$pin_file" ]]; then
+        pin_bak="$(mktemp)"; mv -f "$pin_file" "$pin_bak"
+    fi
+    local rc=0
+    apt-get install -y --allow-change-held-packages --allow-downgrades "$deb" || rc=$?
+    # Restore the pin immediately (Step 11 also (re)writes it later); never leave the
+    # host unpinned if the rest of the run aborts.
+    [[ -n "$pin_bak" ]] && mv -f "$pin_bak" "$pin_file" 2>/dev/null || true
+    return "$rc"
+}
+
 ###############################################################################
 # STEP 0: Pre-flight checks
 ###############################################################################
@@ -1423,15 +1443,15 @@ info "═══ Step 5/12: Install Base Anti-Detection Packages ═══"
 record_step "step_5"
 
 info "Installing ${QEMU_BASE_DEB} ..."
-if dry_guard "apt-get install -y ${WORK_DIR}/${QEMU_BASE_DEB}"; then
-    apt-get install -y "${WORK_DIR}/${QEMU_BASE_DEB}" \
+if dry_guard "apt-get install -y --allow-change-held-packages ${WORK_DIR}/${QEMU_BASE_DEB}"; then
+    install_local_deb "${WORK_DIR}/${QEMU_BASE_DEB}" \
         || fail "Failed to install ${QEMU_BASE_DEB} — run 'apt-get install -f' to resolve dependencies"
 fi
 ok "Base QEMU anti-detection package installed"
 
 info "Installing ${OVMF_BASE_DEB} ..."
-if dry_guard "apt-get install -y ${WORK_DIR}/${OVMF_BASE_DEB}"; then
-    apt-get install -y "${WORK_DIR}/${OVMF_BASE_DEB}" \
+if dry_guard "apt-get install -y --allow-change-held-packages ${WORK_DIR}/${OVMF_BASE_DEB}"; then
+    install_local_deb "${WORK_DIR}/${OVMF_BASE_DEB}" \
         || fail "Failed to install ${OVMF_BASE_DEB} — run 'apt-get install -f' to resolve dependencies"
 fi
 ok "Base OVMF anti-detection package installed"
@@ -1462,8 +1482,8 @@ else
 
     if [[ -n "$STRONG_QEMU_PATH" ]]; then
         info "Installing Strong QEMU: $(basename "$STRONG_QEMU_PATH") ..."
-        if dry_guard "apt-get install -y $STRONG_QEMU_PATH"; then
-            apt-get install -y "$STRONG_QEMU_PATH" \
+        if dry_guard "apt-get install -y --allow-change-held-packages --allow-downgrades $STRONG_QEMU_PATH"; then
+            install_local_deb "$STRONG_QEMU_PATH" \
                 || fail "Failed to install Strong QEMU — run 'apt-get install -f' to resolve dependencies"
         fi
         ok "Strong QEMU package installed"
@@ -1473,8 +1493,8 @@ else
 
     if [[ -n "$STRONG_OVMF_PATH" ]]; then
         info "Installing Strong OVMF: $(basename "$STRONG_OVMF_PATH") ..."
-        if dry_guard "apt-get install -y $STRONG_OVMF_PATH"; then
-            apt-get install -y "$STRONG_OVMF_PATH" \
+        if dry_guard "apt-get install -y --allow-change-held-packages --allow-downgrades $STRONG_OVMF_PATH"; then
+            install_local_deb "$STRONG_OVMF_PATH" \
                 || fail "Failed to install Strong OVMF — run 'apt-get install -f' to resolve dependencies"
         fi
         ok "Strong OVMF package installed"
