@@ -490,7 +490,10 @@ function detect_igpu() {
   # ROM
   [[ -z "$igpu_rom" && "$vendor" == "intel" ]] && igpu_rom="ultra-1-2-qemu10.rom"
 
-  echo "${vendor}:${igpu_pci}:${audio:-}:${igpu_rom:-}"
+  # Separate with '|', NOT ':' — PCI addresses contain colons (domain:bus:dev.fn), so a
+  # ':'-split shreds the address (e.g. amd:0000:05:00.0:... -> PCI="0000"). '|' never
+  # appears in a PCI address, vendor name, or ROM filename.
+  echo "${vendor}|${igpu_pci}|${audio:-}|${igpu_rom:-}"
 }
 
 # ─── Discrete GPU (NVIDIA / AMD dGPU) detection ───────────────────────────────
@@ -522,7 +525,8 @@ function detect_dgpu() {
     [[ -z "$addr" ]] && { msg_error "Could not auto-detect a discrete GPU. Pass --gpu-pci <addr> (see: lspci -Dnn | grep -E 'VGA|3D')." >&2; exit 1; }
     echo -e "${GPU}${BOLD}${DGN}Auto-detected ${vendor^^} dGPU: ${BGN}${addr}${CL}" >&2
   fi
-  echo "${vendor}:${addr}"
+  # '|' separator (PCI addresses contain ':') — consistent with detect_igpu.
+  echo "${vendor}|${addr}"
 }
 
 # ─── Configuration defaults ───────────────────────────────────────────────────
@@ -950,7 +954,7 @@ function build_args() {
     VGA="none"
     local igpu_info
     igpu_info=$(detect_igpu "$IGPU_PCI" "$IGPU_ROM")
-    IFS=: read -r IGPU_VENDOR IGPU_PCI IGPU_AUDIO IGPU_ROM <<< "$igpu_info"
+    IFS='|' read -r IGPU_VENDOR IGPU_PCI IGPU_AUDIO IGPU_ROM <<< "$igpu_info"
 
     if [[ -n "$IGPU_ROM" ]] && [[ ! -f "/usr/share/kvm/${IGPU_ROM}" ]]; then
       msg_error "iGPU ROM not found: /usr/share/kvm/${IGPU_ROM}. Run pve-realpc-setup.sh --igpu first."; exit 1
@@ -973,7 +977,7 @@ function build_args() {
     # (iGPU+dGPU mutual exclusion is enforced earlier, in the validation phase.)
     local dgpu_info
     dgpu_info=$(detect_dgpu "$DGPU_PCI")
-    IFS=: read -r DGPU_VENDOR DGPU_PCI <<< "$dgpu_info"
+    IFS='|' read -r DGPU_VENDOR DGPU_PCI <<< "$dgpu_info"
     if [[ -n "$DGPU_ROM" && ! -f "/usr/share/kvm/${DGPU_ROM}" ]]; then
       msg_error "GPU vBIOS ROM not found: /usr/share/kvm/${DGPU_ROM} (place the dumped ROM there)." >&2; exit 1
     fi
