@@ -1,4 +1,4 @@
-# edid-spoofer.ps1 — Randomise monitor EDID serial fields
+# edid-spoofer.ps1 - Randomise monitor EDID serial fields
 #
 # Structure mirrors Scrut1ny/AutoVirt's EDID_OVERRIDE.ps1 (WMI raw EDID fetch ->
 # in-memory mutation -> EDID_OVERRIDE registry write -> driver disable/enable).
@@ -11,7 +11,7 @@
 #     them to 0x00 (treated as a dummy descriptor). We write a realistic
 #     7-char A-Z0-9 string + 0x0A terminator + 0x20 padding, matching how real
 #     monitors encode this descriptor.
-#   * Driver-restart sleep is 3 s (matches AutoVirt — 500 ms is too short on
+#   * Driver-restart sleep is 3 s (matches AutoVirt - 500 ms is too short on
 #     multi-monitor / slower hosts and leaves the override unapplied).
 
 $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -25,7 +25,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 Write-Host "[*] EDID Spoofer: Randomizing monitor serial numbers..." -ForegroundColor Cyan
 
 # Get monitors via WMI for full EDID data. Some debloated ISOs (tiny11/ghost)
-# strip the WmiMonitorDescriptorMethods provider — handle that gracefully
+# strip the WmiMonitorDescriptorMethods provider - handle that gracefully
 # rather than crashing with a "term not recognized" terminating error.
 $wmiMonitors = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorDescriptorMethods -ErrorAction SilentlyContinue
 if (-not $wmiMonitors) {
@@ -35,10 +35,10 @@ if (-not $wmiMonitors) {
 
 foreach ($wmiMon in $wmiMonitors) {
     # --- 1. Fetch Full EDID (Base + Extensions) ---
-	try {
-		$block0 = [byte[]](Invoke-CimMethod -InputObject $wmiMon -MethodName WmiGetMonitorRawEEdidV1Block -Arguments @{ BlockId = 0 }).BlockContent
-		if (-not $block0) { continue }
-	} catch { continue }
+    try {
+        $block0 = [byte[]](Invoke-CimMethod -InputObject $wmiMon -MethodName WmiGetMonitorRawEEdidV1Block -Arguments @{ BlockId = 0 }).BlockContent
+        if (-not $block0) { continue }
+    } catch { continue }
 
     # A real base EDID block is exactly 128 bytes; anything shorter is a stub
     # we cannot safely mutate (writing past the end throws IndexOutOfRange).
@@ -50,20 +50,20 @@ foreach ($wmiMon in $wmiMonitors) {
     # Initialize block list
     $edidBlocks = @(,$block0)
 
-	# Fetch extension block if flagged (Byte 126)
-	$extCount = $block0[126]
-	for ($b = 1; $b -le $extCount; $b++) {
-		try {
-			$edidBlocks += ,([byte[]](Invoke-CimMethod -InputObject $wmiMon -MethodName WmiGetMonitorRawEEdidV1Block -Arguments @{ BlockId = $b }).BlockContent)
-		} catch { }
-	}
+    # Fetch extension block if flagged (Byte 126)
+    $extCount = $block0[126]
+    for ($b = 1; $b -le $extCount; $b++) {
+        try {
+            $edidBlocks += ,([byte[]](Invoke-CimMethod -InputObject $wmiMon -MethodName WmiGetMonitorRawEEdidV1Block -Arguments @{ BlockId = $b }).BlockContent)
+        } catch { }
+    }
 
     # --- 2. Modify Base Block ---
     $targetBlock = $edidBlocks[0]
     if ($null -eq $targetBlock -or $targetBlock.Length -lt 128) { continue }
 
-	# EDID[12–15]: Manufacturer-assigned ID Serial Number randomized
-	# Non-zero random serial is more realistic than zeroed (zero = "no serial assigned")
+    # EDID[12-15]: Manufacturer-assigned ID Serial Number randomized
+    # Non-zero random serial is more realistic than zeroed (zero = "no serial assigned")
     $targetBlock[12] = Get-Random -Maximum 256
     $targetBlock[13] = Get-Random -Maximum 256
     $targetBlock[14] = Get-Random -Maximum 256
@@ -71,34 +71,40 @@ foreach ($wmiMon in $wmiMonitors) {
     # Ensure not all zero (zero = "no serial" which is suspicious for named monitors)
     if (($targetBlock[12] -bor $targetBlock[13] -bor $targetBlock[14] -bor $targetBlock[15]) -eq 0) { $targetBlock[12] = 1 }
 
-	# EDID[54–125]: Display Descriptor Type 0xFF (Monitor Serial Number) zeroed (18-byte descriptors)
-	foreach ($off in 54, 72, 90, 108) {
-		if (
-			$targetBlock[$off]     -eq 0x00 -and
-			$targetBlock[$off + 1] -eq 0x00 -and
-			$targetBlock[$off + 2] -eq 0x00 -and
-			$targetBlock[$off + 3] -eq 0xFF
-		) {
-			# Randomize serial string in the 0xFF descriptor instead of blanking to 0x10 (dummy).
-			# A blank/dummy descriptor says "no serial" — suspicious for real monitors.
-			# Random 7-char alphanumeric serial is realistic and defeats cross-session fingerprinting.
-			$chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-			$serial = -join ($chars.ToCharArray() | Get-Random -Count 7)
-			# EDID 0xFF descriptor: [off+4]=reserved, [off+5..off+17]=13 bytes serial text
-			# Format: serial chars + 0x0A terminator + 0x20 padding
-			$targetBlock[$off + 4] = 0x00
-			for ($j = 0; $j -lt 13; $j++) {
-				if ($j -lt $serial.Length) { $targetBlock[$off + 5 + $j] = [byte][char]$serial[$j] }
-				elseif ($j -eq $serial.Length) { $targetBlock[$off + 5 + $j] = 0x0A }
-				else { $targetBlock[$off + 5 + $j] = 0x20 }
-			}
-		}
-	}
+    # EDID[54-125]: Display Descriptor Type 0xFF (Monitor Serial Number) zeroed (18-byte descriptors)
+    foreach ($off in 54, 72, 90, 108) {
+        if (
+            $targetBlock[$off]     -eq 0x00 -and
+            $targetBlock[$off + 1] -eq 0x00 -and
+            $targetBlock[$off + 2] -eq 0x00 -and
+            $targetBlock[$off + 3] -eq 0xFF
+        ) {
+            # Randomize serial string in the 0xFF descriptor instead of blanking to 0x10 (dummy).
+            # A blank/dummy descriptor says "no serial" - suspicious for real monitors.
+            # Random 7-char alphanumeric serial is realistic and defeats cross-session fingerprinting.
+            $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            $serial = -join ($chars.ToCharArray() | Get-Random -Count 7)
+            # EDID 0xFF descriptor: [off+4]=reserved, [off+5..off+17]=13 bytes serial text
+            # Format: serial chars + 0x0A terminator + 0x20 padding
+            $targetBlock[$off + 4] = 0x00
+            for ($j = 0; $j -lt 13; $j++) {
+                if ($j -lt $serial.Length) { $targetBlock[$off + 5 + $j] = [byte][char]$serial[$j] }
+                elseif ($j -eq $serial.Length) { $targetBlock[$off + 5 + $j] = 0x0A }
+                else { $targetBlock[$off + 5 + $j] = 0x20 }
+            }
+        }
+    }
 
-	# EDID[127]: Checksum recomputed to satisfy (sum of bytes 0–127) % 256 = 0
-	$sum = 0
-	for ($i = 0; $i -lt 127; $i++) { $sum += $targetBlock[$i] }
-	$targetBlock[127] = (-$sum) -band 0xFF
+    # Reconcile the extension-block count (byte 126) with the blocks we actually
+    # fetched and will write below. If an extension fetch failed above, byte 126 would
+    # otherwise still claim more blocks than exist -> a malformed EDID the driver may
+    # reject. (This is part of bytes 0-126, so the checksum recompute below covers it.)
+    $targetBlock[126] = [byte]([Math]::Max(0, $edidBlocks.Count - 1))
+
+    # EDID[127]: Checksum recomputed to satisfy (sum of bytes 0-127) % 256 = 0
+    $sum = 0
+    for ($i = 0; $i -lt 127; $i++) { $sum += $targetBlock[$i] }
+    $targetBlock[127] = (-$sum) -band 0xFF
 
     # --- 3. Save to Registry ---
     $pnpId = $wmiMon.InstanceName -replace "_0$", ""
@@ -120,17 +126,24 @@ foreach ($wmiMon in $wmiMonitors) {
 Write-Host "[+] EDID override written for all detected monitors." -ForegroundColor Green
 
 # --- 4. Restart Graphics Driver ---
-# Match AutoVirt's 3 second wait between disable and enable — 500ms is unreliable
+# Match AutoVirt's 3 second wait between disable and enable - 500ms is unreliable
 # on slower hosts / multi-monitor setups and the graphics stack can fail to
 # release / reattach cleanly, leaving the EDID override unapplied until reboot.
-Write-Host "[*] Restarting graphics driver to apply EDID changes..." -ForegroundColor Cyan
-Get-PnpDevice -Class Display | Where-Object { $_.Status -eq 'OK' } |
-ForEach-Object {
-    try {
-        Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
-        Start-Sleep -Seconds 3
-        Enable-PnpDevice  -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
-    } catch {
-        Write-Host "[!] Failed to restart display device $($_.InstanceId): $_" -ForegroundColor Yellow
+# Guard the PnpDevice cmdlets: they live in the PnpDevice module, which is absent on
+# some stripped SKUs. The override is already written to the registry above, so if we
+# can't live-restart, it still applies on the next reboot (run-tools.bat reboots).
+if (Get-Command Get-PnpDevice -ErrorAction SilentlyContinue) {
+    Write-Host "[*] Restarting graphics driver to apply EDID changes..." -ForegroundColor Cyan
+    Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'OK' } |
+    ForEach-Object {
+        try {
+            Disable-PnpDevice -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
+            Start-Sleep -Seconds 3
+            Enable-PnpDevice  -InstanceId $_.InstanceId -Confirm:$false -ErrorAction Stop
+        } catch {
+            Write-Host "[!] Failed to restart display device $($_.InstanceId): $_" -ForegroundColor Yellow
+        }
     }
+} else {
+    Write-Host "[!] Get-PnpDevice unavailable - EDID override will apply on next reboot." -ForegroundColor Yellow
 }

@@ -14,6 +14,7 @@
 #   8. Installation of patched KVM kernel module (Intel or AMD)
 #   9. Placement of ACPI table files (/root/)
 #  10. iGPU passthrough setup — Intel or AMD (optional, --igpu)
+#  10b. Discrete NVIDIA/AMD GPU passthrough host prep (optional, --nvidia)
 #  11. Package pinning (prevent apt from overwriting patched QEMU/OVMF)
 #  12. Verification of installation
 #
@@ -23,7 +24,7 @@
 #          bash pve-realpc-setup.sh --help             # full flag reference
 #
 # Common overrides:
-#   --no-strong / --skip-pin / --skip-kernel-downgrade / --skip-download / --igpu
+#   --no-strong / --skip-pin / --skip-kernel-downgrade / --skip-download / --igpu / --nvidia
 #   --release-tag TAG / --strong-tag TAG / --debian-tag TAG
 #
 # Requires: root on a Proxmox VE 9 host, internet access (for downloads & API resolver)
@@ -33,9 +34,10 @@ IFS=$'\n\t'
 
 # ─── Tunables ────────────────────────────────────────────────────────────────
 # Upstream intentionally splits releases:
-#   - The latest PVE9 tag (v11.0.0-2, v20260516-211490-pve9) ships only the
-#     base .deb + ACPI + patch. NO Strong .tgz, NO matching kvm.ko.
-#   - The previous "enhanced" tag (v11.0.0-1, v20260506-222829-pve9) ships
+#   - The newest PVE9 tag (resolved live from GitHub API; v20260530-111870-pve9 /
+#     v11.0.0-4 as of this writing) ships only the base .deb + ACPI + patch.
+#     NO Strong .tgz, NO matching kvm.ko.
+#   - The previous "enhanced" tag (v20260506-222829-pve9 / v11.0.0-1) ships
 #     the same base files PLUS the Strong .tgz (sensor passthrough +
 #     kvm.ko built against kernel 6.17.13-2).
 # The qemu-autoGenPatch.patch is byte-for-byte identical between the two —
@@ -44,7 +46,7 @@ IFS=$'\n\t'
 # but you also avoid the kernel-version pin to 6.17.13-2).
 # Upstream repo (used by both the help heredoc below and the GitHub-API resolver).
 UPSTREAM_REPO="AICodo/pve-emu-realpc"
-RELEASE_TAG="v20260516-211490-pve9"   # latest PVE9 release (base .deb / ACPI / patch)
+RELEASE_TAG="v20260530-111870-pve9"   # static fallback — resolver auto-picks newest at runtime
 STRONG_TAG="v20260506-222829-pve9"    # last release shipping the Strong .tgz
 BASE_URL="https://github.com/${UPSTREAM_REPO}/releases/download/${RELEASE_TAG}"
 STRONG_URL="https://github.com/${UPSTREAM_REPO}/releases/download/${STRONG_TAG}"
@@ -55,24 +57,27 @@ DATACENTER_CFG="/etc/pve/datacenter.cfg"
 BACKUP_DIR="/root/pve-realpc/backup"
 
 # Debian release — patched ROM/BIOS files with VM strings removed
-# The PVE deb and Debian release are built from the SAME sedPatch source patches,
-# but only the Debian release includes separately compiled SeaBIOS/VGA/EFI ROMs
-# with "QEMU", "Bochs", "SeaBIOS" strings scrubbed (the PVE deb ships stock ROMs).
+# The PVE deb and Debian release share the same core sedPatch anti-detection
+# transformations, but only the Debian release includes separately compiled
+# SeaBIOS/VGA/EFI ROMs with "QEMU", "Bochs", "SeaBIOS" strings scrubbed
+# (the PVE deb ships stock ROMs). The PVE qemu-autoGenPatch.patch is ~836 bytes
+# larger — it adds bootsplash overrides and build-system integration.
 # The QEMU binary from the PVE deb is PREFERRED over the Debian one because it
-# includes PVE management integration + Strong build CPU sensor passthrough
-# (the PVE qemu-autoGenPatch.patch is also ~836 bytes larger with extra patches).
+# includes PVE management integration + Strong build CPU sensor passthrough.
 # We only use the Debian release for ROM overlay, NOT the binary.
 DEBIAN_TAG="v20260507-200382-debian"
 DEBIAN_URL="https://github.com/AICodo/pve-emu-realpc/releases/download/${DEBIAN_TAG}"
+DEBIAN_DIR="${WORK_DIR}/debian"       # patched ROM staging (declared early for trap handler)
 DEBIAN_BIOS_FILES=("bios-256k.bin" "bios.bin" "bios-microvm.bin")
 DEBIAN_EFI_ROMS=("efi-e1000.rom" "efi-e1000e.rom" "efi-virtio.rom")
 DEBIAN_VGA_ROMS=("vgabios-qxl.bin" "vgabios-stdvga.bin")
 DEBIAN_ALL_ROMS=("${DEBIAN_BIOS_FILES[@]}" "${DEBIAN_EFI_ROMS[@]}" "${DEBIAN_VGA_ROMS[@]}")
 SEABIOS_PATCH="seabios-autoGenPatch.patch"
 
-# PVE release asset filenames
-# Base files come from ${RELEASE_TAG} (latest); Strong .tgz from ${STRONG_TAG}.
-QEMU_BASE_DEB="pve-qemu-kvm_11.0.0-2_amd64.deb"
+# PVE release asset filenames  (static fallbacks — resolver updates these live)
+# Base files come from ${RELEASE_TAG} (fallback); Strong .tgz from ${STRONG_TAG}.
+# When the resolver runs, these are recomputed from the actual upstream release.
+QEMU_BASE_DEB="pve-qemu-kvm_11.0.0-4_amd64.deb"
 OVMF_BASE_DEB="pve-edk2-firmware-ovmf_4.2025.05-2_all.deb"
 STRONG_TGZ="pve-qemu-kvm_11.0.0-1_amd64_Strong_intel_amd_6.17.13-2.tgz"
 # Inside ${STRONG_TGZ} you'll find these (we locate them at install time by
@@ -93,7 +98,6 @@ IGPU_ROM_DIR="/usr/share/kvm"
 # Boot splash — the PVE build hardcodes /usr/share/kvm/bootsplash.jpg in fw_cfg.c
 # (replaces the default EDK2/TianoCore boot logo to defeat VMAware BOOT_LOGO CRC32 check).
 # Not in release assets — downloaded from main branch.
-BOOTSPLASH_URL="https://raw.githubusercontent.com/AICodo/pve-emu-realpc/main/bootsplash.jpg"
 BOOTSPLASH_DEST="/usr/share/kvm/bootsplash.jpg"
 
 # ─── Flags ───────────────────────────────────────────────────────────────────
@@ -101,6 +105,7 @@ SKIP_DOWNLOAD=false
 SKIP_PIN=false
 SKIP_KERNEL_DOWNGRADE=false
 ENABLE_IGPU=false
+ENABLE_NVIDIA=false               # discrete NVIDIA/AMD GPU passthrough host prep
 ENABLE_STRONG=true
 NEEDS_REBOOT=false
 INTERACTIVE_MODE=auto             # auto = run interactive when stdin is a tty
@@ -110,6 +115,12 @@ RELEASE_TAG_FLAG=""               # set via --release-tag to pin the base tag
 STRONG_TAG_FLAG=""                # set via --strong-tag to pin the Strong tag
 DEBIAN_TAG_FLAG=""                # set via --debian-tag to pin the Debian ROM tag
 USER_PROVIDED_TAG=false
+VERBOSE=false
+DRY_RUN=false
+FORCE=false
+CLEANUP_FILES=()
+STATE_FILE="${WORK_DIR}/.install-state"
+
 while (( $# > 0 )); do
     arg="$1"
     case "$arg" in
@@ -117,11 +128,15 @@ while (( $# > 0 )); do
         --skip-pin)               SKIP_PIN=true ;;
         --skip-kernel-downgrade)  SKIP_KERNEL_DOWNGRADE=true ;;
         --igpu)                   ENABLE_IGPU=true ;;
+        --nvidia|--dgpu)          ENABLE_NVIDIA=true ;;
         --no-strong)              ENABLE_STRONG=false ;;
         --interactive)            INTERACTIVE_MODE=force ;;
         --non-interactive)        INTERACTIVE_MODE=off ;;
         --list-releases)          LIST_RELEASES_ONLY=true ;;
         --skip-resolve)           SKIP_RESOLVE=true ;;
+        --verbose)                VERBOSE=true ;;
+        --dry-run)                DRY_RUN=true ;;
+        --force)                  FORCE=true ;;
         --release-tag)            [[ $# -ge 2 ]] || { echo "Error: --release-tag requires a TAG argument" >&2; exit 2; }
                                   RELEASE_TAG_FLAG="$2"; USER_PROVIDED_TAG=true; shift ;;
         --strong-tag)             [[ $# -ge 2 ]] || { echo "Error: --strong-tag requires a TAG argument (or 'none')" >&2; exit 2; }
@@ -158,12 +173,26 @@ Advanced / unattended use (flags only needed when not running interactively)
     --skip-resolve          Don't query GitHub API; use static fallback tags
 
   Override the install behaviour (all also available as prompts)
-    --igpu                  Enable iGPU passthrough host config
+    --igpu                  Enable iGPU (integrated Intel/AMD) passthrough host config
+    --nvidia                Prep host for discrete NVIDIA/AMD GPU passthrough:
+                            IOMMU (GRUB + systemd-boot), blacklist nouveau/nvidia,
+                            bind the dGPU's functions to vfio-pci by ID, VFIO modules,
+                            initramfs rebuild. Reboot after. Then deploy with --nvidia.
     --no-strong             Skip Strong overlay (no sensor passthrough, no
                             kernel pin to 6.17.13-2)
     --skip-pin              Skip APT package pinning
     --skip-kernel-downgrade Skip auto kernel install if version mismatch
     --skip-download         Reuse pre-staged assets in ${WORK_DIR}
+    --verbose               Show debug output (wget progress, set -x)
+    --dry-run               Print what would be done, don't modify system
+    --force                 Re-install even if already patched
+
+────────────────────────────────────────────────────────────────────────
+Environment
+────────────────────────────────────────────────────────────────────────
+
+  Proxy support: set http_proxy / https_proxy for corporate networks.
+  Example: export https_proxy=http://proxy:8080
 
 ────────────────────────────────────────────────────────────────────────
 Examples
@@ -173,7 +202,7 @@ Examples
   bash $0 --list-releases                       # show available upstream releases
   bash $0 --non-interactive                     # CI: auto latest + Strong, no prompts
   bash $0 --non-interactive --no-strong         # CI: base only, no kernel pin
-  bash $0 --release-tag v20260516-211490-pve9 --strong-tag none
+  bash $0 --release-tag v20260530-111870-pve9 --strong-tag none
 
 HELPEOF
             exit 0
@@ -190,8 +219,62 @@ info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
 ok()    { echo -e "${GREEN}[ OK ]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
+dbg()   { [[ "$VERBOSE" == true ]] && echo -e "${CYAN}[DBG]${NC}   $*" || true; }
+
+dry_msg() { [[ "$DRY_RUN" == true ]] && echo -e "${YELLOW}[DRY]${NC}  $*" || true; }
+
+# ─── Trap: clean up .part files and warn about partial state on interrupt ─────
+cleanup_on_interrupt() {
+    echo "" >&2
+    warn "Script interrupted. Cleaning up partial downloads..."
+    rm -f "${WORK_DIR}"/*.part "${DEBIAN_DIR}"/*.part 2>/dev/null || true
+    [[ ${#CLEANUP_FILES[@]} -gt 0 ]] && rm -f "${CLEANUP_FILES[@]}" 2>/dev/null || true
+    if [[ -f "$STATE_FILE" ]]; then
+        local done_steps
+        done_steps=$(tr '\n' ',' < "$STATE_FILE" | sed 's/,$//; s/,/, /g')
+        warn "Completed steps before interrupt: ${done_steps}"
+    fi
+    warn "Download cache preserved in ${WORK_DIR}. Re-run to resume."
+    warn "If packages were partially installed, run: apt-get install -f -y"
+    exit 130
+}
+trap cleanup_on_interrupt INT TERM
+
+# Guard dry-run commands that would modify the system
+dry_guard() {
+    if [[ "$DRY_RUN" == true ]]; then
+        dry_msg "Would run: $*"
+        return 1
+    fi
+    return 0
+}
+
+# Validate that a config file contains an expected pattern after modification.
+# Used after sed -i on system files to catch silent corruption.
+validate_config_line() {
+    local file="$1" pattern="$2" label="$3"
+    if ! grep -q "$pattern" "$file" 2>/dev/null; then
+        fail "Config validation failed: ${label} — '${pattern}' not found in ${file}. Restore from ${BACKUP_DIR}"
+    fi
+}
+
+# Check available disk space before downloading large assets.
+# Requires at least MIN_MB free in the target directory.
+check_disk_space() {
+    local path="$1" min_mb="${2:-250}"
+    local avail_kb avail_mb
+    mkdir -p "$path" 2>/dev/null || true
+    # -P (POSIX): guarantees one physical line per filesystem, so NR==2/$4 is the
+    # available-KB field even when the device name is long (plain `df -k` wraps it).
+    avail_kb=$(df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [[ -z "$avail_kb" || "$avail_kb" -lt $((min_mb * 1024)) ]]; then
+        fail "Low disk space: ${path} has ${avail_kb:-?}KB free (need >= ${min_mb}MB). Free up space and retry."
+    fi
+    dbg "Disk space OK: ${path} has $((avail_kb / 1024))MB free (need >= ${min_mb}MB)"
+}
 
 require_root() {
+    [[ "$DRY_RUN" == true ]] && return 0
     [[ $EUID -eq 0 ]] || fail "This script must be run as root."
 }
 
@@ -200,9 +283,14 @@ check_pve9() {
         fail "pveversion not found — this script requires Proxmox VE."
     fi
     local pve_ver
-    pve_ver=$(pveversion 2>/dev/null | grep -oP 'pve-manager/\K[0-9]+')
+    # `|| true`: under set -euo pipefail a non-matching grep (exit 1) would abort here.
+    pve_ver=$(pveversion 2>/dev/null | grep -oP 'pve-manager/\K[0-9]+' || true)
     if [[ "$pve_ver" != "8" && "$pve_ver" != "9" ]]; then
         warn "Detected PVE major version ${pve_ver}. This release targets PVE 9. Proceed with caution."
+    fi
+    # Cluster-awareness: changing MAC prefix in datacenter.cfg affects all nodes
+    if [[ -f /etc/pve/corosync.conf ]] || pvecm status &>/dev/null; then
+        warn "Cluster detected — MAC prefix changes in datacenter.cfg will apply cluster-wide."
     fi
 }
 
@@ -214,6 +302,144 @@ detect_cpu_vendor() {
     else
         fail "Could not detect CPU vendor from /proc/cpuinfo."
     fi
+}
+
+# Enable IOMMU (intel_iommu/amd_iommu + iommu=pt) on the host kernel cmdline.
+# Idempotent; sets NEEDS_REBOOT when it changes anything. Handles BOTH boot stacks
+# PVE uses: GRUB (/etc/default/grub) and systemd-boot (/etc/kernel/cmdline via
+# proxmox-boot-tool). The IOMMU flavour follows the host CPU, not the GPU.
+enable_iommu_in_grub() {
+    local iommu_param changed=false found_bootcfg=false
+    [[ "$(detect_cpu_vendor)" == "intel" ]] && iommu_param="intel_iommu=on" || iommu_param="amd_iommu=on"
+
+    # GRUB
+    local grub_file="/etc/default/grub"
+    if [[ -f "$grub_file" ]]; then
+        found_bootcfg=true
+        cp "$grub_file" "${BACKUP_DIR}/grub.default.gpu.bak" 2>/dev/null || true
+        local p
+        for p in "$iommu_param" "iommu=pt"; do
+            if ! grep -q "$p" <(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file" 2>/dev/null) 2>/dev/null; then
+                if dry_guard "add '${p}' to GRUB_CMDLINE_LINUX_DEFAULT"; then
+                    sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"\([^\"]*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\\1 ${p}\"/" "$grub_file"
+                    validate_config_line "$grub_file" "$p" "${p} in GRUB"
+                    changed=true
+                fi
+            fi
+        done
+        # `|| warn` (not a bare pipeline): under set -e/pipefail a non-zero update-grub
+        # would otherwise abort the whole setup here.
+        if [[ "$changed" == true ]] && command -v update-grub &>/dev/null && dry_guard "update-grub"; then
+            update-grub 2>&1 | tail -3 || warn "update-grub returned non-zero — review boot config before reboot"
+        fi
+    fi
+
+    # systemd-boot (ZFS / UEFI PVE installs): single-line kernel cmdline
+    local sd_cmdline="/etc/kernel/cmdline"
+    if [[ -f "$sd_cmdline" ]]; then
+        found_bootcfg=true
+        cp "$sd_cmdline" "${BACKUP_DIR}/kernel-cmdline.gpu.bak" 2>/dev/null || true
+        local p
+        for p in "$iommu_param" "iommu=pt"; do
+            if ! grep -qw -- "$p" "$sd_cmdline" 2>/dev/null; then
+                if dry_guard "append '${p}' to ${sd_cmdline}"; then
+                    # `1 s` — /etc/kernel/cmdline is a single-line file; only ever
+                    # touch line 1 so a stray trailing line can't get a param appended.
+                    sed -i "1 s|\$| ${p}|" "$sd_cmdline"
+                    validate_config_line "$sd_cmdline" "$p" "${p} in kernel cmdline"
+                    changed=true
+                fi
+            fi
+        done
+        if [[ "$changed" == true ]] && command -v proxmox-boot-tool &>/dev/null && dry_guard "proxmox-boot-tool refresh"; then
+            proxmox-boot-tool refresh 2>&1 | tail -3 || warn "proxmox-boot-tool refresh returned non-zero — review boot config before reboot"
+        fi
+    fi
+
+    if [[ "$found_bootcfg" != true ]]; then
+        warn "No /etc/default/grub or /etc/kernel/cmdline found — add '${iommu_param} iommu=pt' to your kernel cmdline manually."
+    elif [[ "$changed" == true ]]; then
+        NEEDS_REBOOT=true
+        ok "IOMMU enabled on host kernel cmdline (${iommu_param} iommu=pt) — reboot required"
+    else
+        ok "IOMMU already enabled (${iommu_param} iommu=pt)"
+    fi
+}
+
+# Configure the host for discrete NVIDIA/AMD GPU passthrough:
+#   IOMMU on, host GPU driver blacklisted, GPU + its functions (HDMI audio, etc.)
+#   bound to vfio-pci by vendor:device ID, VFIO modules at boot, initramfs rebuilt.
+configure_nvidia_passthrough() {
+    info "Detecting discrete GPU on the host ..."
+    enable_iommu_in_grub
+
+    # Find a discrete GPU (NVIDIA preferred, then AMD) that is NOT on bus 00.
+    local gpu_line vname
+    gpu_line=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA compatible controller|3D controller|Display controller' \
+               | grep -iE 'NVIDIA|\[10de:' | awk '$1 !~ /^0000:00:/{print; exit}' || true)
+    vname="NVIDIA"
+    if [[ -z "$gpu_line" ]]; then
+        gpu_line=$(lspci -Dnn 2>/dev/null | grep -iE 'VGA compatible controller|3D controller|Display controller' \
+                   | grep -iE 'AMD|ATI|Radeon|\[1002:' | awk '$1 !~ /^0000:00:/{print; exit}' || true)
+        vname="AMD"
+    fi
+
+    local ids="" gpu_dev=""
+    if [[ -n "$gpu_line" ]]; then
+        local gpu_addr; gpu_addr=$(awk '{print $1}' <<<"$gpu_line")   # 0000:01:00.0
+        gpu_dev="${gpu_addr%.*}"                                       # 0000:01:00
+        info "Found ${vname} dGPU at ${gpu_dev} — binding all its functions (GPU + audio) to vfio-pci"
+        # Collect the [vendor:device] of every function of this device.
+        ids=$(lspci -Dnn -s "$gpu_dev" 2>/dev/null | grep -oE '\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]' | tr -d '[]' | sort -u | paste -sd, -)
+        [[ -n "$ids" ]] && info "vfio-pci ids = ${ids}"
+    else
+        warn "No discrete GPU auto-detected. Applying IOMMU + driver blacklist + VFIO modules"
+        warn "anyway; after reboot, bind your GPU manually by adding its IDs to:"
+        warn "  /etc/modprobe.d/pve-realpc-vfio.conf  (options vfio-pci ids=VENDOR:DEVICE,...)"
+    fi
+
+    # Blacklist host GPU drivers + bind to vfio-pci early.
+    local vfio_conf="/etc/modprobe.d/pve-realpc-vfio.conf"
+    if dry_guard "create ${vfio_conf} (blacklist host GPU drivers + vfio-pci ids)"; then
+        {
+            echo "# Discrete GPU passthrough — created by pve-realpc-setup.sh --nvidia"
+            echo "# NVIDIA host drivers (and nouveau) must not claim the card:"
+            echo "blacklist nouveau"
+            echo "blacklist nvidia"
+            echo "blacklist nvidiafb"
+            echo "blacklist nvidia_drm"
+            echo "blacklist nvidia_modeset"
+            echo "# AMD discrete (harmless if you have an NVIDIA card):"
+            echo "blacklist amdgpu"
+            echo "blacklist radeon"
+            echo "# Make vfio-pci win the bind race over the GPU drivers:"
+            echo "softdep nouveau pre: vfio-pci"
+            echo "softdep nvidia  pre: vfio-pci"
+            echo "softdep amdgpu  pre: vfio-pci"
+            echo "softdep radeon  pre: vfio-pci"
+            echo "softdep snd_hda_intel pre: vfio-pci"
+            [[ -n "$ids" ]] && echo "options vfio-pci ids=${ids} disable_vga=1"
+            echo "options vfio_iommu_type1 allow_unsafe_interrupts=1"
+        } > "$vfio_conf"
+        ok "Wrote ${vfio_conf}"
+    fi
+
+    # Ensure VFIO modules load at boot.
+    local vfio_modules="/etc/modules-load.d/pve-realpc-vfio.conf"
+    if [[ ! -f "$vfio_modules" ]] && dry_guard "create ${vfio_modules}"; then
+        printf '%s\n' "# VFIO modules for GPU passthrough (pve-realpc-setup.sh --nvidia)" \
+            "vfio" "vfio_iommu_type1" "vfio_pci" > "$vfio_modules"
+        ok "Wrote ${vfio_modules} (vfio, vfio_iommu_type1, vfio_pci)"
+    fi
+
+    # Rebuild initramfs so the blacklist + vfio bind take effect at next boot.
+    info "Rebuilding initramfs for VFIO changes ..."
+    if dry_guard "update-initramfs -u -k all"; then
+        if update-initramfs -u -k all; then ok "Initramfs updated"
+        else warn "Initramfs rebuild failed — check /boot space and kernel consistency"; fi
+    fi
+    NEEDS_REBOOT=true
+    ok "${vname} GPU passthrough host prep complete — REBOOT, then deploy with: pve-realpc-deploy-vm.sh --nvidia"
 }
 
 ###############################################################################
@@ -413,7 +639,7 @@ wt_menu() {
     echo "${title} — ${prompt}"
     local i=1; local -a tags=()
     while (( $# )); do
-        tags+=("$1"); echo "  ${i}) $2 [$1]"; shift 2; (( i++ ))
+        tags+=("$1"); echo "  ${i}) $2 [$1]"; shift 2; i=$((i+1))   # not (( i++ )): pre-0 value would exit 1 under set -e
     done
     local reply
     read -rp "Choose [1-$((i-1))]: " reply
@@ -685,8 +911,7 @@ install_target_kernel() {
         # Broader search: list all available kernels and find a match
         warn "Exact package not found. Searching for kernels containing '${target_ver_fragment}' ..."
         local found
-        # apt-cache search uses POSIX ERE — `\|` is a literal pipe, not alternation.
-        # Run two searches and concatenate so both proxmox-kernel-* and pve-kernel-* match.
+        # apt-cache search uses POSIX ERE — run two searches for both prefix schemes.
         # Sanitize version fragment (escape dots) so `.` doesn't wildcard-match.
         local frag_re="${target_ver_fragment//./\\.}"
         found=$( { apt-cache search "proxmox-kernel.*${frag_re}" 2>/dev/null; \
@@ -699,13 +924,34 @@ install_target_kernel() {
             pkg_name=$(awk 'NR==1 {print $1; exit}' <<<"$found")
             info "Selecting: ${pkg_name}"
         else
-            warn "No kernel package found for version '${target_ver_fragment}' in APT repositories."
-            warn "You may need to add the correct Proxmox repository or download the kernel manually."
-            warn ""
-            warn "Manual fix options:"
-            warn "  1. Check available kernels: apt-cache search proxmox-kernel | grep ${target_ver_fragment}"
-            warn "  2. Check your APT sources:  cat /etc/apt/sources.list.d/*.list"
-            warn "  3. Install manually if you have the .deb: dpkg -i proxmox-kernel-${target_kernel}_*.deb"
+            warn "╔══════════════════════════════════════════════════════════════════╗"
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "KERNEL NOT AVAILABLE"
+            printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "No kernel package matching '${target_ver_fragment}' found in APT."
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "The patched kvm.ko was built for this specific kernel version."
+            printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "Options:"
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "  1. Skip Strong (--no-strong) — base anti-detection still works,"
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "     you only lose sensor passthrough (temperature/MHz/power)."
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "  2. Check for a newer Strong .tgz built for your kernel."
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "  3. Install the kvm.ko anyway — it will NOT load on your"
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "     current kernel (version magic mismatch)."
+            printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+            printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "Available kernels:"
+            if command -v apt-cache &>/dev/null; then
+                local avail_kernels
+                avail_kernels=$( { apt-cache search '^proxmox-kernel-[0-9]' 2>/dev/null; \
+                                   apt-cache search '^pve-kernel-[0-9]' 2>/dev/null; } \
+                                 | grep -Ev 'headers|dbg|signed' | awk '{print $1}' | sort -V | tail -10 || true)
+                if [[ -n "$avail_kernels" ]]; then
+                    while IFS= read -r k; do
+                        printf "${YELLOW}[WARN]${NC}  ║    %-62s║\\n" "$k"
+                    done <<<"$avail_kernels"
+                else
+                    printf "${YELLOW}[WARN]${NC}  ║    %-62s║\\n" "(none found — check APT sources: /etc/apt/sources.list.d/)"
+                fi
+            fi
+            warn "╚══════════════════════════════════════════════════════════════════╝"
             return 1
         fi
     fi
@@ -723,50 +969,65 @@ install_target_kernel() {
         apt-get install -y "$pkg_header" 2>&1 | tail -5 || warn "Headers install skipped (non-critical)"
     fi
 
-    # ── Pin the target kernel as the default GRUB boot entry ──
+    # ── Pin the target kernel as the default boot entry ──
     info "Pinning kernel ${target_kernel} as default boot entry ..."
+    local pinned=false
 
-    # Method 1: proxmox-boot-tool (preferred on PVE with systemd-boot / ZFS boot)
+    # Method 1: proxmox-boot-tool — the correct, bootloader-agnostic way on PVE. It
+    # pins the SPECIFIC version (works for systemd-boot AND GRUB, and for a genuine
+    # downgrade where the target is NOT the newest kernel). Authoritative when it works.
     if command -v proxmox-boot-tool &>/dev/null; then
-        info "Refreshing boot configuration via proxmox-boot-tool ..."
-        proxmox-boot-tool refresh 2>&1 | tail -3 || true
-    fi
-
-    # Method 2: GRUB pinning (works on all setups)
-    local grub_default="/etc/default/grub"
-    if [[ -f "$grub_default" ]]; then
-        # Find the GRUB menu entry for the target kernel
-        # PVE GRUB entries look like: "proxmox-ve-kernel-X.Y.Z-N-pve" in advanced options
-        # We use GRUB_DEFAULT=0 with pin so the newest installed kernel (our target) boots first
-        # Backup current GRUB config
-        cp "$grub_default" "${BACKUP_DIR}/grub.default.bak" 2>/dev/null || true
-
-        # Set GRUB to boot the default (first) entry — PVE sorts by version, newest first
-        if grep -q "^GRUB_DEFAULT=" "$grub_default"; then
-            sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=0/' "$grub_default"
+        if proxmox-boot-tool kernel pin --help &>/dev/null 2>&1; then
+            info "Pinning ${target_kernel} via proxmox-boot-tool kernel pin ..."
+            if proxmox-boot-tool kernel pin "$target_kernel" 2>&1 | tail -3; then
+                pinned=true
+                ok "Pinned ${target_kernel} via proxmox-boot-tool (authoritative)"
+            else
+                warn "proxmox-boot-tool kernel pin returned non-zero — falling back to GRUB."
+            fi
         else
-            echo 'GRUB_DEFAULT=0' >> "$grub_default"
+            info "proxmox-boot-tool present but 'kernel pin' unavailable — refresh + GRUB fallback."
+            proxmox-boot-tool refresh 2>&1 | tail -3 || true
         fi
-
-        # Rebuild GRUB config
-        if command -v update-grub &>/dev/null; then
-            info "Updating GRUB configuration ..."
-            update-grub 2>&1 | tail -3
-        fi
-        ok "GRUB configured to boot kernel ${target_kernel}"
     fi
 
-    # PVE 8+ uses proxmox-boot-tool with systemd-boot / GRUB; it has a real
-    # kernel-pin mechanism. Prefer that over GRUB_DEFAULT alone where available.
-    if command -v proxmox-boot-tool &>/dev/null; then
-        info "Pinning ${target_kernel} via proxmox-boot-tool ..."
-        proxmox-boot-tool kernel pin "$target_kernel" 2>&1 | tail -3 || \
-            warn "proxmox-boot-tool kernel pin returned non-zero — GRUB_DEFAULT fallback still in effect."
+    # Method 2: GRUB fallback — ONLY if proxmox-boot-tool didn't authoritatively pin.
+    # GRUB_DEFAULT=0 boots the NEWEST menu entry: correct when the target is the newest
+    # installed kernel (the usual Strong-build case), but WRONG for a real downgrade —
+    # so we detect that and warn instead of silently booting the wrong kernel.
+    if [[ "$pinned" != true ]]; then
+        local grub_default="/etc/default/grub"
+        if [[ -f "$grub_default" ]]; then
+            cp "$grub_default" "${BACKUP_DIR}/grub.default.bak" 2>/dev/null || true
+            if grep -q "^GRUB_DEFAULT=" "$grub_default"; then
+                sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=0/' "$grub_default"
+            else
+                echo 'GRUB_DEFAULT=0' >> "$grub_default"
+            fi
+            validate_config_line "$grub_default" "^GRUB_DEFAULT=0" "GRUB default boot entry"
+
+            # If the target is NOT the newest installed kernel, GRUB_DEFAULT=0 can't pin it.
+            local newest_kernel
+            newest_kernel=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's#.*/vmlinuz-##' | sort -V | tail -1 || true)
+            if [[ -n "$newest_kernel" && "$newest_kernel" != "$target_kernel" ]]; then
+                warn "GRUB fallback boots the NEWEST kernel (${newest_kernel}), but the Strong kvm.ko"
+                warn "needs ${target_kernel}. At the GRUB menu choose 'Advanced options' → ${target_kernel},"
+                warn "or install proxmox-boot-tool so it can pin the exact version."
+            fi
+            if command -v update-grub &>/dev/null; then
+                info "Updating GRUB configuration ..."
+                if dry_guard "update-grub"; then
+                    update-grub || warn "update-grub returned non-zero — boot config may need manual review"
+                fi
+            fi
+            ok "GRUB updated (GRUB_DEFAULT=0)"
+        fi
     fi
 
     # ── Install the patched kvm.ko into the TARGET kernel's module tree ──
-    local target_kvm_dir="/lib/modules/${target_kernel}/kernel/arch/x86/kvm"
-    if [[ -d "/lib/modules/${target_kernel}" ]]; then
+    local target_modules="/lib/modules/${target_kernel}"
+    local target_kvm_dir="${target_modules}/kernel/arch/x86/kvm"
+    if [[ -d "$target_modules" ]]; then
         mkdir -p "$target_kvm_dir"
 
         # Remove any compressed stock module
@@ -775,6 +1036,26 @@ install_target_kernel() {
         info "Installing patched kvm.ko into /lib/modules/${target_kernel}/ ..."
         cp "$kvm_module_src" "${target_kvm_dir}/kvm.ko"
         chmod 644 "${target_kvm_dir}/kvm.ko"
+
+        # Verify vermagic compatibility between the module and the target kernel
+        local module_vermagic="" kernel_vermagic=""
+        module_vermagic=$(modinfo -F vermagic "${target_kvm_dir}/kvm.ko" 2>/dev/null || echo "")
+        if [[ -f "${target_modules}/build/include/generated/utsrelease.h" ]]; then
+            kernel_vermagic=$(grep -oP 'UTS_RELEASE "\K[^"]+' "${target_modules}/build/include/generated/utsrelease.h" 2>/dev/null || echo "")
+        fi
+        if [[ -z "$kernel_vermagic" && -f "/lib/modules/${target_kernel}/modules.builtin" ]]; then
+            # Fallback: the target kernel version IS the vermagic base
+            kernel_vermagic="$target_kernel"
+        fi
+        if [[ -n "$module_vermagic" && -n "$kernel_vermagic" ]]; then
+            # vermagic format: "6.17.13-2-pve SMP preempt mod_unload modversions "
+            if echo "$module_vermagic" | grep -qF "$kernel_vermagic"; then
+                ok "Module vermagic verified: compatible with kernel ${target_kernel}"
+            else
+                warn "Module vermagic MISMATCH: module=${module_vermagic}, kernel=${kernel_vermagic}"
+                warn "The kvm.ko will NOT load. Skip Strong (--no-strong) or find a matching build."
+            fi
+        fi
 
         # Rebuild depmod for the target kernel
         depmod -a "$target_kernel" 2>/dev/null || depmod -a
@@ -789,37 +1070,50 @@ install_target_kernel() {
     NEEDS_REBOOT=true
     echo ""
     warn "╔══════════════════════════════════════════════════════════════════╗"
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "REBOOT REQUIRED"
-    printf "${YELLOW}[WARN]${NC}  ║%-66s║\n" ""
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "A different kernel (${target_kernel}) has been installed"
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "and pinned as the default boot entry."
-    printf "${YELLOW}[WARN]${NC}  ║%-66s║\n" ""
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "Please reboot now:  reboot"
-    printf "${YELLOW}[WARN]${NC}  ║%-66s║\n" ""
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "After reboot, verify with:  uname -r"
-    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\n" "Expected: ${target_kernel}"
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "REBOOT REQUIRED"
+    printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "A different kernel (${target_kernel}) has been installed"
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "and pinned as the default boot entry."
+    printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "Please reboot now:  reboot"
+    printf "${YELLOW}[WARN]${NC}  ║%-66s║\\n" ""
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "After reboot, verify with:  uname -r"
+    printf "${YELLOW}[WARN]${NC}  ║  %-64s║\\n" "Expected: ${target_kernel}"
     warn "╚══════════════════════════════════════════════════════════════════╝"
 
     return 0
 }
 
 download_asset() {
-    # download_asset NAME [URL_BASE]
+    # download_asset NAME [URL_BASE] [DEST_DIR]
     # If URL_BASE is omitted, defaults to ${BASE_URL} (the latest release).
+    # If DEST_DIR is omitted, defaults to ${WORK_DIR}.
     # Downloads to ${dest}.part and renames atomically so a Ctrl-C / network
     # failure mid-download can't leave a partial file that the next run treats
     # as already-downloaded.
+    # For .deb files, validates integrity with dpkg-deb. For .tgz, validates
+    # with tar -tzf. All downloads are size-checked (>=50 bytes).
     local name="$1"
     local url_base="${2:-$BASE_URL}"
-    local dest="${WORK_DIR}/${name}"
+    local dest_dir="${3:-$WORK_DIR}"
+    local dest="${dest_dir}/${name}"
     local part="${dest}.part"
+    local label="${4:-}"
+    [[ -z "$label" ]] && label="$name"
+
     if [[ -f "$dest" ]]; then
-        ok "Already downloaded: ${name}"
+        ok "Already downloaded: ${label}"
         return 0
     fi
-    info "Downloading ${name} ..."
+    dbg "Downloading ${url_base}/${name} → ${dest_dir}/"
+    info "Downloading ${label} ..."
     rm -f "$part"
-    if ! wget -q --show-progress -O "$part" "${url_base}/${name}"; then
+    CLEANUP_FILES+=("$part")
+    # --show-progress only when stdout is a TTY (avoids carriage-return garbled CI logs)
+    local wget_opts=(-q -O "$part")
+    [[ "$VERBOSE" == true ]] && wget_opts=(-O "$part")
+    [[ -t 1 && "$VERBOSE" != true ]] && wget_opts=(-q --show-progress -O "$part")
+    if ! wget "${wget_opts[@]}" "${url_base}/${name}"; then
         rm -f "$part"
         fail "Failed to download ${name}"
     fi
@@ -830,8 +1124,48 @@ download_asset() {
         rm -f "$part"
         fail "Downloaded ${name} is too small (${fsize} bytes) — likely a download error"
     fi
+    # Reject HTML error/interstitial pages for ALL asset types. wget catches 4xx/5xx
+    # by exit code, but a 200-OK HTML page (proxy/CDN/SSO interstitial) would otherwise
+    # be saved as e.g. ssdt.aml or bootsplash.jpg — and .aml/.rom/.bin/.jpg/.patch have
+    # no format integrity check below. No real asset begins with an HTML marker.
+    if head -c 512 "$part" 2>/dev/null | grep -qiE '<!DOCTYPE|<html|<head|<title'; then
+        rm -f "$part"
+        fail "Downloaded ${name} looks like an HTML page, not a binary asset — check the URL/proxy/rate-limit"
+    fi
+    # Integrity check for known formats
+    if [[ "$name" == *.deb ]]; then
+        if ! dpkg-deb --info "$part" &>/dev/null; then
+            rm -f "$part"
+            fail "Downloaded ${name} failed dpkg-deb integrity check — file may be corrupt"
+        fi
+    elif [[ "$name" == *.tgz || "$name" == *.tar.gz ]]; then
+        if ! tar -tzf "$part" &>/dev/null; then
+            rm -f "$part"
+            fail "Downloaded ${name} failed tar integrity check — archive may be corrupt"
+        fi
+    fi
     mv -f "$part" "$dest"
-    ok "Downloaded: ${name} (${fsize} bytes)"
+    ok "Downloaded: ${label} (${fsize} bytes)"
+}
+
+# Install a local .deb with dependency resolution, robust to a PREVIOUS run having
+# already pinned/held these packages (Step 11). Without this, re-runs fail with:
+#   "E: Held packages were changed and -y was used without --allow-change-held-packages"
+# and the Strong build (lower version, e.g. 11.0.0-1) over the base (11.0.0-4) needs
+# --allow-downgrades. We also temporarily lift our own Pin-Priority:-1 file (which would
+# otherwise refuse to install ANY version of these packages); Step 11 re-applies it.
+install_local_deb() {
+    local deb="$1"
+    local pin_file="/etc/apt/preferences.d/pve-realpc-hold" pin_bak=""
+    if [[ -f "$pin_file" ]]; then
+        pin_bak="$(mktemp)"; mv -f "$pin_file" "$pin_bak"
+    fi
+    local rc=0
+    apt-get install -y --allow-change-held-packages --allow-downgrades "$deb" || rc=$?
+    # Restore the pin immediately (Step 11 also (re)writes it later); never leave the
+    # host unpinned if the rest of the run aborts.
+    [[ -n "$pin_bak" ]] && mv -f "$pin_bak" "$pin_file" 2>/dev/null || true
+    return "$rc"
 }
 
 ###############################################################################
@@ -856,11 +1190,43 @@ if [[ "$LIST_RELEASES_ONLY" == true ]]; then
     fi
 fi
 
+if [[ "$DRY_RUN" == true ]]; then
+    dry_msg "DRY RUN — no system modifications will be made."
+    dry_msg ""
+fi
+
 require_root
 check_pve9
 
 # Make sure the working dir exists before the resolver tries to cache into it.
 mkdir -p "${WORK_DIR}" "${BACKUP_DIR}"
+
+# ─── Idempotency / half-installed state check ────────────────────────────────
+# Track install progress so interrupted runs can report what was already done.
+record_step() { echo "$1" >> "$STATE_FILE"; }
+step_done()  { [[ -f "$STATE_FILE" ]] && grep -qxF "$1" "$STATE_FILE"; }
+QEMU_BIN_PATH="/usr/bin/qemu-system-x86_64"
+if [[ "$FORCE" != true ]]; then
+    if [[ -f "$QEMU_BIN_PATH" ]]; then
+        qsz=$(stat -c%s "$QEMU_BIN_PATH" 2>/dev/null || echo "0")
+        if (( qsz >= 29000000 )) && [[ -f "${BACKUP_DIR}/qemu-system-x86_64.stock" ]]; then
+            warn "Patched QEMU appears already installed (binary: $((qsz/1024/1024))MB, backup exists)."
+            warn "Re-run with --force to re-install anyway, or use --dry-run to preview."
+            if [[ "$DRY_RUN" != true ]]; then
+                warn "Skipping — nothing to do. Run with --force to override."
+                exit 0
+            fi
+        fi
+    fi
+    # Warn about half-installed state from a previous interrupted run
+    if [[ -f "$STATE_FILE" ]]; then
+        done_steps=$(tr '\n' ',' < "$STATE_FILE" | sed 's/,$//; s/,/, /g')
+        warn "Previous run was interrupted. Completed steps: ${done_steps}."
+        warn "Re-running will resume from the beginning. Backups from first run are preserved."
+        warn "Delete ${STATE_FILE} to silence this warning."
+    fi
+fi
+rm -f "$STATE_FILE"  # fresh state for this run
 
 # ─── Apply CLI-supplied pins (skips/short-circuits resolver where possible) ──
 if [[ -n "$RELEASE_TAG_FLAG" || -n "$STRONG_TAG_FLAG" || -n "$DEBIAN_TAG_FLAG" ]]; then
@@ -878,27 +1244,32 @@ if [[ -n "$RELEASE_TAG_FLAG" || -n "$STRONG_TAG_FLAG" || -n "$DEBIAN_TAG_FLAG" ]
                          "${DEBIAN_TAG_FLAG:-$DEBIAN_TAG}"
 fi
 
+# Resolve latest tags in non-interactive mode. Called as a function so the
+# variables don't leak into global scope (key concern: local_ prefixed vars).
+resolve_noninteractive_tags() {
+    if ! resolve_upstream_releases; then
+        warn "GitHub API unreachable — falling back to static defaults."
+        return 1
+    fi
+    local def_base def_strong def_debian
+    def_strong=$(latest_of_kind pve9-strong | awk -F'|' '{print $2}')
+    def_base=$(latest_of_kind pve9-base | awk -F'|' '{print $2}')
+    # If upstream's latest tag IS a Strong release, that's also the latest base
+    if [[ -z "$def_base" ]]; then
+        def_base="$def_strong"
+    fi
+    def_debian=$(latest_of_kind debian | awk -F'|' '{print $2}')
+    if [[ -n "$def_base" && -n "$def_strong" && -n "$def_debian" ]]; then
+        info "Auto-resolved latest upstream tags: base=${def_base}, strong=${def_strong}, debian=${def_debian}"
+        apply_release_choice "$def_base" "$def_strong" "$def_debian"
+    fi
+}
+
 # ─── Interactive configuration ────────────────────────────────────────────────
 if should_run_interactive && [[ "$SKIP_RESOLVE" != true ]]; then
     run_interactive_config
 elif [[ "$SKIP_RESOLVE" != true && -z "$RELEASE_TAG_FLAG" && -z "$STRONG_TAG_FLAG" ]]; then
-    # Non-interactive, no pins: still try to resolve the latest tags so we
-    # don't ship with stale hard-coded constants.
-    if resolve_upstream_releases; then
-        local_def_base=$(latest_of_kind pve9-strong | awk -F'|' '{print $2}')
-        if [[ -z "$local_def_base" ]]; then
-            local_def_base=$(latest_of_kind pve9-base | awk -F'|' '{print $2}')
-        fi
-        local_def_strong=$(latest_of_kind pve9-strong | awk -F'|' '{print $2}')
-        local_def_debian=$(latest_of_kind debian | awk -F'|' '{print $2}')
-        if [[ -n "$local_def_base" && -n "$local_def_strong" && -n "$local_def_debian" ]]; then
-            info "Auto-resolved latest upstream tags: base=${local_def_base}, strong=${local_def_strong}, debian=${local_def_debian}"
-            apply_release_choice "$local_def_base" "$local_def_strong" "$local_def_debian"
-        fi
-        unset local_def_base local_def_strong local_def_debian
-    else
-        warn "GitHub API unreachable — falling back to static defaults."
-    fi
+    resolve_noninteractive_tags
 fi
 
 info "CPU vendor: $(detect_cpu_vendor | tr '[:lower:]' '[:upper:]')"
@@ -919,6 +1290,7 @@ mkdir -p "${WORK_DIR}" "${BACKUP_DIR}"
 ###############################################################################
 echo ""
 info "═══ Step 1/12: MAC Address Prefix ═══"
+record_step "step_1"
 
 if [[ -f "$DATACENTER_CFG" ]]; then
     if grep -q "^mac_prefix:" "$DATACENTER_CFG" 2>/dev/null; then
@@ -928,6 +1300,7 @@ if [[ -f "$DATACENTER_CFG" ]]; then
         else
             warn "Changing MAC prefix from ${current_mac} to ${MAC_PREFIX}"
             sed -i "s/^mac_prefix:.*/mac_prefix: ${MAC_PREFIX}/" "$DATACENTER_CFG"
+            validate_config_line "$DATACENTER_CFG" "^mac_prefix: ${MAC_PREFIX}" "MAC prefix after update"
             ok "MAC prefix updated to ${MAC_PREFIX}"
         fi
     else
@@ -945,6 +1318,10 @@ fi
 ###############################################################################
 echo ""
 info "═══ Step 2/12: Download PVE Release Assets ═══"
+record_step "step_2"
+
+# Check disk space before downloading ~150MB of assets
+check_disk_space "$WORK_DIR" 250
 
 if [[ "$SKIP_DOWNLOAD" == true ]]; then
     warn "Skipping downloads (--skip-download). Expecting assets in ${WORK_DIR}"
@@ -978,36 +1355,12 @@ fi
 ###############################################################################
 echo ""
 info "═══ Step 3/12: Download Debian Release Assets (Patched ROMs) ═══"
+record_step "step_3"
 info "The Debian release provides patched BIOS, EFI, and VGA ROM files"
 info "with all VM-identifying strings ('QEMU', 'Bochs', 'SeaBIOS') removed."
 info "These are overlaid after PVE deb installation to close firmware-scan gaps."
 
-DEBIAN_DIR="${WORK_DIR}/debian"
 mkdir -p "$DEBIAN_DIR"
-
-download_debian_asset() {
-    local name="$1"
-    local dest="${DEBIAN_DIR}/${name}"
-    local part="${dest}.part"
-    if [[ -f "$dest" ]]; then
-        ok "Already downloaded: ${name} (debian)"
-        return 0
-    fi
-    info "Downloading ${name} (debian release) ..."
-    rm -f "$part"
-    if ! wget -q --show-progress -O "$part" "${DEBIAN_URL}/${name}"; then
-        rm -f "$part"
-        fail "Failed to download ${name} from Debian release"
-    fi
-    local fsize
-    fsize=$(stat -c%s "$part" 2>/dev/null || echo "0")
-    if [[ "$fsize" -lt 50 ]]; then
-        rm -f "$part"
-        fail "Downloaded ${name} (debian) is too small (${fsize} bytes) — likely a download error"
-    fi
-    mv -f "$part" "$dest"
-    ok "Downloaded: ${name} (debian, ${fsize} bytes)"
-}
 
 if [[ "$SKIP_DOWNLOAD" == true ]]; then
     warn "Skipping Debian downloads (--skip-download). Expecting assets in ${DEBIAN_DIR}"
@@ -1020,25 +1373,25 @@ else
 
     # Download patched BIOS ROMs (SeaBIOS with VM strings scrubbed)
     for f in "${DEBIAN_BIOS_FILES[@]}"; do
-        download_debian_asset "$f"
+        download_asset "$f" "$DEBIAN_URL" "$DEBIAN_DIR" "debian/$f"
     done
 
     # Download patched EFI network boot ROMs
     for f in "${DEBIAN_EFI_ROMS[@]}"; do
-        download_debian_asset "$f"
+        download_asset "$f" "$DEBIAN_URL" "$DEBIAN_DIR" "debian/$f"
     done
 
     # Download patched VGA BIOS ROMs
     for f in "${DEBIAN_VGA_ROMS[@]}"; do
-        download_debian_asset "$f"
+        download_asset "$f" "$DEBIAN_URL" "$DEBIAN_DIR" "debian/$f"
     done
 
     # Download SeaBIOS patch (reference only — not applied, the ROMs are pre-compiled)
-    # download_debian_asset "$SEABIOS_PATCH"
+    # download_asset "$SEABIOS_PATCH" "$DEBIAN_URL" "$DEBIAN_DIR"
 
     # Download ACPI tables from Debian release too (may be newer)
     for aml in "${ACPI_FILES[@]}"; do
-        download_debian_asset "$aml"
+        download_asset "$aml" "$DEBIAN_URL" "$DEBIAN_DIR" "debian/$aml"
     done
 fi
 
@@ -1047,6 +1400,7 @@ fi
 ###############################################################################
 echo ""
 info "═══ Step 4/12: Backup Stock Packages ═══"
+record_step "step_4"
 
 # Back up the current qemu-system-x86_64 binary
 QEMU_BIN="/usr/bin/qemu-system-x86_64"
@@ -1086,13 +1440,20 @@ fi
 ###############################################################################
 echo ""
 info "═══ Step 5/12: Install Base Anti-Detection Packages ═══"
+record_step "step_5"
 
 info "Installing ${QEMU_BASE_DEB} ..."
-dpkg -i "${WORK_DIR}/${QEMU_BASE_DEB}" 2>&1 | tail -5
+if dry_guard "apt-get install -y --allow-change-held-packages ${WORK_DIR}/${QEMU_BASE_DEB}"; then
+    install_local_deb "${WORK_DIR}/${QEMU_BASE_DEB}" \
+        || fail "Failed to install ${QEMU_BASE_DEB} — run 'apt-get install -f' to resolve dependencies"
+fi
 ok "Base QEMU anti-detection package installed"
 
 info "Installing ${OVMF_BASE_DEB} ..."
-dpkg -i "${WORK_DIR}/${OVMF_BASE_DEB}" 2>&1 | tail -5
+if dry_guard "apt-get install -y --allow-change-held-packages ${WORK_DIR}/${OVMF_BASE_DEB}"; then
+    install_local_deb "${WORK_DIR}/${OVMF_BASE_DEB}" \
+        || fail "Failed to install ${OVMF_BASE_DEB} — run 'apt-get install -f' to resolve dependencies"
+fi
 ok "Base OVMF anti-detection package installed"
 
 ###############################################################################
@@ -1100,6 +1461,7 @@ ok "Base OVMF anti-detection package installed"
 ###############################################################################
 echo ""
 info "═══ Step 6/12: Extract & Install Strong Build ═══"
+record_step "step_6"
 
 STRONG_DIR="${WORK_DIR}/strong"
 if [[ "$ENABLE_STRONG" != true ]]; then
@@ -1120,7 +1482,10 @@ else
 
     if [[ -n "$STRONG_QEMU_PATH" ]]; then
         info "Installing Strong QEMU: $(basename "$STRONG_QEMU_PATH") ..."
-        dpkg -i "$STRONG_QEMU_PATH" 2>&1 | tail -5
+        if dry_guard "apt-get install -y --allow-change-held-packages --allow-downgrades $STRONG_QEMU_PATH"; then
+            install_local_deb "$STRONG_QEMU_PATH" \
+                || fail "Failed to install Strong QEMU — run 'apt-get install -f' to resolve dependencies"
+        fi
         ok "Strong QEMU package installed"
     else
         warn "Strong QEMU .deb not found in .tgz — skipping (base install still active)"
@@ -1128,7 +1493,10 @@ else
 
     if [[ -n "$STRONG_OVMF_PATH" ]]; then
         info "Installing Strong OVMF: $(basename "$STRONG_OVMF_PATH") ..."
-        dpkg -i "$STRONG_OVMF_PATH" 2>&1 | tail -5
+        if dry_guard "apt-get install -y --allow-change-held-packages --allow-downgrades $STRONG_OVMF_PATH"; then
+            install_local_deb "$STRONG_OVMF_PATH" \
+                || fail "Failed to install Strong OVMF — run 'apt-get install -f' to resolve dependencies"
+        fi
         ok "Strong OVMF package installed"
     else
         warn "Strong OVMF .deb not found in .tgz — skipping (base install still active)"
@@ -1151,8 +1519,9 @@ else
 fi
 
 # Install iasl (ACPI compiler) for PIT SSDT generation
-# The deploy script loads a custom PIT SSDT to defeat VMAware's SYSTEM_TIMERS /
-# CLOCK check (45pts). iasl compiles ASL source into the binary AML format.
+# The deploy script loads a custom PIT SSDT so the guest exposes the legacy ISA
+# 8254 Programmable Interval Timer (hardware ID PNP0100) that real PCs advertise
+# in ACPI but QEMU's q35 generated DSDT omits. iasl compiles the ASL into AML.
 if ! command -v iasl &>/dev/null; then
     info "Installing acpica-tools (needed for PIT SSDT compilation) ..."
     apt-get install -y acpica-tools 2>&1 | tail -5 \
@@ -1169,6 +1538,7 @@ fi
 ###############################################################################
 echo ""
 info "═══ Step 7/12: Overlay Patched Debian ROM/BIOS Files ═══"
+record_step "step_7"
 info "The PVE deb ships stock SeaBIOS/VGA/EFI ROMs that still contain VM-identifying"
 info "strings ('QEMU', 'Bochs', 'SeaBIOS'). The Debian release provides separately"
 info "compiled ROMs with these strings removed. Both builds use the same sedPatch"
@@ -1194,67 +1564,50 @@ mkdir -p "$QEMU_ROM_DIR" "$QEMU_ROM_DIR_ALT" 2>/dev/null || true
 # hw/i386/acpi-build.c) is compiled into the binary; the external .aml files
 # from Step 9 supplement (not conflict with) the built-in tables.
 
+# Helper: overlay a set of ROM files from the Debian release into PVE's ROM dirs.
+# Backs up stock versions on first run; skips missing source files gracefully.
+overlay_debian_roms() {
+    local label="$1"; shift
+    local -a files=("$@")
+    local f
+    for f in "${files[@]}"; do
+        if [[ -f "${DEBIAN_DIR}/${f}" ]]; then
+            for rom_dir in "$QEMU_ROM_DIR" "$QEMU_ROM_DIR_ALT"; do
+                if [[ -f "${rom_dir}/${f}" && ! -f "${BACKUP_DIR}/${f}.stock" ]]; then
+                    cp "${rom_dir}/${f}" "${BACKUP_DIR}/${f}.stock"
+                fi
+                if dry_guard "cp ${DEBIAN_DIR}/${f} → ${rom_dir}/"; then
+                    cp "${DEBIAN_DIR}/${f}" "${rom_dir}/${f}"
+                    chmod 644 "${rom_dir}/${f}"
+                fi
+            done
+            ok "Overlaid patched ${label}: ${f}"
+        else
+            warn "Missing Debian asset: ${f}"
+        fi
+    done
+}
+
 # ── Overlay patched BIOS ROMs (SeaBIOS — removes QEMU/Bochs/SeaBIOS strings) ──
-for bios_file in "${DEBIAN_BIOS_FILES[@]}"; do
-    if [[ -f "${DEBIAN_DIR}/${bios_file}" ]]; then
-        # Back up stock version if not already done
-        for rom_dir in "$QEMU_ROM_DIR" "$QEMU_ROM_DIR_ALT"; do
-            if [[ -f "${rom_dir}/${bios_file}" && ! -f "${BACKUP_DIR}/${bios_file}.stock" ]]; then
-                cp "${rom_dir}/${bios_file}" "${BACKUP_DIR}/${bios_file}.stock"
-            fi
-            cp "${DEBIAN_DIR}/${bios_file}" "${rom_dir}/${bios_file}"
-            chmod 644 "${rom_dir}/${bios_file}"
-        done
-        ok "Overlaid patched BIOS: ${bios_file}"
-    else
-        warn "Missing Debian asset: ${bios_file}"
-    fi
-done
+overlay_debian_roms "BIOS" "${DEBIAN_BIOS_FILES[@]}"
 
 # ── Overlay patched EFI network boot ROMs ──
-for efi_rom in "${DEBIAN_EFI_ROMS[@]}"; do
-    if [[ -f "${DEBIAN_DIR}/${efi_rom}" ]]; then
-        for rom_dir in "$QEMU_ROM_DIR" "$QEMU_ROM_DIR_ALT"; do
-            if [[ -f "${rom_dir}/${efi_rom}" && ! -f "${BACKUP_DIR}/${efi_rom}.stock" ]]; then
-                cp "${rom_dir}/${efi_rom}" "${BACKUP_DIR}/${efi_rom}.stock"
-            fi
-            cp "${DEBIAN_DIR}/${efi_rom}" "${rom_dir}/${efi_rom}"
-            chmod 644 "${rom_dir}/${efi_rom}"
-        done
-        ok "Overlaid patched EFI ROM: ${efi_rom}"
-    else
-        warn "Missing Debian asset: ${efi_rom}"
-    fi
-done
+overlay_debian_roms "EFI ROM" "${DEBIAN_EFI_ROMS[@]}"
 
 # ── Overlay patched VGA BIOS ROMs ──
-for vga_rom in "${DEBIAN_VGA_ROMS[@]}"; do
-    if [[ -f "${DEBIAN_DIR}/${vga_rom}" ]]; then
-        for rom_dir in "$QEMU_ROM_DIR" "$QEMU_ROM_DIR_ALT"; do
-            if [[ -f "${rom_dir}/${vga_rom}" && ! -f "${BACKUP_DIR}/${vga_rom}.stock" ]]; then
-                cp "${rom_dir}/${vga_rom}" "${BACKUP_DIR}/${vga_rom}.stock"
-            fi
-            cp "${DEBIAN_DIR}/${vga_rom}" "${rom_dir}/${vga_rom}"
-            chmod 644 "${rom_dir}/${vga_rom}"
-        done
-        ok "Overlaid patched VGA BIOS: ${vga_rom}"
-    else
-        warn "Missing Debian asset: ${vga_rom}"
-    fi
-done
+overlay_debian_roms "VGA BIOS" "${DEBIAN_VGA_ROMS[@]}"
 
 ok "Debian release ROM/BIOS overlay complete (PVE/Strong QEMU binary preserved)"
 
 # ── Install custom boot splash (defeats VMAware BOOT_LOGO CRC32 detection) ──
 # The PVE build patches fw_cfg.c to load /usr/share/kvm/bootsplash.jpg instead of
 # the default EDK2/TianoCore logo. CRC32 0x110350C5 = stock OVMF boot logo (100pts).
+# Downloaded from main branch (not a release asset).
+BOOTSPLASH_URL_BASE="https://raw.githubusercontent.com/AICodo/pve-emu-realpc/main"
 if [[ ! -f "$BOOTSPLASH_DEST" ]]; then
     if [[ "$SKIP_DOWNLOAD" != true ]]; then
-        info "Downloading bootsplash.jpg (anti-BOOT_LOGO detection) ..."
-        wget -q --show-progress -O "$BOOTSPLASH_DEST" "$BOOTSPLASH_URL" \
-            || warn "Failed to download bootsplash.jpg — BOOT_LOGO detection may trigger"
+        download_asset "bootsplash.jpg" "$BOOTSPLASH_URL_BASE" "/usr/share/kvm" "bootsplash (anti-BOOT_LOGO)"
         if [[ -f "$BOOTSPLASH_DEST" ]]; then
-            chmod 644 "$BOOTSPLASH_DEST"
             # Also copy to /usr/share/qemu/ for compatibility
             cp "$BOOTSPLASH_DEST" "${QEMU_ROM_DIR_ALT}/bootsplash.jpg" 2>/dev/null || true
             ok "Boot splash installed: ${BOOTSPLASH_DEST}"
@@ -1271,6 +1624,7 @@ fi
 ###############################################################################
 echo ""
 info "═══ Step 8/12: Install Patched KVM Kernel Module ═══"
+record_step "step_8"
 
 CPU_VENDOR=$(detect_cpu_vendor)
 KERNEL_VER=$(uname -r)
@@ -1287,6 +1641,10 @@ info "Looking for KVM module matching kernel ${KERNEL_VER} and CPU vendor ${CPU_
 # Search for matching module
 KVM_MODULE_SRC=""
 
+if [[ ! -d "$STRONG_DIR" ]]; then
+    warn "Strong directory ${STRONG_DIR} not found — was --skip-download used without pre-staged assets?"
+    warn "Skipping KVM module installation. Run without --skip-download to fetch the Strong .tgz."
+else
 # First try: exact kernel version match with CPU vendor suffix.
 # Use -print -quit instead of `| head -1` so find doesn't SIGPIPE under pipefail.
 KVM_MODULE_SRC=$(find "$STRONG_DIR" -name "kvm.ko.*${CPU_VENDOR}" -print -quit 2>/dev/null || true)
@@ -1295,6 +1653,7 @@ if [[ -z "$KVM_MODULE_SRC" ]]; then
     # Second try: any kvm.ko with the vendor name
     KVM_MODULE_SRC=$(find "$STRONG_DIR" -name "kvm.ko*${CPU_VENDOR}*" -print -quit 2>/dev/null || true)
 fi
+fi  # [[ -d "$STRONG_DIR" ]]
 
 if [[ -z "$KVM_MODULE_SRC" ]]; then
     # Third try: list all kvm.ko files and let user see what's available
@@ -1310,7 +1669,7 @@ else
 
     # Check kernel compatibility
     KERNEL_MISMATCH=false
-    if [[ -n "$MODULE_KERNEL_VER" ]] && ! echo "$KERNEL_VER" | grep -q "$MODULE_KERNEL_VER"; then
+    if [[ -n "$MODULE_KERNEL_VER" ]] && ! echo "$KERNEL_VER" | grep -qF "$MODULE_KERNEL_VER"; then
         KERNEL_MISMATCH=true
     fi
 
@@ -1339,6 +1698,7 @@ else
 
     # Install into the CURRENT running kernel (normal path, or fallback if downgrade failed)
     if [[ -n "$KVM_MODULE_SRC" ]]; then
+        if dry_guard "install kvm.ko → ${KERNEL_VER}"; then
         KVM_DEST="/lib/modules/${KERNEL_VER}/kernel/arch/x86/kvm/kvm.ko"
 
         # Remove compressed version if present
@@ -1361,8 +1721,30 @@ else
             warn "stopping all VMs and running: rmmod kvm_intel kvm && modprobe kvm"
         else
             info "Loading patched KVM module ..."
-            modprobe kvm && ok "Patched KVM module loaded" || warn "Failed to load — will work after reboot"
+            if modprobe kvm 2>/dev/null; then
+                ok "Patched KVM module loaded successfully"
+            else
+                # Check vermagic to determine if failure is permanent or transient.
+                # NOTE: this block runs at top-level script scope (Step 8 is not a
+                # function), so `local` is illegal here — under `set -e` it would
+                # abort the script with "local: can only be used in a function"
+                # right when we're trying to print the diagnostic. Use a plain var.
+                mod_vermagic=$(modinfo -F vermagic "$KVM_DEST" 2>/dev/null || echo "")
+                if [[ -n "$mod_vermagic" ]] && ! echo "$mod_vermagic" | grep -qF "$KERNEL_VER"; then
+                    warn "KVM module FAILED to load: version magic mismatch."
+                    warn "  Module built for: $(echo "$mod_vermagic" | awk '{print $1}')"
+                    warn "  Running kernel:   ${KERNEL_VER}"
+                    warn "  This will NOT fix itself after reboot. Options:"
+                    warn "  1. Re-run with --no-strong to skip sensor passthrough"
+                    warn "  2. Install the matching kernel: proxmox-kernel-${KERNEL_VER}"
+                    warn "  3. Check upstream for a Strong build against your kernel"
+                else
+                    warn "Failed to load KVM module — may be a transient issue."
+                    warn "After reboot, verify with: lsmod | grep kvm"
+                fi
+            fi
         fi
+        fi  # dry_guard
 
         ok "Patched KVM module installed for ${CPU_VENDOR}"
     fi
@@ -1375,6 +1757,7 @@ fi  # end of "if [[ $ENABLE_STRONG == true ]]" block for Step 8
 ###############################################################################
 echo ""
 info "═══ Step 9/12: Place ACPI Table Files ═══"
+record_step "step_9"
 
 for aml in "${ACPI_FILES[@]}"; do
     # Prefer Debian release ACPI files (may be newer), fall back to PVE release
@@ -1393,14 +1776,16 @@ for aml in "${ACPI_FILES[@]}"; do
     fi
 done
 
-# Generate PIT SSDT (defeats VMAware VM::CLOCK / SYSTEM_TIMERS detection)
+# Generate PIT SSDT — expose the legacy ISA Programmable Interval Timer (PNP0100)
 #
-# VMAware's CLOCK check (45pts) enumerates all Windows devices via SetupDi
-# searching for hardware ID "PNP0100" (the ISA 8254 Programmable Interval Timer).
-# Real PCs expose PIT in their ACPI DSDT, but QEMU's generated DSDT omits it.
+# Real PCs advertise the 8254 PIT (hardware ID PNP0100) in their ACPI tables and
+# Windows enumerates it as a system device. QEMU's q35 generated DSDT omits it,
+# leaving a device-tree anomaly that hardware-enumeration fingerprinting can flag.
 # We compile a minimal SSDT that defines PNP0100 at the standard PIT I/O ports
-# (0x40–0x43, IRQ 0) so Windows enumerates it normally.
-info "Generating PIT SSDT (anti-SYSTEM_TIMERS detection) ..."
+# (0x40–0x43, IRQ 0) so the guest device tree matches a physical machine.
+# NOTE: this addresses *device enumeration*, not timing-based "clock" probes
+# (RDTSC/QPC skew) — those are handled by the patched KVM/QEMU build, not ACPI.
+info "Generating PIT SSDT (exposes legacy ISA PIT / PNP0100) ..."
 PIT_ASL="${WORK_DIR}/pit.asl"
 PIT_AML="${ACPI_DIR}/pit.aml"
 
@@ -1426,7 +1811,10 @@ DefinitionBlock ("pit.aml", "SSDT", 2, "REALPC", "PIT     ", 0x00000001)
     }
 }
 PITEOF
-    iasl -p "${WORK_DIR}/pit" "$PIT_ASL" &>/dev/null
+    # Non-fatal: a non-zero iasl exit (tool quirk, odd locale, etc.) must not abort
+    # the whole setup at Step 9 — the [[ -f pit.aml ]] check below handles a missing
+    # output gracefully and warns. Without `|| true`, set -e would kill the script.
+    iasl -p "${WORK_DIR}/pit" "$PIT_ASL" &>/dev/null || true
     if [[ -f "${WORK_DIR}/pit.aml" ]]; then
         cp "${WORK_DIR}/pit.aml" "$PIT_AML"
         chmod 644 "$PIT_AML"
@@ -1437,7 +1825,7 @@ PITEOF
 else
     warn "iasl (acpica-tools) not found — cannot generate PIT SSDT."
     warn "  Install with: apt-get install -y acpica-tools"
-    warn "  VMAware CLOCK/SYSTEM_TIMERS (45pts) will trigger without it."
+    warn "  Without it the guest won't expose the legacy ISA PIT (PNP0100)."
 fi
 
 ###############################################################################
@@ -1447,6 +1835,7 @@ echo ""
 if [[ "$ENABLE_IGPU" == true ]]; then
     IGPU_VENDOR=$(detect_cpu_vendor)
     info "═══ Step 10/12: iGPU Passthrough Setup (${IGPU_VENDOR^^}) ═══"
+    record_step "step_10"
 
     # Download Intel iGPU ROM (Intel only — AMD doesn't need a custom ROM)
     if [[ "$IGPU_VENDOR" == "intel" ]]; then
@@ -1456,9 +1845,7 @@ if [[ "$ENABLE_IGPU" == true ]]; then
             if [[ -f "$ROM_DEST" ]]; then
                 ok "iGPU ROM already installed: ${ROM_DEST}"
             else
-                info "Downloading Intel iGPU ROM: ${IGPU_ROM_FILE} ..."
-                wget -q --show-progress -O "$ROM_DEST" "${IGPU_ROM_URL}/${IGPU_ROM_FILE}" \
-                    || fail "Failed to download iGPU ROM"
+                download_asset "$IGPU_ROM_FILE" "$IGPU_ROM_URL" "$IGPU_ROM_DIR" "iGPU ROM: ${IGPU_ROM_FILE}"
                 ok "iGPU ROM installed: ${ROM_DEST} ($(stat -c%s "$ROM_DEST") bytes)"
             fi
         else
@@ -1481,16 +1868,18 @@ if [[ "$ENABLE_IGPU" == true ]]; then
             IOMMU_PARAM="amd_iommu=on"
         fi
         GRUB_CHANGED=false
-        if ! grep -q "${IOMMU_PARAM}" "$GRUB_FILE"; then
+        if ! grep -q "${IOMMU_PARAM}" <(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" 2>/dev/null) 2>/dev/null; then
             info "Enabling ${IGPU_VENDOR^^} IOMMU in GRUB (${IOMMU_PARAM}) ..."
             cp "$GRUB_FILE" "${BACKUP_DIR}/grub.default.igpu.bak" 2>/dev/null || true
-            sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"\([^\"]*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 ${IOMMU_PARAM}\"/" "$GRUB_FILE"
+            sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"\([^\"]*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\\1 ${IOMMU_PARAM}\"/" "$GRUB_FILE"
+            validate_config_line "$GRUB_FILE" "${IOMMU_PARAM}" "${IGPU_VENDOR^^} IOMMU in GRUB"
             GRUB_CHANGED=true
         fi
         # Add IOMMU passthrough mode — only passes assigned devices through IOMMU
         # (reduces overhead for non-passthrough devices vs translating all DMA)
-        if ! grep -q "iommu=pt" "$GRUB_FILE"; then
+        if ! grep -q "iommu=pt" <(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" 2>/dev/null) 2>/dev/null; then
             sed -i "s/GRUB_CMDLINE_LINUX_DEFAULT=\"\([^\"]*\)\"/GRUB_CMDLINE_LINUX_DEFAULT=\"\1 iommu=pt\"/" "$GRUB_FILE"
+            validate_config_line "$GRUB_FILE" "iommu=pt" "IOMMU passthrough mode in GRUB"
             GRUB_CHANGED=true
         fi
         if [[ "$GRUB_CHANGED" == true ]]; then
@@ -1507,6 +1896,7 @@ if [[ "$ENABLE_IGPU" == true ]]; then
     # Blacklist GPU and audio drivers for VFIO passthrough (vendor-specific)
     IGPU_BLACKLIST_FILE="/etc/modprobe.d/pve-realpc-igpu.conf"
     if [[ ! -f "$IGPU_BLACKLIST_FILE" ]]; then
+        if dry_guard "create ${IGPU_BLACKLIST_FILE}"; then
         if [[ "$IGPU_VENDOR" == "intel" ]]; then
             cat > "$IGPU_BLACKLIST_FILE" <<'IGPUEOF'
 # Blacklist Intel GPU and audio drivers to allow VFIO passthrough
@@ -1528,10 +1918,12 @@ options vfio_iommu_type1 allow_unsafe_interrupts=1
 IGPUEOF
             ok "Created ${IGPU_BLACKLIST_FILE} (blacklist amdgpu + radeon + snd_hda_intel)"
         fi
+        fi  # dry_guard
 
         # Ensure VFIO modules load at boot so VFIO claims the devices before other drivers
         VFIO_MODULES_FILE="/etc/modules-load.d/pve-realpc-vfio.conf"
         if [[ ! -f "$VFIO_MODULES_FILE" ]]; then
+            if dry_guard "create ${VFIO_MODULES_FILE}"; then
             cat > "$VFIO_MODULES_FILE" <<'VFIOEOF'
 # Load VFIO modules at boot for iGPU passthrough
 # Created by pve-realpc-setup.sh --igpu
@@ -1540,14 +1932,21 @@ vfio_iommu_type1
 vfio_pci
 VFIOEOF
             ok "Created ${VFIO_MODULES_FILE} (vfio, vfio_iommu_type1, vfio_pci)"
+            fi  # dry_guard
         else
             ok "VFIO modules already configured: ${VFIO_MODULES_FILE}"
         fi
 
         # Rebuild initramfs so VFIO claims the devices at boot
         info "Rebuilding initramfs for VFIO changes ..."
-        update-initramfs -u -k all 2>&1 | tail -3
-        ok "Initramfs updated"
+        if dry_guard "update-initramfs -u -k all"; then
+            if update-initramfs -u -k all; then
+                ok "Initramfs updated"
+            else
+                warn "Initramfs rebuild failed — VFIO may not claim devices after reboot"
+                warn "Check /boot for available space and kernel consistency."
+            fi
+        fi
         NEEDS_REBOOT=true
     else
         ok "iGPU blacklist already configured: ${IGPU_BLACKLIST_FILE}"
@@ -1558,15 +1957,34 @@ else
 fi
 
 ###############################################################################
+# STEP 10b: Discrete NVIDIA / AMD GPU Passthrough host prep (optional, --nvidia)
+###############################################################################
+echo ""
+if [[ "$ENABLE_NVIDIA" == true ]]; then
+    info "═══ Step 10b/12: Discrete GPU Passthrough Setup (--nvidia) ═══"
+    record_step "step_10b"
+    if [[ "$ENABLE_IGPU" == true ]]; then
+        warn "Both --igpu and --nvidia given. iGPU blacklists i915/amdgpu; the discrete"
+        warn "config additionally blacklists nouveau/nvidia and binds the dGPU to vfio-pci."
+        warn "Make sure these don't target the GPU you actually want the HOST to keep."
+    fi
+    configure_nvidia_passthrough
+else
+    info "═══ Step 10b/12: Discrete GPU Passthrough ═══"
+    info "Skipped (use --nvidia to prep host for NVIDIA/AMD dGPU passthrough)"
+fi
+
+###############################################################################
 # STEP 11: Pin packages (prevent apt upgrade from overwriting)
 ###############################################################################
 echo ""
 info "═══ Step 11/12: APT Package Pinning ═══"
+record_step "step_11"
 
 PIN_FILE="/etc/apt/preferences.d/pve-realpc-hold"
 if [[ "$SKIP_PIN" == true ]]; then
     warn "Skipping APT pinning (--skip-pin)"
-else
+elif dry_guard "create ${PIN_FILE} + apt-mark hold"; then
     cat > "$PIN_FILE" <<'PINEOF'
 # Prevent apt from overwriting anti-detection QEMU and OVMF packages
 # Remove this file or run: apt-mark unhold pve-qemu-kvm pve-edk2-firmware-ovmf
@@ -1592,6 +2010,7 @@ fi
 ###############################################################################
 echo ""
 info "═══ Step 12/12: Verification ═══"
+record_step "step_12"
 
 # Check QEMU binary size (PVE/Strong build should be ~29MB+)
 QEMU_BIN="/usr/bin/qemu-system-x86_64"
@@ -1637,44 +2056,46 @@ else
     warn "${ROM_MISSING} of $((ROM_OK + ROM_MISSING)) ROM files missing"
 fi
 
-# Spot-check: verify a patched BIOS doesn't contain "QEMU" or "Bochs" strings
-for check_rom in "bios-256k.bin" "vgabios-stdvga.bin"; do
+# Spot-check the SeaBIOS scrub: bios-256k.bin SHOULD be free of QEMU/Bochs/SeaBIOS
+# (the Debian overlay genuinely scrubs the SeaBIOS). A hit here is a real failure.
+if command -v strings &>/dev/null; then
     for rom_dir in "$QEMU_ROM_DIR" "$QEMU_ROM_DIR_ALT"; do
-        if [[ -f "${rom_dir}/${check_rom}" ]]; then
-            if command -v strings &>/dev/null; then
-                if strings "${rom_dir}/${check_rom}" 2>/dev/null | grep -qi "QEMU\|Bochs\|SeaBIOS"; then
-                    warn "UNPATCHED: ${rom_dir}/${check_rom} still contains VM strings!"
-                else
-                    ok "Verified: ${check_rom} is clean (no VM strings)"
-                fi
+        if [[ -f "${rom_dir}/bios-256k.bin" ]]; then
+            if strings "${rom_dir}/bios-256k.bin" 2>/dev/null | grep -qi "QEMU\|Bochs\|SeaBIOS"; then
+                warn "bios-256k.bin still contains VM strings — SeaBIOS overlay may have failed"
             else
-                warn "Cannot verify ROM strings — 'strings' command not found (install binutils)"
+                ok "Verified: bios-256k.bin is clean (no VM strings)"
             fi
             break
         fi
     done
-done
 
-# Verify VMware/VirtIO VGA ROMs (v10.2.1+ / v11 recommend VMware display, but
-# the Debian release only provides stdvga + qxl ROMs. vgabios-vmware.bin and
-# vgabios-virtio.bin come from the PVE deb and may still contain VM strings
-# since PVE ships pre-built ROM blobs that bypass the sedPatch process.)
-if command -v strings &>/dev/null; then
-    for extra_rom in "vgabios-vmware.bin" "vgabios-virtio.bin"; do
+    # Emulated VGA option ROMs: vgabios-stdvga.bin IS the Bochs VGABIOS ("Bochs"),
+    # and vgabios-vmware/virtio carry VM strings too. Verified on a real PVE 9 host:
+    # the upstream overlay does NOT scrub these (it can't remove a Bochs VGABIOS's own
+    # name without breaking it). The patched PCI-IDs hide the DEVICE ID, but a raw
+    # option-ROM string scan can still see "Bochs"/"VMware". This is inherent to
+    # emulated displays — NOT a bug or a failed overlay.
+    vga_dirty=false
+    for vrom in vgabios-stdvga.bin vgabios-vmware.bin vgabios-virtio.bin; do
         for rom_dir in "$QEMU_ROM_DIR" "$QEMU_ROM_DIR_ALT"; do
-            if [[ -f "${rom_dir}/${extra_rom}" ]]; then
-                if strings "${rom_dir}/${extra_rom}" 2>/dev/null | grep -qi "QEMU\|Bochs\|SeaBIOS"; then
-                    warn "${extra_rom} contains VM strings (not overlaid from Debian release)"
-                    warn "  → The Debian build doesn't produce ${extra_rom}. If using --vga vmware or"
-                    warn "    --vga virtio, firmware string scans may still detect VM signatures."
-                    warn "  → Mitigation: use --vga std (overlaid) or GPU passthrough (--vga none)."
+            if [[ -f "${rom_dir}/${vrom}" ]]; then
+                if strings "${rom_dir}/${vrom}" 2>/dev/null | grep -qi "QEMU\|Bochs\|VMware\|SeaBIOS"; then
+                    vga_dirty=true
                 else
-                    ok "Verified: ${extra_rom} is clean (no VM strings)"
+                    ok "Verified: ${vrom} is clean"
                 fi
                 break
             fi
         done
     done
+    if [[ "$vga_dirty" == true ]]; then
+        warn "Emulated VGA option ROMs carry VM strings (e.g. 'Bochs' in the stdvga VGABIOS) —"
+        warn "  inherent to emulated displays, NOT a failed overlay. PCI-IDs are patched regardless."
+        warn "  For a FULLY clean display, use GPU passthrough: deploy with --vga none + --nvidia/--igpu."
+    fi
+else
+    warn "Cannot verify ROM strings — 'strings' command not found (install binutils)"
 fi
 
 # Check ACPI files
@@ -1717,11 +2138,11 @@ else
     warn "Install with: apt install python3-virt-firmware"
 fi
 
-# Check PIT SSDT (SYSTEM_TIMERS anti-detection)
+# Check PIT SSDT (legacy ISA PIT / PNP0100 exposure)
 if [[ -f "${ACPI_DIR}/pit.aml" ]]; then
     ok "PIT SSDT: pit.aml present ($(stat -c%s "${ACPI_DIR}/pit.aml") bytes)"
 else
-    warn "PIT SSDT: pit.aml missing — VMAware CLOCK/SYSTEM_TIMERS (45pts) will trigger"
+    warn "PIT SSDT: pit.aml missing — guest won't expose the legacy ISA PIT (PNP0100)"
     if ! command -v iasl &>/dev/null; then
         warn "Install iasl: apt install acpica-tools, then re-run this script"
     fi
@@ -1754,7 +2175,7 @@ echo -e "${GREEN}╠════════════════════
 _bxe
 if [[ "$ENABLE_STRONG" == true ]]; then
 _bx "$GREEN" "Strong QEMU + OVMF installed (sensor passthrough)"
-_bx "$GREEN" "Patched KVM module installed (${CPU_VENDOR}, kernel 6.17.13-2)"
+_bx "$GREEN" "Patched KVM module installed (${CPU_VENDOR}, kernel ${KERNEL_VER})"
 else
 _bx "$GREEN" "Base QEMU + OVMF installed (--no-strong, no sensor passthrough)"
 _bx "$GREEN" "Host kvm.ko unchanged (no kernel pin required)"
@@ -1771,7 +2192,7 @@ if [[ -f "$BOOTSPLASH_DEST" ]]; then
 _bx "$GREEN" "Boot splash installed (defeats BOOT_LOGO CRC32 detection)"
 fi
 if [[ -f "${ACPI_DIR}/pit.aml" ]]; then
-_bx "$GREEN" "PIT SSDT compiled (defeats SYSTEM_TIMERS detection)"
+_bx "$GREEN" "PIT SSDT compiled (exposes legacy ISA PIT / PNP0100)"
 fi
 if [[ "$ENABLE_IGPU" == true ]]; then
 igpu_v=$(detect_cpu_vendor)

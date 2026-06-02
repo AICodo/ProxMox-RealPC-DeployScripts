@@ -1,4 +1,4 @@
-# qemu-cleanup.ps1 — Remove VM fingerprints from a Windows guest
+# qemu-cleanup.ps1 - Remove VM fingerprints from a Windows guest
 #
 # Structure mirrors Scrut1ny/AutoVirt's qemu-cleanup.ps1: download PSTools,
 # build a here-string cleanup payload, run it as SYSTEM via PsExec64 so we can
@@ -28,7 +28,7 @@ $psexecPath      = Join-Path $tempDir "PsExec64.exe"
 $cleanupScriptPath = Join-Path $tempDir "cleanup.ps1"
 
 # Download and extract PSTools only if PsExec64.exe is missing.
-# We don't pin a SHA256 (Sysinternals updates PsExec on its own cadence —
+# We don't pin a SHA256 (Sysinternals updates PsExec on its own cadence -
 # pinning would create unbounded maintenance burden). Instead:
 #   1. Force TLS 1.2 (Invoke-WebRequest's defaults vary by PS version).
 #   2. After extraction, verify the Authenticode signature on PsExec64.exe is
@@ -71,7 +71,7 @@ $classRoot     = "HKLM:\SYSTEM\CurrentControlSet\Control\Class"
 # and Red Hat device/vendor IDs. v10.2.1 changed PCI-IDs for stdvga/vmware/virtio-gpu,
 # but older artifacts may still exist from previous installs.
 #
-# v10.2.1 PCI-ID changes (these are the NEW patched values — NOT targeted here):
+# v10.2.1 PCI-ID changes (these are the NEW patched values - NOT targeted here):
 #   Standard VGA: no longer 0x1234 (patched to non-detectable value)
 #   VMware compat: no longer 0x15ad (patched to non-detectable value)
 #   VirtIO-GPU:    no longer 0x1af4 (patched to non-detectable value)
@@ -151,13 +151,13 @@ if (Test-Path $classRoot) {
 }
 
 # Clean Enum\SCSI of VM-related entries only (preserve legitimate SATA/NVMe disk entries)
-# Remove-AllSubKeys is too aggressive — it nukes the active boot disk's registry keys
+# Remove-AllSubKeys is too aggressive - it nukes the active boot disk's registry keys
 # since Windows registers AHCI/SATA disks under Enum\SCSI via the SCSI miniport driver.
 if (Test-Path $scsiRoot) {
     Remove-KeysMatching -Root $scsiRoot -Patterns $searchStrings
 }
 
-# Clean DriverStore FileRepository — remove VirtIO/QEMU driver packages
+# Clean DriverStore FileRepository - remove VirtIO/QEMU driver packages
 $driverStore = "$env:SystemRoot\System32\DriverStore\FileRepository"
 if (Test-Path $driverStore) {
     $driverPatterns = @("vio*", "qemu*", "balloon*", "virtio*", "red_hat*", "netkvm*", "pvpanic*", "spice*", "qxl*", "viogpu*")
@@ -227,7 +227,7 @@ if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
 
 # Validate BIOS/SMBIOS registry entries for residual VM strings
 # Detection tools (VMAware, pafish, al-khaser) scan this path directly rather than
-# doing live SMBIOS queries — values are populated at boot from SMBIOS tables.
+# doing live SMBIOS queries - values are populated at boot from SMBIOS tables.
 # If the patched QEMU provides correct SMBIOS, these should be clean. Log warnings
 # for any that still contain VM-identifying strings.
 $biosRegPath = "HKLM:\HARDWARE\DESCRIPTION\System\BIOS"
@@ -256,7 +256,7 @@ if (Test-Path $cpuRegPath) {
     }
 }
 
-# Clean setupapi logs — device installation traces that record VM hardware PnP events
+# Clean setupapi logs - device installation traces that record VM hardware PnP events
 # These logs can reveal that VirtIO/QEMU devices were enumerated during install
 $setupApiLogs = @(
     "$env:SystemRoot\INF\setupapi.dev.log",
@@ -270,7 +270,7 @@ foreach ($log in $setupApiLogs) {
             Remove-Item $log -Force -ErrorAction Stop
             Write-Host "Deleted setup log: $log"
         } catch {
-            # Log may be locked by a service — truncate instead
+            # Log may be locked by a service - truncate instead
             try { Set-Content -Path $log -Value "" -Force -ErrorAction Stop; Write-Host "Truncated setup log: $log" }
             catch { Write-Host "Failed to clean: $log" }
         }
